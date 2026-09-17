@@ -1,2 +1,2 @@
-BOT_TOKEN = твой токен
-ADMIN_ID = твой Telegram ID
+python-telegram-bot==22.8
+Flask==3.1.2
