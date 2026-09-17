@@ -361,7 +361,7 @@ async def setup():
             "RENDER_EXTERNAL_URL не найден."
         )
 
-    webhook_url = (
+    webhookв до_url = (
         f"{RENDER_URL}/telegram"
     )
 
@@ -375,4 +375,3 @@ async def setup():
     )
 
 
-def 
