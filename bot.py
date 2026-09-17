@@ -343,9 +343,7 @@ def telegram_webhook():
         bot=telegram_app.bot
     )
 
-    await telegram_app.update_queue.put(
-        update
-    )
+    telegram_app.update_queue.put(update)
 
     return "OK"
 
