@@ -377,37 +377,4 @@ async def setup():
     )
 
 
-def main():
-
-    telegram_app.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
-    )
-
-    telegram_app.add_handler(
-        CommandHandler(
-            "alert",
-            alert
-        )
-    )
-
-    telegram_app.add_handler(
-        CallbackQueryHandler(
-            button
-        )
-    )
-
-    asyncio.run(
-        setup()
-    )
-
-    app_web.run(
-        host="0.0.0.0",
-        port=PORT
-    )
-
-
-if __name__ == "__main__":
-    main()
+def 
