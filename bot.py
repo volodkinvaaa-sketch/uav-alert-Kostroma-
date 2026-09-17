@@ -331,7 +331,6 @@ def home():
 
     return "UAV ALERT работает!"
 
-
 @app_web.post("/telegram")
 async def telegram_webhook():
 
@@ -349,6 +348,7 @@ async def telegram_webhook():
     )
 
     return "OK"
+
 
 
 async def setup():
