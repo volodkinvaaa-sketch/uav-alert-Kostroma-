@@ -22,7 +22,8 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-CHANNEL_ID = "@RADAR_Kostoma"
+# НОВОЕ НАЗВАНИЕ КАНАЛА
+CHANNEL_ID = "@RADAR_Kostroma"
 
 SOURCES = {
     "radar_russia": {
@@ -269,7 +270,9 @@ def get_telegram_posts(url):
         return posts
 
     except Exception as e:
-        print(f"[SOURCE ERROR] {url}: {e}")
+        print(
+            f"[SOURCE ERROR] {url}: {e}"
+        )
         return []
 
 
@@ -295,7 +298,7 @@ def is_kostroma(text):
 
 
 # =========================================================
-# ОПРЕДЕЛЕНИЕ ТЕРРИТОРИЙ
+# ПОИСК ТЕРРИТОРИЙ
 # =========================================================
 
 def find_territories(text):
@@ -329,7 +332,10 @@ def detect_status(text):
         "ракетная угроза",
     ]
 
-    if any(word in text for word in red_words):
+    if any(
+        word in text
+        for word in red_words
+    ):
         return "red"
 
     # 🟢 ОТБОЙ
@@ -347,10 +353,13 @@ def detect_status(text):
         "отбой беспилотной опасности",
     ]
 
-    if any(word in text for word in green_words):
+    if any(
+        word in text
+        for word in green_words
+    ):
         return "green"
 
-    # 🟡 БПЛА
+    # 🟡 ОПАСНОСТЬ БПЛА
 
     yellow_words = [
         "угроза по бпла",
@@ -365,7 +374,10 @@ def detect_status(text):
         "опасность беспилотной атаки",
     ]
 
-    if any(word in text for word in yellow_words):
+    if any(
+        word in text
+        for word in yellow_words
+    ):
         return "yellow"
 
     drone_words = [
@@ -385,9 +397,15 @@ def detect_status(text):
     ]
 
     if (
-        any(word in text for word in drone_words)
+        any(
+            word in text
+            for word in drone_words
+        )
         and
-        any(word in text for word in danger_words)
+        any(
+            word in text
+            for word in danger_words
+        )
     ):
         return "yellow"
 
@@ -395,14 +413,17 @@ def detect_status(text):
 
 
 # =========================================================
-# ПОИСК ПОСЛЕДНЕГО СТАТУСА
+# ПОСЛЕДНИЙ СТАТУС
 # =========================================================
 
 def find_latest_status(posts):
     found = []
 
     for post in posts:
-        text = post.get("text", "")
+        text = post.get(
+            "text",
+            ""
+        )
 
         if not is_kostroma(text):
             continue
@@ -416,7 +437,10 @@ def find_latest_status(posts):
 
         found.append({
             "status": status,
-            "post": post.get("post_id", 0),
+            "post": post.get(
+                "post_id",
+                0
+            ),
             "territories": territories
         })
 
@@ -478,7 +502,9 @@ def get_radarmap_status():
         }
 
     except Exception as e:
-        print(f"[RADARMAP ERROR] {e}")
+        print(
+            f"[RADARMAP ERROR] {e}"
+        )
 
         return {
             "status": "green",
@@ -533,7 +559,7 @@ def calculate_overall(results):
 
 
 # =========================================================
-# ТЕРРИТОРИИ ИЗ ВСЕХ ИСТОЧНИКОВ
+# СОБИРАЕМ ТЕРРИТОРИИ
 # =========================================================
 
 def collect_territories(results):
@@ -551,7 +577,7 @@ def collect_territories(results):
 
 
 # =========================================================
-# НАЗВАНИЕ СТАТУСА
+# СТАТУС ТЕКСТОМ
 # =========================================================
 
 def status_text(status):
@@ -565,7 +591,7 @@ def status_text(status):
 
 
 # =========================================================
-# ФОРМИРОВАНИЕ УВЕДОМЛЕНИЯ
+# УВЕДОМЛЕНИЕ
 # =========================================================
 
 def make_notification(
@@ -585,7 +611,9 @@ def make_notification(
         )
 
         for territory in territories:
-            text += f"• {territory}\n"
+            text += (
+                f"• {territory}\n"
+            )
 
         text += "\n"
 
@@ -597,8 +625,8 @@ def make_notification(
 
     text += (
         "ℹ️ Информационное уведомление.\n"
-        "Если официальные сообщения доступны, "
-        "ориентируйтесь прежде всего на них."
+        "Приоритет имеют официальные сообщения "
+        "органов власти и МЧС."
     )
 
     return text
@@ -741,7 +769,9 @@ async def status_command(
         )
 
         for territory in territories:
-            text += f"• {territory}\n"
+            text += (
+                f"• {territory}\n"
+            )
 
     else:
         text += (
@@ -785,17 +815,24 @@ async def test_command(
         "Реальной опасности оно не означает."
     )
 
+    # Отправляем пользователю
     try:
         await context.bot.send_message(
             chat_id=user_id,
             text=test_message,
             parse_mode="HTML"
         )
+
+        print(
+            "[TEST] Сообщение отправлено пользователю."
+        )
+
     except Exception as e:
         print(
             f"[TEST USER ERROR] {e}"
         )
 
+    # Отправляем в НОВЫЙ канал
     channel_ok = await send_to_channel(
         context.application,
         test_message
@@ -803,13 +840,14 @@ async def test_command(
 
     if channel_ok:
         await update.message.reply_text(
-            "✅ Тест отправлен тебе и в @RADAR_Kostoma."
+            "✅ Тест отправлен тебе и в @RADAR_Kostroma."
         )
     else:
         await update.message.reply_text(
             "❌ Не удалось отправить тест в канал.\n\n"
-            "Проверь права администратора бота "
-            "и разрешение на публикацию сообщений."
+            "Проверь, что бот является администратором "
+            "канала @RADAR_Kostroma и имеет право "
+            "публиковать сообщения."
         )
 
 
@@ -893,11 +931,13 @@ async def monitoring_loop(
                         "отправляем уведомление."
                     )
 
+                    # Подписчикам
                     await send_to_subscribers(
                         application,
                         message
                     )
 
+                    # В @RADAR_Kostroma
                     await send_to_channel(
                         application,
                         message
@@ -941,7 +981,7 @@ def main():
         "🚨 UAV ALERT запускается..."
     )
     print(
-        "📢 Канал: @RADAR_Kostoma"
+        "📢 Канал: @RADAR_Kostroma"
     )
     print(
         "===================================="
