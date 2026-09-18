@@ -1,9 +1,8 @@
 import os
 import json
 import logging
-import asyncio
-
-from flask import Flask, request
+import threading
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -11,42 +10,62 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
 )
-
-logging.basicConfig(level=logging.INFO)
-
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-
+# =========================
+# НАСТРОЙКИ
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID_TEXT = os.getenv("ADMIN_ID", "0")
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")
 PORT = int(os.getenv("PORT", "10000"))
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "")
-
+try:
+    ADMIN_ID = int(ADMIN_ID_TEXT)
+except ValueError:
+    ADMIN_ID = 0
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger(__name__)
+# =========================
+# WEB-СЕРВЕР
+# =========================
+web = Flask(__name__)
+@web.route("/")
+def home():
+    return "UAV ALERT работает!"
+def start_web():
+    web.run(
+        host="0.0.0.0",
+        port=PORT,
+        debug=False,
+        use_reloader=False
+    )
+# =========================
+# ФАЙЛЫ
+# =========================
 SUBSCRIBERS_FILE = "subscribers.json"
 NEWS_FILE = "news.json"
-
-app_web = Flask(__name__)
-
-telegram_app = (
-    Application.builder()
-    .token(TOKEN)
-    .updater(None)
-    .build()
-)
-
-
 def load_json(filename, default):
     try:
-        with open(filename, "r", encoding="utf-8") as f:
-            return json.load(f)
+        with open(filename, "r", encoding="utf-8") as file:
+            return json.load(file)
     except Exception:
         return default
-
-
 def save_json(filename, data):
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def menu():
+    try:
+        with open(filename, "w", encoding="utf-8") as file:
+            json.dump(
+                data,
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+    except Exception as error:
+        logger.error(f"Ошибка сохранения: {error}")
+# =========================
+# МЕНЮ
+# =========================
+def main_menu():
     keyboard = [
         [
             InlineKeyboardButton(
@@ -69,14 +88,11 @@ def menu():
                 "ℹ️ О сервисе",
                 callback_data="about"
             )
-        ],
+        ]
     ]
-
     return InlineKeyboardMarkup(keyboard)
-
-
-def unsubscribe_menu():
-    return InlineKeyboardMarkup([
+def subscribed_menu():
+    keyboard = [
         [
             InlineKeyboardButton(
                 "🔕 Отписаться",
@@ -89,189 +105,132 @@ def unsubscribe_menu():
                 callback_data="status"
             )
         ]
-    ])
-
-
+    ]
+    return InlineKeyboardMarkup(keyboard)
+# =========================
+# /START
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    text = (
+    await update.message.reply_text(
         "🚨 UAV ALERT\n\n"
         "📍 Костромская область\n\n"
         "Гражданский информационный сервис "
-        "для официальных предупреждений.\n\n"
-        "🔔 Подпишитесь, чтобы получать уведомления "
-        "о проверенной информации."
+        "для получения проверенных официальных "
+        "предупреждений.\n\n"
+        "Выберите действие:",
+        reply_markup=main_menu()
     )
-
-    await update.message.reply_text(
-        text,
-        reply_markup=menu()
-    )
-
-
+# =========================
+# КНОПКИ
+# =========================
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     query = update.callback_query
     await query.answer()
-
     user_id = query.from_user.id
-
     subscribers = load_json(
         SUBSCRIBERS_FILE,
         []
     )
-
     if query.data == "subscribe":
-
         if user_id not in subscribers:
-
             subscribers.append(user_id)
-
             save_json(
                 SUBSCRIBERS_FILE,
                 subscribers
             )
-
             await query.edit_message_text(
                 "🔔 Вы подписались на уведомления!\n\n"
                 "📍 Костромская область\n\n"
-                "Сообщения будут отправляться "
-                "при наличии проверенной официальной информации.",
-                reply_markup=unsubscribe_menu()
+                "При появлении проверенного "
+                "официального предупреждения "
+                "вы получите уведомление.",
+                reply_markup=subscribed_menu()
             )
-
         else:
-
             await query.edit_message_text(
-                "🔔 Вы уже подписаны на уведомления.",
-                reply_markup=unsubscribe_menu()
+                "🔔 Вы уже подписаны.",
+                reply_markup=subscribed_menu()
             )
-
     elif query.data == "unsubscribe":
-
         if user_id in subscribers:
             subscribers.remove(user_id)
-
         save_json(
             SUBSCRIBERS_FILE,
             subscribers
         )
-
         await query.edit_message_text(
             "🔕 Вы отписались от уведомлений.",
-            reply_markup=menu()
+            reply_markup=main_menu()
         )
-
     elif query.data == "status":
-
         await query.edit_message_text(
             "🚨 СТАТУС\n\n"
             "📍 Костромская область\n\n"
             "🟢 Опасность не объявлена\n\n"
-            "При появлении проверенного "
-            "официального предупреждения "
-            "оно будет опубликовано здесь.",
-            reply_markup=menu()
+            "Статус изменяется после "
+            "получения подтверждённой "
+            "официальной информации.",
+            reply_markup=main_menu()
         )
-
     elif query.data == "news":
-
         news = load_json(
             NEWS_FILE,
             []
         )
-
         if not news:
-
             text = (
                 "📰 ПОСЛЕДНИЕ СООБЩЕНИЯ\n\n"
-                "Сообщений пока нет.\n\n"
-                "Непроверенная информация "
-                "не публикуется как официальная."
+                "Сообщений пока нет."
             )
-
         else:
-
             text = "📰 ПОСЛЕДНИЕ СООБЩЕНИЯ\n\n"
-
             for item in news[-5:]:
-
                 text += (
-                    f"⚠️ {item['text']}\n"
-                    f"Источник: {item['source']}\n\n"
+                    f"⚠️ {item.get('text', '')}\n"
+                    f"Источник: {item.get('source', '')}\n\n"
                 )
-
         await query.edit_message_text(
             text,
-            reply_markup=menu()
+            reply_markup=main_menu()
         )
-
     elif query.data == "about":
-
         await query.edit_message_text(
             "ℹ️ UAV ALERT\n\n"
             "Гражданский информационный сервис "
             "по Костромской области.\n\n"
-            "Сервис предназначен для публикации "
-            "проверенных официальных предупреждений.\n\n"
-            "Непроверенные сообщения и данные "
-            "неофициальных источников не выдаются "
-            "за официальную информацию.",
-            reply_markup=menu()
+            "Публикуется только проверенная "
+            "официальная информация.",
+            reply_markup=main_menu()
         )
-
-
-async def alert(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+# =========================
+# /ALERT
+# =========================
+async def alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-
         await update.message.reply_text(
             "⛔ Нет доступа."
         )
-
         return
-
     if not context.args:
-
         await update.message.reply_text(
             "Использование:\n\n"
-            "/alert Текст предупреждения | Источник\n\n"
-            "Например:\n"
-            "/alert Объявлена беспилотная опасность | Официальное сообщение"
+            "/alert Текст | Источник"
         )
-
         return
-
     raw = " ".join(context.args)
-
     if "|" not in raw:
-
         await update.message.reply_text(
-            "❌ Нужно указать источник через символ |"
+            "❌ Используй символ | между текстом и источником."
         )
-
         return
-
-    alert_text, source = raw.split(
-        "|",
-        1
-    )
-
+    alert_text, source = raw.split("|", 1)
     alert_text = alert_text.strip()
     source = source.strip()
-
     if not alert_text or not source:
-
         await update.message.reply_text(
-            "❌ Нужно указать текст предупреждения "
-            "и источник."
+            "❌ Заполни текст и источник."
         )
-
         return
-
     message = (
         "🚨 UAV ALERT\n\n"
         "📍 Костромская область\n\n"
@@ -280,98 +239,109 @@ async def alert(
         "Следуйте официальным указаниям "
         "экстренных служб."
     )
-
+    # Сохраняем сообщение
     news = load_json(
         NEWS_FILE,
         []
     )
-
     news.append({
         "text": alert_text,
         "source": source
     })
-
     save_json(
         NEWS_FILE,
         news[-20:]
     )
-
+    # Отправляем подписчикам
     subscribers = load_json(
         SUBSCRIBERS_FILE,
         []
     )
-
     sent = 0
-
-    for user_id in subscribers:
-
+    for subscriber_id in subscribers:
         try:
-
             await context.bot.send_message(
-                chat_id=user_id,
+                chat_id=subscriber_id,
                 text=message
             )
-
             sent += 1
-
-        except Exception as e:
-
-            logging.warning(
-                f"Не удалось отправить {user_id}: {e}"
+        except Exception as error:
+            logger.warning(
+                f"Не удалось отправить {subscriber_id}: {error}"
             )
-
+    # Отправляем в канал
+    channel_sent = False
+    if CHANNEL_USERNAME:
+        try:
+            await context.bot.send_message(
+                chat_id=CHANNEL_USERNAME,
+                text=message
+            )
+            channel_sent = True
+        except Exception as error:
+            logger.error(
+                f"Ошибка отправки в канал: {error}"
+            )
     await update.message.reply_text(
-        f"✅ Сообщение отправлено.\n\n"
-        f"👥 Получателей: {sent}"
+        "✅ Сообщение обработано.\n\n"
+        f"👥 Подписчиков уведомлено: {sent}\n"
+        f"📢 Канал: {'отправлено' if channel_sent else 'не отправлено'}"
     )
-
-
-@app_web.get("/")
-def home():
-
-    return "UAV ALERT работает!"
-
-@app_web.post("/telegram")
-def telegram_webhook():
-
-    data = request.get_json(
-        force=True
-    )
-
-    update = Update.de_json(
-        data,
-        bot=telegram_app.bot
-    )
-
-    telegram_app.update_queue.put(update)
-
-    return "OK"
-
-
-
-async def setup():
-
-    await telegram_app.initialize()
-
-    await telegram_app.start()
-
-    if not RENDER_URL:
-
+# =========================
+# ЗАПУСК
+# =========================
+def main():
+    print("")
+    print("==============================")
+    print("🚨 UAV ALERT")
+    print("==============================")
+    if not BOT_TOKEN:
         raise RuntimeError(
-            "RENDER_EXTERNAL_URL не найден."
+            "BOT_TOKEN не задан."
         )
-
-    webhookв_url = (
-        f"{RENDER_URL}/telegram"
+    if ADMIN_ID == 0:
+        raise RuntimeError(
+            "ADMIN_ID не задан или указан неправильно."
+        )
+    if not CHANNEL_USERNAME:
+        logger.warning(
+            "CHANNEL_USERNAME не задан. "
+            "Сообщения в канал отправляться не будут."
+        )
+    print("✅ Настройки найдены")
+    # Веб-сервер Render
+    web_thread = threading.Thread(
+        target=start_web,
+        daemon=True
     )
-
-    await telegram_app.bot.set_webhook(
-        url=webhook_url,
+    web_thread.start()
+    print("✅ Web-сервер запущен")
+    # Telegram
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            "alert",
+            alert
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            button
+        )
+    )
+    print("🤖 Бот запускается...")
+    application.run_polling(
         allowed_updates=Update.ALL_TYPES
     )
-
-    logging.info(
-        f"Webhook установлен: {webhook_url}"
-    )
-
-
+if __name__ == "__main__":
+    main()
