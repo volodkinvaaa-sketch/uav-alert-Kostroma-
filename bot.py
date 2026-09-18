@@ -43,7 +43,7 @@ def home():
 
 
 @app.route("/status")
-def status():
+def status_page():
     return jsonify(load_state())
 
 
@@ -54,24 +54,20 @@ def status():
 def load_state():
 
     if not os.path.exists(STATE_FILE):
-
         return {
             "status": "green",
             "last_post": 0
         }
 
     try:
-
         with open(
             STATE_FILE,
             "r",
             encoding="utf-8"
         ) as file:
-
             return json.load(file)
 
     except Exception:
-
         return {
             "status": "green",
             "last_post": 0
@@ -135,7 +131,7 @@ def save_subscribers(subscribers):
 
 
 # =========================================================
-# TELEGRAM КОМАНДЫ
+# КОМАНДЫ TELEGRAM
 # =========================================================
 
 async def start_command(
@@ -164,8 +160,7 @@ async def start_command(
         f"{SOURCE_USERNAME}\n\n"
 
         "⚠️ Информация носит "
-        "информационный характер.\n"
-
+        "информационный характер. "
         "Следуйте официальным указаниям "
         "государственных служб."
     )
@@ -270,8 +265,7 @@ def send_message(
     except Exception as error:
 
         print(
-            f"❌ Ошибка отправки: "
-            f"{error}"
+            f"❌ Ошибка отправки: {error}"
         )
 
 
@@ -302,7 +296,7 @@ def notify_users(message):
 
 
 # =========================================================
-# ПОЛУЧЕНИЕ ПОСТОВ
+# ПОЛУЧЕНИЕ ПОСТОВ ИЗ ИСТОЧНИКА
 # =========================================================
 
 def get_source_posts():
@@ -401,11 +395,8 @@ def get_source_posts():
             if text:
 
                 posts.append({
-
                     "id": post_id,
-
                     "text": text
-
                 })
 
         return posts
@@ -432,7 +423,7 @@ def is_kostroma(text):
         text.split()
     )
 
-    kostroma_words = [
+    keywords = [
 
         "костромская область",
 
@@ -449,12 +440,10 @@ def is_kostroma(text):
         "кострома"
     ]
 
-    for word in kostroma_words:
-
-        if word in text:
-            return True
-
-    return False
+    return any(
+        word in text
+        for word in keywords
+    )
 
 
 # =========================================================
@@ -470,9 +459,7 @@ def detect_status(text):
     )
 
 
-    # -----------------------------------------------------
     # 🔴 РАКЕТНАЯ ОПАСНОСТЬ
-    # -----------------------------------------------------
 
     missile_words = [
 
@@ -485,16 +472,15 @@ def detect_status(text):
         "опасность по ракетам"
     ]
 
-    for word in missile_words:
+    if any(
+        word in text
+        for word in missile_words
+    ):
 
-        if word in text:
-
-            return "red"
+        return "red"
 
 
-    # -----------------------------------------------------
     # СЛОВА ПРО БПЛА
-    # -----------------------------------------------------
 
     drone_words = [
 
@@ -511,19 +497,13 @@ def detect_status(text):
         "беспилотная"
     ]
 
-
     has_drone = any(
-
         word in text
-
         for word in drone_words
-
     )
 
 
-    # -----------------------------------------------------
     # 🟢 ОТБОЙ
-    # -----------------------------------------------------
 
     cancel_words = [
 
@@ -541,11 +521,8 @@ def detect_status(text):
     ]
 
     has_cancel = any(
-
         word in text
-
         for word in cancel_words
-
     )
 
 
@@ -554,9 +531,7 @@ def detect_status(text):
         return "green"
 
 
-    # -----------------------------------------------------
-    # 🟡 ОПАСНОСТЬ БПЛА
-    # -----------------------------------------------------
+    # 🟡 ОПАСНОСТЬ
 
     danger_words = [
 
@@ -570,11 +545,8 @@ def detect_status(text):
     ]
 
     has_danger = any(
-
         word in text
-
         for word in danger_words
-
     )
 
 
@@ -587,23 +559,79 @@ def detect_status(text):
 
 
 # =========================================================
-# ПРОВЕРКА ИСТОЧНИКА
+# ПРИНУДИТЕЛЬНОЕ ОПРЕДЕЛЕНИЕ ТЕКУЩЕГО СТАТУСА
 # =========================================================
 
-def check_source():
+def initialize_current_status(posts):
 
     print("")
     print(
-        "🔎 Проверка источника "
-        f"{SOURCE_USERNAME}"
+        "🔄 ПРИНУДИТЕЛЬНАЯ ПРОВЕРКА "
+        "ТЕКУЩЕГО СТАТУСА"
     )
 
-    posts = get_source_posts()
+    kostroma_posts = []
 
-    if not posts:
+    for post in posts:
+
+        if is_kostroma(post["text"]):
+
+            detected = detect_status(
+                post["text"]
+            )
+
+            print(
+                f"🔎 Пост #{post['id']} "
+                f"Кострома → {detected}"
+            )
+
+            kostroma_posts.append({
+
+                "id": post["id"],
+
+                "text": post["text"],
+
+                "status": detected
+            })
+
+
+    if not kostroma_posts:
 
         print(
-            "⚠️ Сообщения не найдены."
+            "⚠️ Постов про Костромскую "
+            "область не найдено."
+        )
+
+        return
+
+
+    # Сортируем от нового к старому
+
+    kostroma_posts.sort(
+        key=lambda x: x["id"],
+        reverse=True
+    )
+
+
+    latest = kostroma_posts[0]
+
+
+    print(
+        f"📌 Последний пост Костромы: "
+        f"#{latest['id']}"
+    )
+
+    print(
+        f"🧠 Определён статус: "
+        f"{latest['status']}"
+    )
+
+
+    if latest["status"] is None:
+
+        print(
+            "⚠️ Последний пост найден, "
+            "но статус не распознан."
         )
 
         return
@@ -616,47 +644,59 @@ def check_source():
         "green"
     )
 
+
+    # ВАЖНО:
+    # при запуске статус обновляется
+    # независимо от last_post
+
+    state["status"] = latest["status"]
+
+    state["last_post"] = latest["id"]
+
+    save_state(state)
+
+
+    print(
+        f"💾 Текущий статус сохранён: "
+        f"{latest['status']}"
+    )
+
+
+    # При запуске не отправляем старое
+    # уведомление повторно
+
+    if old_status != latest["status"]:
+
+        print(
+            "ℹ️ Статус изменился во время "
+            "инициализации."
+        )
+
+    else:
+
+        print(
+            "ℹ️ Статус остался прежним."
+        )
+
+
+# =========================================================
+# ПРОВЕРКА НОВЫХ ПОСТОВ
+# =========================================================
+
+def check_new_posts(posts):
+
+    state = load_state()
+
     old_post = state.get(
         "last_post",
         0
     )
 
-
-    print(
-        f"📌 Предыдущий статус: "
-        f"{old_status}"
+    old_status = state.get(
+        "status",
+        "green"
     )
 
-    print(
-        f"📌 Последний обработанный пост: "
-        f"{old_post}"
-    )
-
-
-    # =====================================================
-    # ПОКАЗЫВАЕМ ПОСЛЕДНИЕ ПОСТЫ
-    # =====================================================
-
-    for post in posts[:10]:
-
-        preview = post["text"]
-
-        if len(preview) > 300:
-
-            preview = (
-                preview[:300]
-                + "..."
-            )
-
-        print(
-            f"📨 Пост #{post['id']}: "
-            f"{preview}"
-        )
-
-
-    # =====================================================
-    # НОВЫЕ ПОСТЫ
-    # =====================================================
 
     new_posts = [
 
@@ -665,30 +705,28 @@ def check_source():
         for post in posts
 
         if post["id"] > old_post
-
     ]
 
+
     print(
-        f"🆕 Новых сообщений: "
+        f"🆕 Новых постов: "
         f"{len(new_posts)}"
     )
 
 
-    # =====================================================
-    # АНАЛИЗ
-    # =====================================================
+    if not new_posts:
+        return
 
-    for post in reversed(new_posts):
+
+    for post in sorted(
+        new_posts,
+        key=lambda x: x["id"]
+    ):
 
         text = post["text"]
 
 
         if not is_kostroma(text):
-
-            print(
-                f"⏭ Пост #{post['id']} "
-                "не относится к Костромской области."
-            )
 
             continue
 
@@ -697,39 +735,29 @@ def check_source():
 
 
         print(
-            f"🧠 Пост #{post['id']} "
-            f"Кострома → "
-            f"{detected}"
+            f"🧠 Новый пост #{post['id']} "
+            f"→ {detected}"
         )
 
 
         if detected is None:
-
-            print(
-                "ℹ️ Опасность не распознана "
-                "по тексту."
-            )
 
             continue
 
 
         if detected == old_status:
 
-            print(
-                "ℹ️ Статус не изменился."
-            )
+            state["last_post"] = post["id"]
 
             continue
 
 
         state["status"] = detected
 
+        state["last_post"] = post["id"]
+
         old_status = detected
 
-
-        # =================================================
-        # 🟡 БПЛА
-        # =================================================
 
         if detected == "yellow":
 
@@ -751,17 +779,8 @@ def check_source():
                 "указаниям государственных служб."
             )
 
-            print(
-                "🟡 ОБНАРУЖЕНА "
-                "БЕСПИЛОТНАЯ ОПАСНОСТЬ!"
-            )
-
             notify_users(message)
 
-
-        # =================================================
-        # 🔴 РАКЕТНАЯ
-        # =================================================
 
         elif detected == "red":
 
@@ -781,17 +800,8 @@ def check_source():
                 "указаниям государственных служб."
             )
 
-            print(
-                "🔴 ОБНАРУЖЕНА "
-                "РАКЕТНАЯ ОПАСНОСТЬ!"
-            )
-
             notify_users(message)
 
-
-        # =================================================
-        # 🟢 ОТБОЙ
-        # =================================================
 
         elif detected == "green":
 
@@ -809,39 +819,53 @@ def check_source():
                 f"{SOURCE_USERNAME}"
             )
 
-            print(
-                "🟢 ОБНАРУЖЕН ОТБОЙ!"
-            )
-
             notify_users(message)
 
 
-    # =====================================================
-    # СОХРАНЕНИЕ ПОСЛЕДНЕГО ПОСТА
-    # =====================================================
+        save_state(state)
 
-    if posts:
 
-        newest_id = max(
+# =========================================================
+# ОСНОВНАЯ ПРОВЕРКА
+# =========================================================
 
-            post["id"]
+def check_source(first_run=False):
 
-            for post in posts
+    print("")
+    print(
+        "🔎 Проверка источника "
+        f"{SOURCE_USERNAME}"
+    )
 
+
+    posts = get_source_posts()
+
+
+    if not posts:
+
+        print(
+            "⚠️ Посты не получены."
         )
 
-        if newest_id > old_post:
-
-            state["last_post"] = newest_id
+        return
 
 
-    save_state(state)
+    # ПРИ КАЖДОМ ЗАПУСКЕ
+    # принудительно определяем статус
+
+    if first_run:
+
+        initialize_current_status(
+            posts
+        )
+
+        return
 
 
-    print(
-        f"💾 Сохранено. "
-        f"Статус: {state['status']}"
-    )
+    # После запуска —
+    # только новые сообщения
+
+    check_new_posts(posts)
 
 
 # =========================================================
@@ -859,11 +883,38 @@ def source_loop():
         f"{SOURCE_USERNAME}"
     )
 
+
+    # ==========================================
+    # ПЕРВАЯ ПРОВЕРКА
+    # ==========================================
+
+    try:
+
+        check_source(
+            first_run=True
+        )
+
+    except Exception as error:
+
+        print(
+            f"❌ Ошибка первой проверки: "
+            f"{error}"
+        )
+
+
+    # ==========================================
+    # ДАЛЬШЕ КАЖДЫЕ 60 СЕКУНД
+    # ==========================================
+
     while True:
+
+        time.sleep(60)
 
         try:
 
-            check_source()
+            check_source(
+                first_run=False
+            )
 
         except Exception as error:
 
@@ -872,16 +923,9 @@ def source_loop():
                 f"{error}"
             )
 
-        print(
-            "⏳ Следующая проверка "
-            "через 60 секунд."
-        )
-
-        time.sleep(60)
-
 
 # =========================================================
-# FLASK
+# FLASK THREAD
 # =========================================================
 
 def run_flask():
@@ -895,7 +939,7 @@ def run_flask():
 
 
 # =========================================================
-# ЗАПУСК
+# MAIN
 # =========================================================
 
 def main():
@@ -904,7 +948,7 @@ def main():
 
         print(
             "❌ ОШИБКА: BOT_TOKEN "
-            "не задан в Render."
+            "не задан."
         )
 
         return
@@ -977,7 +1021,7 @@ def main():
 
 
 # =========================================================
-# MAIN
+# START
 # =========================================================
 
 if __name__ == "__main__":
