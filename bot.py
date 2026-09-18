@@ -26,7 +26,11 @@ ADMIN_ID = 1421675956
 CHANNEL_ID = "@RADAR_Kostroma"
 CHANNEL_URL = "https://t.me/RADAR_Kostroma"
 
+# РЕКЛАМНАЯ ССЫЛКА
+AD_URL = "https://t.me/srars_onesteps_bot?start=_tgr_oZFsCBZhNGVi"
+
 CHECK_INTERVAL = 60
+
 
 # =========================
 # ИСТОЧНИКИ
@@ -46,6 +50,7 @@ SOURCES = {
         "url": "https://radar-map.ru/",
     },
 }
+
 
 # =========================
 # ТЕРРИТОРИИ
@@ -75,6 +80,7 @@ TERRITORIES = [
     "Солигаличский муниципальный округ",
 ]
 
+
 # =========================
 # FLASK
 # =========================
@@ -99,6 +105,7 @@ def web_status():
             return f.read(), 200, {
                 "Content-Type": "application/json"
             }
+
     except Exception:
         return '{"overall":"green"}', 200, {
             "Content-Type": "application/json"
@@ -124,6 +131,7 @@ def load_subscribers():
             encoding="utf-8"
         ) as f:
             return json.load(f)
+
     except Exception:
         return []
 
@@ -295,7 +303,7 @@ def find_territories(text):
 
 
 # =========================
-# ПОЛУЧЕНИЕ TELEGRAM-ПОСТОВ
+# TELEGRAM-ПОСТЫ
 # =========================
 
 def get_telegram_posts(url):
@@ -571,9 +579,19 @@ def build_notification(data):
             territories
         ):
 
-            text += (
-                f"• {territory}\n"
-            )
+            text += f"• {territory}\n"
+
+    # =========================
+    # РЕКЛАМНЫЙ БЛОК
+    # =========================
+
+    text += (
+        "\n━━━━━━━━━━━━━━\n"
+        "📢 Партнёрская рекомендация\n"
+        "🔗 Рекомендуемый сервис:\n"
+        f"{AD_URL}\n"
+        "━━━━━━━━━━━━━━\n"
+    )
 
     text += (
         "\n⚠️ Информационное уведомление.\n"
@@ -693,7 +711,9 @@ async def start(
 
     if user_id not in subscribers:
 
-        subscribers.append(user_id)
+        subscribers.append(
+            user_id
+        )
 
         save_subscribers(
             subscribers
@@ -837,18 +857,20 @@ async def test_command(
         "• Буй\n"
         "• Галич\n\n"
 
+        "━━━━━━━━━━━━━━\n"
+        "📢 Партнёрская рекомендация\n"
+        "🔗 Рекомендуемый сервис:\n"
+        f"{AD_URL}\n"
+        "━━━━━━━━━━━━━━\n\n"
+
         "⚠️ Это тестовое сообщение.\n"
         "Реальная опасность не объявлена "
         "этим сообщением."
     )
 
-    # Отправляем тест тебе
-
     await update.message.reply_text(
         message
     )
-
-    # Отправляем тест в канал
 
     try:
 
@@ -866,17 +888,19 @@ async def test_command(
 
 
 # =========================
-# ЗАПУСК
+# POST INIT
 # =========================
 
-async def post_init(
-    application
-):
+async def post_init(application):
 
     asyncio.create_task(
         monitor(application)
     )
 
+
+# =========================
+# ЗАПУСК
+# =========================
 
 def main():
 
