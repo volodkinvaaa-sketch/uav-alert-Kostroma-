@@ -22,14 +22,17 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 # ТВОЙ TELEGRAM ID
 ADMIN_ID = 1421675956
 
-# ТВОЙ TELEGRAM-КАНАЛ
+# TELEGRAM-КАНАЛ
 CHANNEL_ID = "@RADAR_Kostroma"
 CHANNEL_URL = "https://t.me/RADAR_Kostroma"
 
-# РЕКЛАМНАЯ ССЫЛКА
-AD_URL = "https://t.me/srars_onesteps_bot?start=_tgr_oZFsCBZhNGVi"
+# НОВАЯ РЕКЛАМА
+AD_URL = "https://t.me/soraveobot_bot?start=_tgr_09OvCARhMDhi"
 
 CHECK_INTERVAL = 60
+
+STATE_FILE = "state.json"
+SUBSCRIBERS_FILE = "subscribers.json"
 
 
 # =========================
@@ -87,9 +90,6 @@ TERRITORIES = [
 
 app = Flask(__name__)
 
-STATE_FILE = "state.json"
-SUBSCRIBERS_FILE = "subscribers.json"
-
 state_lock = threading.Lock()
 
 
@@ -101,7 +101,11 @@ def home():
 @app.route("/status")
 def web_status():
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
             return f.read(), 200, {
                 "Content-Type": "application/json"
             }
@@ -120,7 +124,7 @@ def run_flask():
 
 
 # =========================
-# ФАЙЛЫ
+# ПОДПИСЧИКИ
 # =========================
 
 def load_subscribers():
@@ -149,6 +153,10 @@ def save_subscribers(subscribers):
             indent=2
         )
 
+
+# =========================
+# STATE
+# =========================
 
 def save_state(data):
     with state_lock:
@@ -295,7 +303,6 @@ def find_territories(text):
     lower_text = text.lower()
 
     for territory in TERRITORIES:
-
         if territory.lower() in lower_text:
             result.append(territory)
 
@@ -303,13 +310,11 @@ def find_territories(text):
 
 
 # =========================
-# TELEGRAM-ПОСТЫ
+# ПОЛУЧЕНИЕ TELEGRAM-ПОСТОВ
 # =========================
 
 def get_telegram_posts(url):
-
     try:
-
         response = requests.get(
             url,
             timeout=15,
@@ -350,15 +355,12 @@ def get_telegram_posts(url):
             post_id = 0
 
             if link and link.get("href"):
-
                 try:
-
                     post_id = int(
                         link["href"]
                         .rstrip("/")
                         .split("/")[-1]
                     )
-
                 except Exception:
                     pass
 
@@ -370,13 +372,16 @@ def get_telegram_posts(url):
         return posts
 
     except Exception as e:
-
         print(
             f"Ошибка получения {url}: {e}"
         )
 
         return []
 
+
+# =========================
+# ПОИСК ПОСЛЕДНЕГО СТАТУСА
+# =========================
 
 def find_latest_status(posts):
 
@@ -405,7 +410,6 @@ def find_latest_status(posts):
         })
 
     if not found:
-
         return {
             "status": "green",
             "post": 0,
@@ -427,7 +431,6 @@ def find_latest_status(posts):
 def get_radarmap_status():
 
     try:
-
         response = requests.get(
             SOURCES["radarmap"]["url"],
             timeout=15,
@@ -447,7 +450,6 @@ def get_radarmap_status():
         )
 
         if "костром" not in text.lower():
-
             return {
                 "status": "green",
                 "post": 0,
@@ -511,15 +513,12 @@ def check_sources():
     ]
 
     if "red" in statuses:
-
         overall = "red"
 
     elif "yellow" in statuses:
-
         overall = "yellow"
 
     else:
-
         overall = "green"
 
     return {
@@ -529,7 +528,7 @@ def check_sources():
 
 
 # =========================
-# ТЕКСТ СТАТУСА
+# СТАТУС
 # =========================
 
 def status_text(status):
@@ -544,7 +543,7 @@ def status_text(status):
 
 
 # =========================
-# СОЗДАНИЕ УВЕДОМЛЕНИЯ
+# УВЕДОМЛЕНИЕ
 # =========================
 
 def build_notification(data):
@@ -582,14 +581,14 @@ def build_notification(data):
             text += f"• {territory}\n"
 
     # =========================
-    # РЕКЛАМНЫЙ БЛОК
+    # РЕКЛАМА
     # =========================
 
     text += (
         "\n━━━━━━━━━━━━━━\n"
         "📢 Партнёрская рекомендация\n"
-        "🔗 Рекомендуемый сервис:\n"
-        f"{AD_URL}\n"
+        "🤖 SORAVEO BOT\n"
+        f"🔗 {AD_URL}\n"
         "━━━━━━━━━━━━━━\n"
     )
 
@@ -603,7 +602,7 @@ def build_notification(data):
 
 
 # =========================
-# ОТПРАВКА УВЕДОМЛЕНИЯ
+# ОТПРАВКА
 # =========================
 
 async def send_notification(
@@ -785,7 +784,7 @@ def is_admin(update):
 
 
 # =========================
-# /STATUS — ТОЛЬКО АДМИН
+# /STATUS
 # =========================
 
 async def status_command(
@@ -829,7 +828,7 @@ async def status_command(
 
 
 # =========================
-# /TEST — ТОЛЬКО АДМИН
+# /TEST
 # =========================
 
 async def test_command(
@@ -859,8 +858,8 @@ async def test_command(
 
         "━━━━━━━━━━━━━━\n"
         "📢 Партнёрская рекомендация\n"
-        "🔗 Рекомендуемый сервис:\n"
-        f"{AD_URL}\n"
+        "🤖 SORAVEO BOT\n"
+        f"🔗 {AD_URL}\n"
         "━━━━━━━━━━━━━━\n\n"
 
         "⚠️ Это тестовое сообщение.\n"
@@ -967,3 +966,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
