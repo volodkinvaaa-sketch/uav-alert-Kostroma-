@@ -1,29 +1,40 @@
 import os
 import json
-import time
+import re
+import asyncio
 import threading
 import requests
+
 from flask import Flask
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 
-# =========================
+# =========================================================
 # НАСТРОЙКИ
-# =========================
+# =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "").strip()
 
 PORT = int(os.getenv("PORT", "10000"))
 
-# Официальная лента МЧС Костромской области
-MCHS_URL = "https://44.mchs.gov.ru/deyatelnost/press-centr/novosti"
+# Публичная лента информационного канала
+RADAR_CHANNEL = "radarrussiia"
+RADAR_URL = f"https://t.me/s/{RADAR_CHANNEL}"
 
-CHECK_INTERVAL = 60  # проверка каждую минуту
+CHECK_INTERVAL = 60
 
-# =========================
-# FLASK ДЛЯ RENDER
-# =========================
+STATE_FILE = "state.json"
+SUBSCRIBERS_FILE = "subscribers.json"
+
+
+# =========================================================
+# FLASK
+# =========================================================
 
 web = Flask(__name__)
 
@@ -40,12 +51,9 @@ def run_web():
     )
 
 
-# =========================
-# ХРАНЕНИЕ
-# =========================
-
-STATE_FILE = "state.json"
-
+# =========================================================
+# СОСТОЯНИЕ
+# =========================================================
 
 def load_state():
     try:
@@ -53,12 +61,12 @@ def load_state():
             return json.load(f)
     except Exception:
         return {
-            "last_news": "",
-            "status": "🟢 Опасность не объявлена"
+            "status": "🟢 Опасность не объявлена",
+            "last_post": 0
         }
 
 
-def save_state(state):
+def save_state():
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(
             state,
@@ -71,12 +79,9 @@ def save_state(state):
 state = load_state()
 
 
-# =========================
+# =========================================================
 # ПОДПИСЧИКИ
-# =========================
-
-SUBSCRIBERS_FILE = "subscribers.json"
-
+# =========================================================
 
 def load_subscribers():
     try:
@@ -96,9 +101,9 @@ def save_subscribers(users):
         )
 
 
-# =========================
-# КОМАНДЫ
-# =========================
+# =========================================================
+# КОМАНДА /START
+# =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -113,13 +118,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🚨 UAV ALERT\n\n"
         "Ты подписан на уведомления.\n\n"
-        "Источник: официальная информация МЧС России "
-        "по Костромской области.\n\n"
+        "📍 Регион: Костромская область\n\n"
+        "Источник мониторинга:\n"
+        "Radar / radarrussiia\n\n"
         "Команды:\n"
         "/status — текущий статус\n"
         "/stop — отключить уведомления"
     )
 
+
+# =========================================================
+# /STOP
+# =========================================================
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -136,71 +146,82 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# =========================================================
+# /STATUS
+# =========================================================
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
-        f"🚨 UAV ALERT\n\n"
+        "🚨 UAV ALERT\n\n"
         f"Текущий статус:\n"
         f"{state.get('status', '🟢 Опасность не объявлена')}\n\n"
-        f"Источник: МЧС России по Костромской области"
+        "📍 Костромская область\n\n"
+        "Источник мониторинга:\n"
+        "Radar / radarrussiia\n\n"
+        "⚠️ Для официальных указаний "
+        "используйте сообщения государственных служб."
     )
 
 
-# =========================
-# ОТПРАВКА СООБЩЕНИЯ
-# =========================
+# =========================================================
+# ОТПРАВКА УВЕДОМЛЕНИЯ
+# =========================================================
 
-async def send_alert(application, text):
+async def send_alert(application, message):
 
     users = load_subscribers()
 
+    # Личные уведомления
     for user_id in users.copy():
 
         try:
             await application.bot.send_message(
                 chat_id=user_id,
-                text=text
+                text=message
             )
 
         except Exception as e:
             print(
-                f"Не удалось отправить пользователю "
+                f"Ошибка отправки пользователю "
                 f"{user_id}: {e}"
             )
 
-    # Отправка в публичный канал
+    # Публичный канал
     if CHANNEL_USERNAME:
 
         try:
             await application.bot.send_message(
                 chat_id=CHANNEL_USERNAME,
-                text=text
+                text=message
             )
 
-            print("Сообщение отправлено в канал.")
+            print("✅ Отправлено в канал.")
 
         except Exception as e:
             print(
-                f"Ошибка отправки в канал: {e}"
+                f"❌ Ошибка отправки в канал: {e}"
             )
 
 
-# =========================
-# ПРОВЕРКА МЧС
-# =========================
+# =========================================================
+# ЗАГРУЗКА RADAR ЛЕНТЫ
+# =========================================================
 
-def get_mchs_page():
+def get_radar_page():
 
     headers = {
-        "User-Agent":
-        "Mozilla/5.0 "
-        "(Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 "
-        "Chrome/120 Safari/537.36"
+        "User-Agent": (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/140 Safari/537.36"
+        )
     }
 
     response = requests.get(
-        MCHS_URL,
+        RADAR_URL,
         headers=headers,
         timeout=20
     )
@@ -210,120 +231,210 @@ def get_mchs_page():
     return response.text
 
 
-def find_alert(text):
+# =========================================================
+# ПОЛУЧЕНИЕ ПОСЛЕДНИХ ПОСТОВ
+# =========================================================
+
+def parse_posts(html):
+
+    posts = []
+
+    pattern = re.compile(
+        r'data-post="'
+        + re.escape(RADAR_CHANNEL)
+        + r'/(\d+)"'
+        r'.*?'
+        r'class="tgme_widget_message_text[^"]*"'
+        r'>(.*?)</div>',
+        re.S
+    )
+
+    matches = pattern.findall(html)
+
+    for post_id, raw_text in matches:
+
+        text = re.sub(
+            r"<br\s*/?>",
+            "\n",
+            raw_text
+        )
+
+        text = re.sub(
+            r"<[^>]+>",
+            "",
+            text
+        )
+
+        text = (
+            text
+            .replace("&nbsp;", " ")
+            .replace("&quot;", '"')
+            .replace("&amp;", "&")
+        )
+
+        text = text.strip()
+
+        posts.append({
+            "id": int(post_id),
+            "text": text
+        })
+
+    return posts
+
+
+# =========================================================
+# ФИЛЬТР КОСТРОМСКОЙ ОБЛАСТИ
+# =========================================================
+
+def check_post(text):
 
     text_lower = text.lower()
 
-    # Сначала проверяем отбой
-    if (
-        "отбой беспилотной опасности"
-        in text_lower
-        or
-        "опасность отменена"
-        in text_lower
-    ):
-        return "🟢 Беспилотная опасность отменена."
+    # Только Костромская область
+    kostroma = (
+        "костромская область" in text_lower
+        or "костромской области" in text_lower
+    )
 
-    # Затем объявление опасности
+    if not kostroma:
+        return None
+
+    # -----------------------------------------------------
+    # ОТБОЙ
+    # -----------------------------------------------------
+
     if (
-        "беспилотная опасность"
-        in text_lower
-        or
-        "опасность атаки беспилотников"
-        in text_lower
-        or
-        "угроза беспилотной опасности"
-        in text_lower
+        "отбой опасности по бпла" in text_lower
+        or "отбой беспилотной опасности" in text_lower
+        or "отбой опасности бпла" in text_lower
+    ):
+        return "🟢 Отбой беспилотной опасности."
+
+    # -----------------------------------------------------
+    # ОПАСНОСТЬ
+    # -----------------------------------------------------
+
+    if (
+        "опасность по бпла" in text_lower
+        or "беспилотная опасность" in text_lower
+        or "опасность бпла" in text_lower
     ):
         return "🟡 Беспилотная опасность объявлена."
 
     return None
 
 
-# =========================
-# АВТОПРОВЕРКА
-# =========================
+# =========================================================
+# АВТОМАТИЧЕСКАЯ ПРОВЕРКА
+# =========================================================
 
 async def automatic_check(application):
 
-    global state
-
-    print("Автоматическая проверка МЧС запущена.")
+    print("🔎 Автоматическая проверка Radar запущена.")
 
     while True:
 
         try:
 
-            html = get_mchs_page()
+            html = get_radar_page()
 
-            result = find_alert(html)
+            posts = parse_posts(html)
 
-            if result:
+            # Самые новые сначала
+            posts.sort(
+                key=lambda x: x["id"],
+                reverse=True
+            )
 
-                old_status = state.get(
-                    "status",
-                    "🟢 Опасность не объявлена"
+            for post in posts[:20]:
+
+                post_id = post["id"]
+
+                # Уже обработанный пост
+                if post_id <= int(
+                    state.get("last_post", 0)
+                ):
+                    continue
+
+                text = post["text"]
+
+                print(
+                    f"📨 Новый пост #{post_id}: "
+                    f"{text[:150]}"
                 )
 
-                if result != old_status:
+                result = check_post(text)
 
-                    state["status"] = result
+                # Запоминаем пост,
+                # даже если он нам не подходит
+                state["last_post"] = post_id
+                save_state()
 
-                    save_state(state)
+                if result:
 
-                    message = (
-                        "🚨 UAV ALERT\n\n"
-                        f"{result}\n\n"
-                        "📍 Костромская область\n\n"
-                        "Источник:\n"
-                        "ГУ МЧС России "
-                        "по Костромской области\n\n"
-                        "⚠️ Следите за официальными "
-                        "сообщениями экстренных служб."
+                    old_status = state.get(
+                        "status",
+                        "🟢 Опасность не объявлена"
                     )
 
-                    print(
-                        "Найдено изменение статуса:",
-                        result
-                    )
+                    if result != old_status:
 
-                    await send_alert(
-                        application,
-                        message
-                    )
+                        state["status"] = result
+                        save_state()
+
+                        message = (
+                            "🚨 UAV ALERT\n\n"
+                            f"{result}\n\n"
+                            "📍 Костромская область\n\n"
+                            "📡 Источник мониторинга:\n"
+                            "Radar / @radarrussiia\n\n"
+                            "⚠️ Информация носит "
+                            "информационный характер. "
+                            "Следуйте официальным "
+                            "указаниям государственных служб."
+                        )
+
+                        print(
+                            f"🚨 ИЗМЕНЕНИЕ СТАТУСА: "
+                            f"{result}"
+                        )
+
+                        await send_alert(
+                            application,
+                            message
+                        )
 
         except Exception as e:
 
             print(
-                "Ошибка проверки МЧС:",
-                e
+                f"❌ Ошибка проверки Radar: {e}"
             )
 
-        await __import__("asyncio").sleep(
+        await asyncio.sleep(
             CHECK_INTERVAL
         )
 
 
-# =========================
+# =========================================================
 # ЗАПУСК
-# =========================
+# =========================================================
+
+async def post_init(application):
+
+    application.create_task(
+        automatic_check(application)
+    )
+
 
 def main():
 
     if not BOT_TOKEN:
 
         print(
-            "ОШИБКА: не задан BOT_TOKEN"
+            "❌ ОШИБКА: BOT_TOKEN не задан."
         )
 
         return
-
-    if not CHANNEL_USERNAME:
-
-        print(
-            "ВНИМАНИЕ: CHANNEL_USERNAME "
-            "не задан."
-        )
 
     threading.Thread(
         target=run_web,
@@ -333,6 +444,7 @@ def main():
     application = (
         Application.builder()
         .token(BOT_TOKEN)
+        .post_init(post_init)
         .build()
     )
 
@@ -356,13 +468,6 @@ def main():
             status
         )
     )
-
-    async def post_init(app):
-        app.create_task(
-            automatic_check(app)
-        )
-
-    application.post_init = post_init
 
     print("🚨 UAV ALERT запускается...")
 
