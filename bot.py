@@ -46,17 +46,29 @@ SOURCES = {
     "radar_russia": {
         "name": "📡 Радар Россия",
         "url": "https://t.me/s/radarrussiia",
+        "type": "secondary",
     },
     "bpla_russia": {
         "name": "📢 БПЛА Россия",
         "url": "https://t.me/s/bplarussiaru",
+        "type": "secondary",
+    },
+    "locator_russia": {
+        "name": "📡 Локатор России",
+        "url": "https://t.me/s/locatorru",
+        "type": "secondary",
+    },
+    "russia_monitoring": {
+        "name": "🛰️ Мониторинг.РФ",
+        "url": "https://t.me/s/russiamonitoring_radar_bpla",
+        "type": "secondary",
     },
     "radarmap": {
         "name": "🗺️ RadarMap",
         "url": "https://radar-map.ru/",
+        "type": "secondary",
     },
 }
-
 
 # =========================================================
 # ГОРОДА
