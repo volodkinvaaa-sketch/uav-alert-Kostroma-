@@ -6,8 +6,14 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from flask import Flask, jsonify
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -16,63 +22,55 @@ from telegram.ext import (
 )
 
 
-# =========================================================
+# ============================================================
 # НАСТРОЙКИ
-# =========================================================
+# ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-ADMIN_ID = 1421675956
-
-CHANNEL_ID = "@RADAR_Kostroma"
-CHANNEL_URL = "https://t.me/RADAR_Kostroma"
-
-AD_URL = "https://t.me/soraveobot_bot?start=_tgr_09OvCARhMDhi"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "1421675956"))
+CHANNEL = os.getenv("CHANNEL", "@RADAR_Kostroma")
+PORT = int(os.getenv("PORT", "10000"))
 
 CHECK_INTERVAL = 60
 
-STATE_FILE = "state.json"
-SUBSCRIBERS_FILE = "subscribers.json"
-HISTORY_FILE = "history.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-MAX_HISTORY = 20
+STATE_FILE = os.path.join(BASE_DIR, "state.json")
+HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
+SUBSCRIBERS_FILE = os.path.join(BASE_DIR, "subscribers.json")
 
 
-# =========================================================
+# ============================================================
 # ИСТОЧНИКИ
-# =========================================================
+# ============================================================
 
 SOURCES = {
-    "radar_russia": {
-        "name": "📡 Радар Россия",
-        "url": "https://t.me/s/radarrussiia",
-        "type": "secondary",
-    },
-    "bpla_russia": {
-        "name": "📢 БПЛА Россия",
-        "url": "https://t.me/s/bplarussiaru",
-        "type": "secondary",
-    },
-    "locator_russia": {
+    "locator": {
         "name": "📡 Локатор России",
         "url": "https://t.me/s/locatorru",
         "type": "secondary",
     },
-    "russia_monitoring": {
-        "name": "🛰️ Мониторинг.РФ",
+    "monitoring": {
+        "name": "🛰️ Мониторинг БПЛА",
         "url": "https://t.me/s/russiamonitoring_radar_bpla",
         "type": "secondary",
     },
-    "radarmap": {
-        "name": "🗺️ RadarMap",
-        "url": "https://radar-map.ru/",
+    "radar": {
+        "name": "📡 Радар Россия",
+        "url": "https://t.me/s/radarrussiia",
+        "type": "secondary",
+    },
+    "bpla": {
+        "name": "📢 БПЛА Россия",
+        "url": "https://t.me/s/bplarussiaru",
         "type": "secondary",
     },
 }
 
-# =========================================================
+
+# ============================================================
 # ГОРОДА
-# =========================================================
+# ============================================================
 
 CITIES = [
     "Кострома",
@@ -89,10 +87,6 @@ CITIES = [
     "Нея",
 ]
 
-
-# =========================================================
-# РАЙОНЫ / ОКРУГА
-# =========================================================
 
 TERRITORIES = [
     "Антроповский муниципальный округ",
@@ -118,224 +112,85 @@ TERRITORIES = [
 ]
 
 
-# =========================================================
-# FLASK
-# =========================================================
-
-app = Flask(__name__)
-
-
-@app.route("/")
-def home():
-    return "UAV ALERT работает."
-
-
-@app.route("/status")
-def web_status():
-    data = load_json(STATE_FILE, {})
-    return json.dumps(
-        data,
-        ensure_ascii=False,
-        indent=2,
-    )
-
-
-def run_flask():
-    app.run(
-        host="0.0.0.0",
-        port=10000,
-        debug=False,
-        use_reloader=False,
-    )
-
-
-# =========================================================
-# ВРЕМЯ МСК
-# =========================================================
+# ============================================================
+# ВРЕМЯ
+# ============================================================
 
 def moscow_time():
-    msk = timezone(
-        timedelta(hours=3)
-    )
-
-    return datetime.now(
-        msk
-    ).strftime(
-        "%d.%m.%Y %H:%M:%S МСК"
-    )
+    msk = timezone(timedelta(hours=3))
+    return datetime.now(msk).strftime("%d.%m.%Y %H:%M:%S МСК")
 
 
-# =========================================================
+# ============================================================
 # JSON
-# =========================================================
+# ============================================================
 
-def load_json(filename, default):
+def load_json(path, default):
     try:
-        if not os.path.exists(filename):
+        if not os.path.exists(path):
             return default
 
-        with open(
-            filename,
-            "r",
-            encoding="utf-8",
-        ) as file:
-            return json.load(file)
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
-    except Exception as error:
-        print(
-            f"Ошибка чтения {filename}: {error}"
-        )
+    except Exception:
         return default
 
 
-def save_json(filename, data):
+def save_json(path, data):
     try:
-        with open(
-            filename,
-            "w",
-            encoding="utf-8",
-        ) as file:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(
                 data,
-                file,
+                f,
                 ensure_ascii=False,
-                indent=2,
+                indent=2
             )
-
-    except Exception as error:
-        print(
-            f"Ошибка сохранения {filename}: {error}"
-        )
+    except Exception as e:
+        print("Ошибка сохранения:", e)
 
 
-# =========================================================
-# ПОДПИСЧИКИ
-# =========================================================
+# ============================================================
+# СОСТОЯНИЕ
+# ============================================================
 
-def load_subscribers():
-    data = load_json(
-        SUBSCRIBERS_FILE,
-        {},
-    )
-
-    if not isinstance(data, dict):
-        return {}
-
-    changed = False
-
-    for user_id, user in data.items():
-
-        if not isinstance(user, dict):
-            data[user_id] = {
-                "location": None,
-                "location_type": None,
-                "notifications": True,
-                "send_green": True,
-            }
-            changed = True
-            continue
-
-        if "notifications" not in user:
-            user["notifications"] = True
-            changed = True
-
-        if "send_green" not in user:
-            user["send_green"] = True
-            changed = True
-
-        if "location" not in user:
-            user["location"] = None
-            changed = True
-
-        if "location_type" not in user:
-            user["location_type"] = None
-            changed = True
-
-    if changed:
-        save_subscribers(data)
-
-    return data
+DEFAULT_STATE = {
+    "status": "green",
+    "text": "Опасность не объявлена",
+    "source": "",
+    "post_id": "",
+    "location": "",
+    "updated": "",
+}
 
 
-def save_subscribers(data):
-    save_json(
-        SUBSCRIBERS_FILE,
-        data,
-    )
+state = load_json(STATE_FILE, DEFAULT_STATE)
+history = load_json(HISTORY_FILE, [])
+subscribers = load_json(SUBSCRIBERS_FILE, {})
 
 
-def get_user_data(user_id):
-    subscribers = load_subscribers()
+# ============================================================
+# ПРОВЕРКИ
+# ============================================================
 
-    return subscribers.get(
-        str(user_id),
-        {},
-    )
+def is_kostroma(text):
+    text = text.lower()
 
+    words = [
+        "кострома",
+        "костромская область",
+        "костромской области",
+        "костромская обл",
+        "костромской обл",
+    ]
 
-def set_user_location(
-    user_id,
-    location_type,
-    location,
-):
-    subscribers = load_subscribers()
-
-    key = str(user_id)
-
-    old = subscribers.get(
-        key,
-        {},
-    )
-
-    subscribers[key] = {
-        "location": location,
-        "location_type": location_type,
-        "notifications": old.get(
-            "notifications",
-            True,
-        ),
-        "send_green": old.get(
-            "send_green",
-            True,
-        ),
-    }
-
-    save_subscribers(
-        subscribers
-    )
-
-
-def remove_subscriber(user_id):
-    subscribers = load_subscribers()
-
-    subscribers.pop(
-        str(user_id),
-        None,
-    )
-
-    save_subscribers(
-        subscribers
-    )
-
-
-# =========================================================
-# СТАТУСЫ
-# =========================================================
-
-def status_text(status):
-
-    if status == "red":
-        return "🔴 РАКЕТНАЯ ОПАСНОСТЬ"
-
-    if status == "yellow":
-        return "🟡 БЕСПИЛОТНАЯ ОПАСНОСТЬ"
-
-    return "🟢 ОПАСНОСТЬ НЕ ОБЪЯВЛЕНА"
+    return any(word in text for word in words)
 
 
 def detect_status(text):
     text = text.lower()
 
+    # Красный
     red_words = [
         "ракетная опасность",
         "ракетной опасности",
@@ -345,10 +200,10 @@ def detect_status(text):
         "ракетная угроза",
     ]
 
-    for word in red_words:
-        if word in text:
-            return "red"
+    if any(word in text for word in red_words):
+        return "red"
 
+    # Отбой
     green_words = [
         "отбой",
         "отмена опасности",
@@ -362,10 +217,10 @@ def detect_status(text):
         "отбой беспилотной опасности",
     ]
 
-    for word in green_words:
-        if word in text:
-            return "green"
+    if any(word in text for word in green_words):
+        return "green"
 
+    # Желтый
     yellow_words = [
         "угроза по бпла",
         "угроза бпла",
@@ -379,16 +234,14 @@ def detect_status(text):
         "опасность беспилотной атаки",
     ]
 
-    for word in yellow_words:
-        if word in text:
-            return "yellow"
+    if any(word in text for word in yellow_words):
+        return "yellow"
 
     drone_words = [
         "бпла",
         "беспилотник",
         "беспилотников",
-        "беспилотного аппарата",
-        "беспилотные аппараты",
+        "беспилотная",
     ]
 
     danger_words = [
@@ -398,106 +251,53 @@ def detect_status(text):
         "внимание",
     ]
 
-    has_drone = any(
-        word in text
-        for word in drone_words
-    )
-
-    has_danger = any(
-        word in text
-        for word in danger_words
-    )
-
-    if has_drone and has_danger:
+    if (
+        any(word in text for word in drone_words)
+        and any(word in text for word in danger_words)
+    ):
         return "yellow"
 
-    return "green"
+    return None
 
 
-# =========================================================
-# КОСТРОМСКАЯ ОБЛАСТЬ
-# =========================================================
+def status_name(status):
+    if status == "red":
+        return "🔴 Ракетная опасность"
 
-def is_kostroma(text):
-    text = text.lower()
+    if status == "yellow":
+        return "🟡 Беспилотная опасность"
 
-    words = [
-        "кострома",
-        "костромская область",
-        "костромской области",
-        "костромская обл",
-        "костромской обл",
-    ]
-
-    return any(
-        word in text
-        for word in words
-    )
+    return "🟢 Опасность не объявлена"
 
 
-# =========================================================
-# ПОИСК ГОРОДОВ
-# =========================================================
-
-def find_cities(text):
-    result = []
-
-    lower_text = text.lower()
-
-    for city in CITIES:
-        if city.lower() in lower_text:
-            if city not in result:
-                result.append(city)
-
-    return result
-
-
-# =========================================================
-# ПОИСК РАЙОНОВ
-# =========================================================
-
-def find_territories(text):
-    result = []
-
-    lower_text = text.lower()
-
-    for territory in TERRITORIES:
-        if territory.lower() in lower_text:
-            if territory not in result:
-                result.append(territory)
-
-    return result
-
-
-# =========================================================
-# TELEGRAM ИСТОЧНИКИ
-# =========================================================
+# ============================================================
+# TELEGRAM SCRAPER
+# ============================================================
 
 def get_telegram_posts(url):
-
     try:
         response = requests.get(
             url,
-            timeout=20,
+            timeout=15,
             headers={
                 "User-Agent": "Mozilla/5.0"
-            },
+            }
         )
 
-        response.raise_for_status()
+        if response.status_code != 200:
+            return []
 
         soup = BeautifulSoup(
             response.text,
-            "html.parser",
+            "html.parser"
         )
 
         posts = []
 
-        for message in soup.select(
+        for element in soup.select(
             ".tgme_widget_message"
         ):
-
-            text_element = message.select_one(
+            text_element = element.select_one(
                 ".tgme_widget_message_text"
             )
 
@@ -505,23 +305,14 @@ def get_telegram_posts(url):
                 continue
 
             text = text_element.get_text(
-                "\n",
-                strip=True,
+                " ",
+                strip=True
             )
 
-            post_id = 0
-
-            data_post = message.get(
-                "data-post"
+            post_id = element.get(
+                "data-post",
+                ""
             )
-
-            if data_post:
-                try:
-                    post_id = int(
-                        data_post.split("/")[-1]
-                    )
-                except Exception:
-                    post_id = 0
 
             posts.append({
                 "text": text,
@@ -530,928 +321,349 @@ def get_telegram_posts(url):
 
         return posts
 
-    except Exception as error:
-        print(
-            f"Ошибка источника {url}: {error}"
-        )
+    except Exception as e:
+        print("Ошибка источника:", e)
         return []
 
 
-# =========================================================
-# ПОСЛЕДНИЙ СТАТУС
-# =========================================================
+def find_location(text):
+    text_lower = text.lower()
 
-def find_latest_status(posts):
+    # Сначала города
+    for city in CITIES:
+        if city.lower() in text_lower:
+            return city
 
-    found = []
+    # Затем округа
+    for territory in TERRITORIES:
+        if territory.lower() in text_lower:
+            return territory
 
-    for post in posts:
+    # Только область
+    if is_kostroma(text):
+        return "Костромская область"
 
-        text = post["text"]
+    return ""
 
-        if not is_kostroma(text):
-            continue
 
-        found.append({
-            "status": detect_status(text),
-            "territories": find_territories(text),
-            "cities": find_cities(text),
-            "post_id": post["post_id"],
-        })
+def find_latest_status():
+    candidates = []
 
-    if not found:
+    for source_id, source in SOURCES.items():
+
+        posts = get_telegram_posts(
+            source["url"]
+        )
+
+        for post in posts:
+
+            text = post["text"]
+
+            if not is_kostroma(text):
+                continue
+
+            status = detect_status(text)
+
+            if not status:
+                continue
+
+            candidates.append({
+                "status": status,
+                "text": text,
+                "source": source["name"],
+                "source_id": source_id,
+                "post_id": post["post_id"],
+                "location": find_location(text),
+            })
+
+    if not candidates:
         return None
 
-    found.sort(
-        key=lambda item: item["post_id"],
-        reverse=True,
-    )
-
-    return found[0]
+    # Берём первый найденный подтверждённый статус
+    return candidates[0]
 
 
-# =========================================================
-# RADARMAP
-# =========================================================
+# ============================================================
+# ИСТОРИЯ
+# ============================================================
 
-def get_radarmap_status():
+def add_history(new_state):
+    global history
 
-    try:
-        response = requests.get(
-            "https://radar-map.ru/",
-            timeout=20,
-            headers={
-                "User-Agent": "Mozilla/5.0"
-            },
-        )
-
-        response.raise_for_status()
-
-        text = response.text.lower()
-
-        if "костром" not in text:
-            return {
-                "status": "green",
-                "territories": [],
-                "cities": [],
-            }
-
-        return {
-            "status": detect_status(text),
-            "territories": [],
-            "cities": [],
-        }
-
-    except Exception as error:
-        print(
-            f"Ошибка RadarMap: {error}"
-        )
-
-        return {
-            "status": "green",
-            "territories": [],
-            "cities": [],
-        }
-
-
-# =========================================================
-# ПРОВЕРКА ИСТОЧНИКОВ
-# =========================================================
-
-def check_sources():
-
-    results = {}
-
-    for key, source in SOURCES.items():
-
-        if key == "radarmap":
-
-            result = get_radarmap_status()
-
-        else:
-
-            posts = get_telegram_posts(
-                source["url"]
-            )
-
-            latest = find_latest_status(
-                posts
-            )
-
-            if latest:
-
-                result = {
-                    "status": latest["status"],
-                    "territories": latest["territories"],
-                    "cities": latest["cities"],
-                }
-
-            else:
-
-                result = {
-                    "status": "green",
-                    "territories": [],
-                    "cities": [],
-                }
-
-        results[key] = {
-            "name": source["name"],
-            "status": result["status"],
-            "territories": result["territories"],
-            "cities": result["cities"],
-        }
-
-    overall = "green"
-
-    for result in results.values():
-
-        if result["status"] == "red":
-            overall = "red"
-            break
-
-        if result["status"] == "yellow":
-            overall = "yellow"
-
-    return {
-        "overall": overall,
-        "sources": results,
-        "checked_at": moscow_time(),
+    item = {
+        "status": new_state["status"],
+        "text": new_state["text"],
+        "source": new_state["source"],
+        "location": new_state["location"],
+        "time": moscow_time(),
     }
 
+    history.insert(0, item)
 
-# =========================================================
-# ЛОКАЦИИ
-# =========================================================
+    history = history[:20]
 
-def collect_locations(data):
-
-    territories = []
-    cities = []
-
-    for source in data["sources"].values():
-
-        for territory in source.get(
-            "territories",
-            [],
-        ):
-
-            if territory not in territories:
-                territories.append(
-                    territory
-                )
-
-        for city in source.get(
-            "cities",
-            [],
-        ):
-
-            if city not in cities:
-                cities.append(
-                    city
-                )
-
-    return territories, cities
-
-
-def notification_matches_location(
-    location,
-    data,
-):
-
-    if not location:
-        return False
-
-    territories, cities = collect_locations(
-        data
+    save_json(
+        HISTORY_FILE,
+        history
     )
 
-    location_lower = location.lower()
 
-    for city in cities:
+# ============================================================
+# ПОДПИСЧИКИ
+# ============================================================
 
-        if city.lower() == location_lower:
-            return True
+def get_user(user_id):
+    key = str(user_id)
 
-    for territory in territories:
+    if key not in subscribers:
+        subscribers[key] = {
+            "location": "Кострома",
+            "notifications": True,
+            "green_notifications": True,
+        }
 
-        if territory.lower() == location_lower:
-            return True
+        save_json(
+            SUBSCRIBERS_FILE,
+            subscribers
+        )
 
-    return False
+    return subscribers[key]
 
 
-# =========================================================
+# ============================================================
 # КЛАВИАТУРА
-# =========================================================
+# ============================================================
 
 def main_keyboard():
-
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
                 "📊 Текущий статус",
-                callback_data="current_status",
-            )
+                callback_data="status"
+            ),
         ],
         [
             InlineKeyboardButton(
                 "📍 Моё место",
-                callback_data="my_location",
+                callback_data="my_location"
             ),
             InlineKeyboardButton(
                 "🔄 Изменить",
-                callback_data="choose_location",
+                callback_data="change_location"
             ),
         ],
         [
             InlineKeyboardButton(
                 "📚 История",
-                callback_data="history",
-            )
+                callback_data="history"
+            ),
+            InlineKeyboardButton(
+                "📋 Сводка",
+                callback_data="summary"
+            ),
         ],
         [
             InlineKeyboardButton(
                 "⚙️ Настройки",
-                callback_data="settings",
-            )
+                callback_data="settings"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📡 Источники",
+                callback_data="sources"
+            ),
         ],
         [
             InlineKeyboardButton(
                 "📢 Наш канал",
-                url=CHANNEL_URL,
-            )
+                url="https://t.me/RADAR_Kostroma"
+            ),
         ],
     ])
 
 
-def location_type_keyboard():
+def location_keyboard():
+    buttons = []
 
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🏙️ Город",
-                callback_data="location_city",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🏘️ Район / округ",
-                callback_data="location_territory",
-            )
-        ],
-    ])
-
-
-def cities_keyboard():
-
-    keyboard = []
-    row = []
-
-    for city in CITIES:
-
-        row.append(
+    for i, city in enumerate(CITIES):
+        buttons.append(
             InlineKeyboardButton(
                 city,
-                callback_data=f"city:{city}",
+                callback_data=f"city:{i}"
             )
         )
 
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
+    rows = []
 
-    if row:
-        keyboard.append(row)
+    for i in range(0, len(buttons), 2):
+        rows.append(buttons[i:i + 2])
 
-    keyboard.append([
+    rows.append([
         InlineKeyboardButton(
-            "⬅️ Назад",
-            callback_data="choose_location",
+            "🏘 Округа",
+            callback_data="territories"
         )
     ])
 
-    return InlineKeyboardMarkup(
-        keyboard
-    )
+    rows.append([
+        InlineKeyboardButton(
+            "⬅️ Назад",
+            callback_data="back"
+        )
+    ])
+
+    return InlineKeyboardMarkup(rows)
 
 
-def territories_keyboard():
+def territory_keyboard():
+    buttons = []
 
-    keyboard = []
-
-    for index, territory in enumerate(
-        TERRITORIES
-    ):
-
-        keyboard.append([
+    for i, territory in enumerate(TERRITORIES):
+        buttons.append(
             InlineKeyboardButton(
                 territory,
-                callback_data=f"territory:{index}",
+                callback_data=f"terr:{i}"
             )
-        ])
+        )
 
-    keyboard.append([
+    rows = []
+
+    for i in range(0, len(buttons), 1):
+        rows.append(buttons[i:i + 1])
+
+    rows.append([
         InlineKeyboardButton(
             "⬅️ Назад",
-            callback_data="choose_location",
+            callback_data="change_location"
         )
     ])
 
-    return InlineKeyboardMarkup(
-        keyboard
-    )
+    return InlineKeyboardMarkup(rows)
 
 
-def settings_keyboard(user_id):
-
-    user = get_user_data(
-        user_id
-    )
-
-    notifications = user.get(
-        "notifications",
-        True,
-    )
-
-    send_green = user.get(
-        "send_green",
-        True,
-    )
-
-    notification_text = (
-        "🔔 Уведомления: ВКЛ"
-        if notifications
-        else "🔕 Уведомления: ВЫКЛ"
-    )
-
-    green_text = (
-        "🟢 Отбой: ВКЛ"
-        if send_green
-        else "⚪ Отбой: ВЫКЛ"
-    )
-
+def settings_keyboard():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                notification_text,
-                callback_data="toggle_notifications",
+                "🔔 Уведомления",
+                callback_data="toggle_notifications"
             )
         ],
         [
             InlineKeyboardButton(
-                green_text,
-                callback_data="toggle_green",
+                "🟢 Уведомления об отбое",
+                callback_data="toggle_green"
             )
         ],
         [
             InlineKeyboardButton(
                 "📍 Изменить место",
-                callback_data="choose_location",
+                callback_data="change_location"
             )
         ],
         [
             InlineKeyboardButton(
-                "⬅️ Главное меню",
-                callback_data="main_menu",
+                "⬅️ Назад",
+                callback_data="back"
             )
         ],
     ])
 
 
-# =========================================================
-# START
-# =========================================================
+# ============================================================
+# ФОРМАТИРОВАНИЕ
+# ============================================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+def status_text():
+    return (
+        "🚨 <b>UAV ALERT</b>\n\n"
+        f"{status_name(state.get('status'))}\n\n"
+        f"📍 Регион: <b>Костромская область</b>\n"
+        f"🕐 Обновлено: {state.get('updated', '—')}\n"
+        f"📡 Источник: {state.get('source', '—')}\n"
+    )
+
+
+def summary_text():
+    return (
+        "📋 <b>Сводка UAV ALERT</b>\n\n"
+        f"📍 Регион: Костромская область\n"
+        f"🚦 Статус: {status_name(state.get('status'))}\n"
+        f"📍 Место: {state.get('location') or 'не указано'}\n"
+        f"🕐 Последнее обновление: "
+        f"{state.get('updated', '—')}\n"
+        f"📡 Источник: {state.get('source', '—')}\n\n"
+        "⚠️ Информация носит справочный характер. "
+        "Приоритет имеют официальные сообщения "
+        "органов власти и МЧС."
+    )
+
+
+# ============================================================
+# START
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
 
-    if not user:
-        return
-
-    subscribers = load_subscribers()
-
-    if str(user.id) not in subscribers:
-
-        subscribers[str(user.id)] = {
-            "location": None,
-            "location_type": None,
-            "notifications": True,
-            "send_green": True,
-        }
-
-        save_subscribers(
-            subscribers
-        )
-
-    user_data = get_user_data(
-        user.id
-    )
-
-    location = user_data.get(
-        "location"
-    )
-
-    if location:
-
-        await update.message.reply_text(
-            "🚨 UAV ALERT\n\n"
-            f"📍 Ваше место: {location}\n\n"
-            "Выберите действие:",
-            reply_markup=main_keyboard(),
-        )
-
-    else:
-
-        await update.message.reply_text(
-            "🚨 UAV ALERT\n\n"
-            "Гражданский информационный сервис.\n\n"
-            "📍 Сначала выберите город "
-            "или район / муниципальный округ.",
-            reply_markup=location_type_keyboard(),
-        )
-
-
-# =========================================================
-# КОМАНДА STATUS
-# =========================================================
-
-async def status_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    data = check_sources()
-
-    territories, cities = collect_locations(
-        data
-    )
+    if user:
+        get_user(user.id)
 
     text = (
-        "📊 UAV ALERT — СТАТУС\n\n"
-        "📍 Костромская область\n\n"
-        f"{status_text(data['overall'])}\n\n"
-        f"🕐 Проверено: {data['checked_at']}\n"
-    )
-
-    if territories:
-
-        text += "\n🏘️ Районы / округа:\n"
-
-        for territory in territories:
-            text += f"• {territory}\n"
-
-    if cities:
-
-        text += "\n🏙️ Города:\n"
-
-        for city in cities:
-            text += f"• {city}\n"
-
-    text += (
-        "\n⚠️ Бот показывает сведения "
-        "из доступных источников."
+        "🚨 <b>UAV ALERT</b>\n\n"
+        "Гражданский информационный сервис "
+        "по ситуации в Костромской области.\n\n"
+        "Выберите нужный раздел:"
     )
 
     await update.message.reply_text(
         text,
-        reply_markup=main_keyboard(),
+        parse_mode="HTML",
+        reply_markup=main_keyboard()
     )
 
 
-# =========================================================
+# ============================================================
+# STATUS
+# ============================================================
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    await update.message.reply_text(
+        status_text(),
+        parse_mode="HTML",
+        reply_markup=main_keyboard()
+    )
+
+
+# ============================================================
 # STOP
-# =========================================================
+# ============================================================
 
-async def stop(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    user = update.effective_user
+    user_id = update.effective_user.id
 
-    if not user:
-        return
+    user = get_user(user_id)
 
-    remove_subscriber(
-        user.id
+    user["notifications"] = False
+
+    save_json(
+        SUBSCRIBERS_FILE,
+        subscribers
     )
 
     await update.message.reply_text(
         "🔕 Уведомления отключены.\n\n"
-        "Для повторного подключения нажмите "
-        "/start"
+        "Включить их можно через ⚙️ Настройки."
     )
 
 
-# =========================================================
-# CALLBACK: ВЫБОР МЕСТА
-# =========================================================
-
-async def choose_location(
-    update,
-    context,
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    await query.edit_message_text(
-        "📍 Выберите тип места:",
-        reply_markup=location_type_keyboard(),
-    )
-
-
-async def show_cities(
-    update,
-    context,
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    await query.edit_message_text(
-        "🏙️ Выберите ваш город:",
-        reply_markup=cities_keyboard(),
-    )
-
-
-async def show_territories(
-    update,
-    context,
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    await query.edit_message_text(
-        "🏘️ Выберите район / округ:",
-        reply_markup=territories_keyboard(),
-    )
-
-
-async def select_city(
-    update,
-    context,
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    city = query.data.split(
-        ":",
-        1,
-    )[1]
-
-    set_user_location(
-        query.from_user.id,
-        "city",
-        city,
-    )
-
-    await query.edit_message_text(
-        "✅ Место сохранено!\n\n"
-        f"🏙️ {city}\n\n"
-        "Теперь можно открыть текущий статус.",
-        reply_markup=main_keyboard(),
-    )
-
-
-async def select_territory(
-    update,
-    context,
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    try:
-
-        index = int(
-            query.data.split(
-                ":",
-                1,
-            )[1]
-        )
-
-        territory = TERRITORIES[
-            index
-        ]
-
-    except Exception:
-
-        await query.edit_message_text(
-            "❌ Ошибка выбора района.",
-            reply_markup=location_type_keyboard(),
-        )
-
-        return
-
-    set_user_location(
-        query.from_user.id,
-        "territory",
-        territory,
-    )
-
-    await query.edit_message_text(
-        "✅ Место сохранено!\n\n"
-        f"🏘️ {territory}",
-        reply_markup=main_keyboard(),
-    )
-
-
-# =========================================================
-# МОЁ МЕСТО
-# =========================================================
-
-async def my_location(
-    update,
-    context,
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    user = get_user_data(
-        query.from_user.id
-    )
-
-    location = user.get(
-        "location"
-    )
-
-    if location:
-
-        await query.edit_message_text(
-            "📍 МОЁ МЕСТО\n\n"
-            f"➡️ {location}",
-            reply_markup=main_keyboard(),
-        )
-
-    else:
-
-        await query.edit_message_text(
-            "📍 Место ещё не выбрано.",
-            reply_markup=location_type_keyboard(),
-        )
-
-
-# =========================================================
-# ТЕКУЩИЙ СТАТУС
-# =========================================================
-
-async def current_status(
-    update,
-    context,
-):
-
-    query = update.callback_query
-
-    await query.answer(
-        "Проверяем источники..."
-    )
-
-    data = check_sources()
-
-    territories, cities = collect_locations(
-        data
-    )
-
-    text = (
-        "📊 ТЕКУЩИЙ СТАТУС\n\n"
-        "📍 Костромская область\n\n"
-        f"{status_text(data['overall'])}\n\n"
-        f"🕐 Проверено: {data['checked_at']}\n"
-    )
-
-    if territories:
-
-        text += "\n🏘️ Районы / округа:\n"
-
-        for territory in territories:
-            text += f"• {territory}\n"
-
-    if cities:
-
-        text += "\n🏙️ Города:\n"
-
-        for city in cities:
-            text += f"• {city}\n"
-
-    text += (
-        "\n⚠️ Приоритет имеют официальные "
-        "сообщения органов власти и МЧС."
-    )
-
-    await query.edit_message_text(
-        text,
-        reply_markup=main_keyboard(),
-    )
-
-
-# =========================================================
-# ИСТОРИЯ
-# =========================================================
-
-def add_history(data):
-
-    history = load_json(
-        HISTORY_FILE,
-        [],
-    )
-
-    territories, cities = collect_locations(
-        data
-    )
-
-    history.insert(
-        0,
-        {
-            "time": data["checked_at"],
-            "status": data["overall"],
-            "territories": territories,
-            "cities": cities,
-        },
-    )
-
-    history = history[
-        :MAX_HISTORY
-    ]
-
-    save_json(
-        HISTORY_FILE,
-        history,
-    )
-
-
-async def history_command(
-    update,
-    context,
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    history = load_json(
-        HISTORY_FILE,
-        [],
-    )
-
-    if not history:
-
-        await query.edit_message_text(
-            "📚 История пока пустая.",
-            reply_markup=main_keyboard(),
-        )
-
-        return
-
-    text = "📚 ПОСЛЕДНИЕ ОБНОВЛЕНИЯ\n\n"
-
-    for item in history[:10]:
-
-        text += (
-            f"🕐 {item.get('time', '—')}\n"
-            f"{status_text(item.get('status', 'green'))}\n"
-        )
-
-        if item.get("cities"):
-            text += (
-                "🏙️ "
-                + ", ".join(
-                    item["cities"][:3]
-                )
-                + "\n"
-            )
-
-        if item.get("territories"):
-            text += (
-                "🏘️ "
-                + ", ".join(
-                    item["territories"][:3]
-                )
-                + "\n"
-            )
-
-        text += "\n"
-
-    await query.edit_message_text(
-        text,
-        reply_markup=main_keyboard(),
-    )
-
-
-# =========================================================
-# НАСТРОЙКИ
-# =========================================================
-
-async def settings_command(
-    update,
-    context,
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    user = get_user_data(
-        query.from_user.id
-    )
-
-    location = user.get(
-        "location",
-        "не выбрано",
-    )
-
-    await query.edit_message_text(
-        "⚙️ НАСТРОЙКИ\n\n"
-        f"📍 Место: {location}\n\n"
-        "Настройки уведомлений:",
-        reply_markup=settings_keyboard(
-            query.from_user.id
-        ),
-    )
-
-
-async def toggle_notifications(
-    update,
-    context,
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    subscribers = load_subscribers()
-
-    user = subscribers.get(
-        str(query.from_user.id)
-    )
-
-    if not user:
-        return
-
-    user["notifications"] = not user.get(
-        "notifications",
-        True,
-    )
-
-    save_subscribers(
-        subscribers
-    )
-
-    await settings_command(
-        update,
-        context,
-    )
-
-
-async def toggle_green(
-    update,
-    context,
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    subscribers = load_subscribers()
-
-    user = subscribers.get(
-        str(query.from_user.id)
-    )
-
-    if not user:
-        return
-
-    user["send_green"] = not user.get(
-        "send_green",
-        True,
-    )
-
-    save_subscribers(
-        subscribers
-    )
-
-    await settings_command(
-        update,
-        context,
-    )
-
-
-# =========================================================
-# АДМИН
-# =========================================================
+# ============================================================
+# ADMIN TEST
+# ============================================================
 
 def is_admin(update):
 
@@ -1461,317 +673,467 @@ def is_admin(update):
     )
 
 
-async def admin_status(
-    update,
-    context,
-):
+async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not is_admin(update):
-
         await update.message.reply_text(
-            "⛔ Команда только для администратора."
+            "⛔ Команда доступна только администратору."
         )
-
         return
 
-    data = check_sources()
-
     text = (
-        "🔐 UAV ALERT — ADMIN\n\n"
-        f"{status_text(data['overall'])}\n\n"
-        f"🕐 {data['checked_at']}\n\n"
+        "🧪 <b>ТЕСТ UAV ALERT</b>\n\n"
+        "🟡 Демонстрационное уведомление.\n"
+        "Реальной угрозы нет.\n\n"
+        f"🕐 {moscow_time()}"
     )
-
-    for source in data["sources"].values():
-
-        text += (
-            f"{source['name']}: "
-            f"{status_text(source['status'])}\n"
-        )
 
     await update.message.reply_text(
-        text
-    )
-
-
-# =========================================================
-# ТЕСТ
-# =========================================================
-
-async def test_command(
-    update,
-    context,
-):
-
-    if not is_admin(update):
-
-        await update.message.reply_text(
-            "⛔ Команда только для администратора."
-        )
-
-        return
-
-    text = (
-        "🧪 ТЕСТ UAV ALERT\n\n"
-        "📍 Костромская область\n\n"
-        "🟡 БЕСПИЛОТНАЯ ОПАСНОСТЬ\n\n"
-        "⚠️ Это тестовое сообщение.\n"
-        "Оно НЕ является реальным "
-        "сообщением об опасности.\n\n"
-        f"🕐 Время: {moscow_time()}\n\n"
-        "━━━━━━━━━━━━━━\n"
-        "📢 Партнёрская рекомендация\n"
-        "🤖 SORAVEO BOT\n"
-        f"🔗 {AD_URL}\n"
-        "━━━━━━━━━━━━━━"
+        text,
+        parse_mode="HTML"
     )
 
     try:
-
         await context.bot.send_message(
-            chat_id=CHANNEL_ID,
+            chat_id=CHANNEL,
             text=text,
+            parse_mode="HTML"
         )
-
-    except Exception as error:
-
-        print(
-            f"Ошибка отправки теста: {error}"
-        )
-
-    await update.message.reply_text(
-        "✅ Тест отправлен в канал."
-    )
+    except Exception as e:
+        print("Ошибка отправки теста:", e)
 
 
-# =========================================================
-# УВЕДОМЛЕНИЯ
-# =========================================================
+# ============================================================
+# CALLBACK
+# ============================================================
 
-def build_notification(data):
-
-    territories, cities = collect_locations(
-        data
-    )
-
-    text = (
-        "🚨 UAV ALERT\n\n"
-        "📍 Костромская область\n\n"
-        f"{status_text(data['overall'])}\n\n"
-        f"🕐 Проверено: {data['checked_at']}\n"
-    )
-
-    if territories:
-
-        text += (
-            "\n🏘️ Районы / округа, "
-            "указанные в источниках:\n"
-        )
-
-        for territory in territories:
-            text += f"• {territory}\n"
-
-    if cities:
-
-        text += (
-            "\n🏙️ Населённые пункты, "
-            "указанные в источниках:\n"
-        )
-
-        for city in cities:
-            text += f"• {city}\n"
-
-    text += (
-        "\n━━━━━━━━━━━━━━\n"
-        "📢 Партнёрская рекомендация\n"
-        "🤖 SORAVEO BOT\n"
-        f"🔗 {AD_URL}\n"
-        "━━━━━━━━━━━━━━\n\n"
-        "⚠️ Информационное уведомление.\n"
-        "Бот показывает только сведения "
-        "из доступных источников.\n"
-        "Приоритет имеют официальные "
-        "сообщения органов власти и МЧС."
-    )
-
-    return text
-
-
-async def send_notification(
-    application,
-    data,
+async def callback_router(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    subscribers = load_subscribers()
+    query = update.callback_query
 
-    text = build_notification(
-        data
-    )
+    await query.answer()
 
-    try:
+    user_id = query.from_user.id
+    user = get_user(user_id)
 
-        await application.bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=text,
+    data = query.data
+
+    # ---------------- STATUS ----------------
+
+    if data == "status":
+
+        await query.edit_message_text(
+            status_text(),
+            parse_mode="HTML",
+            reply_markup=main_keyboard()
         )
 
-        print(
-            "📢 Сообщение отправлено в канал."
+    # ---------------- MY LOCATION ----------------
+
+    elif data == "my_location":
+
+        location = user.get(
+            "location",
+            "Кострома"
         )
 
-    except Exception as error:
-
-        print(
-            f"Ошибка канала: {error}"
+        await query.edit_message_text(
+            f"📍 <b>Ваше место</b>\n\n"
+            f"Вы выбрали: <b>{location}</b>",
+            parse_mode="HTML",
+            reply_markup=main_keyboard()
         )
 
-    for user_id, user in subscribers.items():
+    # ---------------- CHANGE LOCATION ----------------
 
-        if not isinstance(user, dict):
-            continue
+    elif data == "change_location":
+
+        await query.edit_message_text(
+            "📍 <b>Выберите город:</b>",
+            parse_mode="HTML",
+            reply_markup=location_keyboard()
+        )
+
+    # ---------------- CITY ----------------
+
+    elif data.startswith("city:"):
+
+        try:
+            index = int(
+                data.split(":")[1]
+            )
+
+            location = CITIES[index]
+
+            user["location"] = location
+
+            save_json(
+                SUBSCRIBERS_FILE,
+                subscribers
+            )
+
+            await query.edit_message_text(
+                f"✅ Место сохранено.\n\n"
+                f"📍 <b>{location}</b>",
+                parse_mode="HTML",
+                reply_markup=main_keyboard()
+            )
+
+        except Exception:
+            await query.edit_message_text(
+                "Ошибка выбора города."
+            )
+
+    # ---------------- TERRITORIES ----------------
+
+    elif data == "territories":
+
+        await query.edit_message_text(
+            "🏘 <b>Выберите муниципальный округ:</b>",
+            parse_mode="HTML",
+            reply_markup=territory_keyboard()
+        )
+
+    # ---------------- TERRITORY ----------------
+
+    elif data.startswith("terr:"):
+
+        try:
+            index = int(
+                data.split(":")[1]
+            )
+
+            location = TERRITORIES[index]
+
+            user["location"] = location
+
+            save_json(
+                SUBSCRIBERS_FILE,
+                subscribers
+            )
+
+            await query.edit_message_text(
+                f"✅ Место сохранено.\n\n"
+                f"📍 <b>{location}</b>",
+                parse_mode="HTML",
+                reply_markup=main_keyboard()
+            )
+
+        except Exception:
+            await query.edit_message_text(
+                "Ошибка выбора округа."
+            )
+
+    # ---------------- HISTORY ----------------
+
+    elif data == "history":
+
+        if not history:
+
+            text = (
+                "📚 <b>История</b>\n\n"
+                "История пока пустая."
+            )
+
+        else:
+
+            lines = [
+                "📚 <b>Последние события</b>\n"
+            ]
+
+            for item in history[:10]:
+
+                lines.append(
+                    f"{item.get('time', '')} — "
+                    f"{status_name(item.get('status'))}\n"
+                    f"📍 {item.get('location') or 'Костромская область'}\n"
+                )
+
+            text = "\n".join(lines)
+
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=main_keyboard()
+        )
+
+    # ---------------- SUMMARY ----------------
+
+    elif data == "summary":
+
+        await query.edit_message_text(
+            summary_text(),
+            parse_mode="HTML",
+            reply_markup=main_keyboard()
+        )
+
+    # ---------------- SOURCES ----------------
+
+    elif data == "sources":
+
+        lines = [
+            "📡 <b>Источники UAV ALERT</b>\n"
+        ]
+
+        for source in SOURCES.values():
+
+            lines.append(
+                f"{source['name']}\n"
+                f"{source['url']}\n"
+            )
+
+        lines.append(
+            "⚠️ Указанные источники могут быть "
+            "вторичными. Приоритет имеют официальные "
+            "сообщения органов власти и МЧС."
+        )
+
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=main_keyboard()
+        )
+
+    # ---------------- SETTINGS ----------------
+
+    elif data == "settings":
+
+        notifications = (
+            "включены"
+            if user.get("notifications", True)
+            else "выключены"
+        )
+
+        green = (
+            "включены"
+            if user.get("green_notifications", True)
+            else "выключены"
+        )
+
+        text = (
+            "⚙️ <b>Настройки</b>\n\n"
+            f"🔔 Уведомления: <b>{notifications}</b>\n"
+            f"🟢 Уведомления об отбое: <b>{green}</b>"
+        )
+
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=settings_keyboard()
+        )
+
+    # ---------------- TOGGLE NOTIFICATIONS ----------------
+
+    elif data == "toggle_notifications":
+
+        user["notifications"] = not user.get(
+            "notifications",
+            True
+        )
+
+        save_json(
+            SUBSCRIBERS_FILE,
+            subscribers
+        )
+
+        await query.edit_message_text(
+            "⚙️ Настройки обновлены.",
+            reply_markup=settings_keyboard()
+        )
+
+    # ---------------- TOGGLE GREEN ----------------
+
+    elif data == "toggle_green":
+
+        user["green_notifications"] = not user.get(
+            "green_notifications",
+            True
+        )
+
+        save_json(
+            SUBSCRIBERS_FILE,
+            subscribers
+        )
+
+        await query.edit_message_text(
+            "⚙️ Настройки обновлены.",
+            reply_markup=settings_keyboard()
+        )
+
+    # ---------------- BACK ----------------
+
+    elif data == "back":
+
+        await query.edit_message_text(
+            "🚨 <b>UAV ALERT</b>\n\n"
+            "Выберите нужный раздел:",
+            parse_mode="HTML",
+            reply_markup=main_keyboard()
+        )
+
+
+# ============================================================
+# УВЕДОМЛЕНИЯ
+# ============================================================
+
+async def notify_subscribers(bot, new_state):
+
+    for user_id, user in list(
+        subscribers.items()
+    ):
 
         if not user.get(
             "notifications",
-            True,
+            True
         ):
             continue
 
         location = user.get(
-            "location"
+            "location",
+            "Кострома"
         )
 
-        if not location:
-            continue
+        source_text = new_state.get(
+            "text",
+            ""
+        )
 
-        if not notification_matches_location(
-            location,
-            data,
-        ):
-            continue
+        # Отправляем уведомление только если
+        # выбранное место явно встречается
+        # в исходном сообщении.
+        if location.lower() not in source_text.lower():
+
+            if location != "Костромская область":
+                continue
+
+        status = new_state["status"]
 
         if (
-            data["overall"] == "green"
+            status == "green"
             and not user.get(
-                "send_green",
-                True,
+                "green_notifications",
+                True
             )
         ):
             continue
+
+        message = (
+            f"🚨 <b>UAV ALERT</b>\n\n"
+            f"{status_name(status)}\n\n"
+            f"📍 {location}\n"
+            f"🕐 {new_state.get('updated', moscow_time())}\n"
+            f"📡 {new_state.get('source', '—')}\n\n"
+            "⚠️ Информация носит справочный характер. "
+            "Приоритет имеют официальные сообщения "
+            "органов власти и МЧС."
+        )
 
         try:
 
-            await application.bot.send_message(
+            await bot.send_message(
                 chat_id=int(user_id),
-                text=text,
+                text=message,
+                parse_mode="HTML"
             )
 
-        except Exception as error:
+        except Exception as e:
 
             print(
-                f"Ошибка пользователю "
-                f"{user_id}: {error}"
+                "Ошибка уведомления:",
+                user_id,
+                e
             )
 
 
-# =========================================================
+# ============================================================
 # МОНИТОРИНГ
-# =========================================================
+# ============================================================
 
-async def monitor(application):
+async def monitor_loop(bot):
 
-    print(
-        "📡 Мониторинг запущен."
-    )
-
-    previous = load_json(
-        STATE_FILE,
-        None,
-    )
-
-    first_run = previous is None
+    global state
 
     while True:
 
         try:
 
-            data = check_sources()
+            result = find_latest_status()
 
-            current = {
-                "overall": data["overall"],
-                "sources": data["sources"],
-                "checked_at": data["checked_at"],
-            }
+            if result:
 
-            if first_run:
-
-                save_json(
-                    STATE_FILE,
-                    current,
-                )
-
-                previous = current
-                first_run = False
-
-                print(
-                    "💾 Первичное состояние сохранено."
-                )
-
-            else:
-
-                old_compare = {
-                    "overall": previous.get(
-                        "overall"
-                    ),
-                    "sources": previous.get(
-                        "sources",
-                        {},
-                    ),
+                new_state = {
+                    "status": result["status"],
+                    "text": result["text"],
+                    "source": result["source"],
+                    "post_id": result["post_id"],
+                    "location": result["location"],
+                    "updated": moscow_time(),
                 }
 
-                new_compare = {
-                    "overall": current["overall"],
-                    "sources": current["sources"],
-                }
+                old_status = state.get(
+                    "status"
+                )
 
-                if old_compare != new_compare:
+                old_post = state.get(
+                    "post_id"
+                )
 
-                    print(
-                        "🔄 Обнаружено изменение."
+                if (
+                    new_state["status"] != old_status
+                    or new_state["post_id"] != old_post
+                ):
+
+                    state = new_state
+
+                    save_json(
+                        STATE_FILE,
+                        state
                     )
 
                     add_history(
-                        data
+                        state
                     )
 
-                    await send_notification(
-                        application,
-                        data,
+                    await notify_subscribers(
+                        bot,
+                        state
                     )
 
-                    save_json(
-                        STATE_FILE,
-                        current,
+                    channel_message = (
+                        f"🚨 <b>UAV ALERT</b>\n\n"
+                        f"{status_name(state['status'])}\n\n"
+                        f"📍 {state['location'] or 'Костромская область'}\n"
+                        f"🕐 {state['updated']}\n"
+                        f"📡 {state['source']}\n\n"
+                        "⚠️ Информация носит "
+                        "справочный характер.\n"
+                        "Приоритет имеют официальные "
+                        "сообщения органов власти и МЧС."
                     )
 
-                    previous = current
+                    try:
 
-                else:
+                        await bot.send_message(
+                            chat_id=CHANNEL,
+                            text=channel_message,
+                            parse_mode="HTML"
+                        )
 
-                    save_json(
-                        STATE_FILE,
-                        current,
-                    )
+                    except Exception as e:
 
-                    previous[
-                        "checked_at"
-                    ] = current[
-                        "checked_at"
-                    ]
+                        print(
+                            "Ошибка канала:",
+                            e
+                        )
 
-        except Exception as error:
+        except Exception as e:
 
             print(
-                f"Ошибка мониторинга: {error}"
+                "Ошибка мониторинга:",
+                e
             )
 
         await asyncio.sleep(
@@ -1779,174 +1141,131 @@ async def monitor(application):
         )
 
 
-# =========================================================
-# КОМАНДЫ TELEGRAM
-# =========================================================
+# ============================================================
+# СТАТИСТИКА АДМИНА
+# ============================================================
 
-async def setup_commands(
-    application,
+async def stats_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    commands = [
+    if not is_admin(update):
+
+        await update.message.reply_text(
+            "⛔ Нет доступа."
+        )
+
+        return
+
+    active = 0
+
+    for user in subscribers.values():
+
+        if user.get(
+            "notifications",
+            True
+        ):
+            active += 1
+
+    text = (
+        "📊 <b>UAV ALERT — статистика</b>\n\n"
+        f"👥 Пользователей: {len(subscribers)}\n"
+        f"🔔 Активных уведомлений: {active}\n"
+        f"📡 Источников: {len(SOURCES)}\n"
+        f"📚 Записей истории: {len(history)}\n"
+        f"📍 Городов: {len(CITIES)}\n"
+        f"🏘 Округов: {len(TERRITORIES)}\n"
+    )
+
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML"
+    )
+
+
+# ============================================================
+# FLASK
+# ============================================================
+
+app_web = Flask(__name__)
+
+
+@app_web.route("/")
+def home():
+
+    return "UAV ALERT работает."
+
+
+@app_web.route("/status")
+def web_status():
+
+    return jsonify(state)
+
+
+def run_flask():
+
+    app_web.run(
+        host="0.0.0.0",
+        port=PORT
+    )
+
+
+# ============================================================
+# POST INIT
+# ============================================================
+
+async def post_init(application):
+
+    await application.bot.set_my_commands([
         BotCommand(
             "start",
-            "🚨 Запустить UAV ALERT",
+            "Главное меню"
         ),
         BotCommand(
             "status",
-            "📊 Текущий статус",
+            "Текущий статус"
         ),
         BotCommand(
             "stop",
-            "🔕 Отключить уведомления",
+            "Отключить уведомления"
         ),
-    ]
-
-    await application.bot.set_my_commands(
-        commands
-    )
-
-    print(
-        "⌨️ Меню команд Telegram установлено."
-    )
-
-
-# =========================================================
-# POST INIT
-# =========================================================
-
-async def post_init(
-    application,
-):
-
-    await setup_commands(
-        application
-    )
+        BotCommand(
+            "test",
+            "Тестовое уведомление"
+        ),
+        BotCommand(
+            "stats",
+            "Статистика"
+        ),
+    ])
 
     asyncio.create_task(
-        monitor(application)
+        monitor_loop(
+            application.bot
+        )
     )
 
 
-# =========================================================
-# CALLBACK ROUTER
-# =========================================================
-
-async def callback_router(
-    update,
-    context,
-):
-
-    query = update.callback_query
-
-    if not query:
-        return
-
-    data = query.data
-
-    if data == "main_menu":
-
-        await query.answer()
-
-        await query.edit_message_text(
-            "🚨 UAV ALERT\n\n"
-            "Выберите действие:",
-            reply_markup=main_keyboard(),
-        )
-
-    elif data == "choose_location":
-
-        await choose_location(
-            update,
-            context,
-        )
-
-    elif data == "location_city":
-
-        await show_cities(
-            update,
-            context,
-        )
-
-    elif data == "location_territory":
-
-        await show_territories(
-            update,
-            context,
-        )
-
-    elif data.startswith("city:"):
-
-        await select_city(
-            update,
-            context,
-        )
-
-    elif data.startswith("territory:"):
-
-        await select_territory(
-            update,
-            context,
-        )
-
-    elif data == "my_location":
-
-        await my_location(
-            update,
-            context,
-        )
-
-    elif data == "current_status":
-
-        await current_status(
-            update,
-            context,
-        )
-
-    elif data == "history":
-
-        await history_command(
-            update,
-            context,
-        )
-
-    elif data == "settings":
-
-        await settings_command(
-            update,
-            context,
-        )
-
-    elif data == "toggle_notifications":
-
-        await toggle_notifications(
-            update,
-            context,
-        )
-
-    elif data == "toggle_green":
-
-        await toggle_green(
-            update,
-            context,
-        )
-
-
-# =========================================================
+# ============================================================
 # MAIN
-# =========================================================
+# ============================================================
 
 def main():
 
     if not BOT_TOKEN:
 
-        raise RuntimeError(
-            "Переменная BOT_TOKEN не найдена."
+        print(
+            "ОШИБКА: BOT_TOKEN не найден."
         )
 
+        return
+
+    # Flask работает отдельно,
+    # чтобы Render видел активный web-сервис.
     threading.Thread(
         target=run_flask,
-        daemon=True,
+        daemon=True
     ).start()
 
     application = (
@@ -1959,28 +1278,35 @@ def main():
     application.add_handler(
         CommandHandler(
             "start",
-            start,
+            start
         )
     )
 
     application.add_handler(
         CommandHandler(
             "status",
-            status_command,
+            status_command
         )
     )
 
     application.add_handler(
         CommandHandler(
             "stop",
-            stop,
+            stop
         )
     )
 
     application.add_handler(
         CommandHandler(
             "test",
-            test_command,
+            test_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "stats",
+            stats_command
         )
     )
 
@@ -1991,19 +1317,12 @@ def main():
     )
 
     print(
-        "🤖 UAV ALERT запущен."
+        "🚨 UAV ALERT запущен"
     )
 
-    print(
-        "🕐 Время: МСК (UTC+3)"
+    application.run_polling(
+        drop_pending_updates=True
     )
-
-    print(
-        "📢 Канал:",
-        CHANNEL_ID,
-    )
-
-    application.run_polling()
 
 
 if __name__ == "__main__":
