@@ -581,11 +581,11 @@ def normalize_state():
     # собираем его из старых данных.
     # --------------------------------------------------------
 
-    if not state.get(
+        if not state.get(
         "active_locations"
     ):
 
-        state["active_locations"] = unique_list(
+        old_locations = (
             state.get(
                 "districts",
                 [],
@@ -597,6 +597,14 @@ def normalize_state():
             + state.get(
                 "cities",
                 [],
+            )
+        )
+
+        state[
+            "active_locations"
+        ] = list(
+            dict.fromkeys(
+                old_locations
             )
         )
 
