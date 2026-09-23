@@ -5,7 +5,7 @@ import time
 import hashlib
 import threading
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 from bs4 import BeautifulSoup
@@ -46,6 +46,7 @@ from telegram.ext import (
 # - Подписчики
 # - Автоматический мониторинг Telegram-источников
 # - Жёсткая защита от повторных пушей
+# - Время МСК
 # ============================================================
 
 
@@ -66,6 +67,15 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
 # Сколько часов хранить отпечатки уведомлений.
 # Это защита от повторного спама.
 DEDUP_HOURS = int(os.getenv("DEDUP_HOURS", "24"))
+
+
+# ============================================================
+# МОСКОВСКОЕ ВРЕМЯ
+# ============================================================
+
+MSK = timezone(
+    timedelta(hours=3)
+)
 
 
 # ============================================================
@@ -428,7 +438,7 @@ normalize_state()
 
 def now_iso():
     return datetime.now(
-        timezone.utc
+        MSK
     ).isoformat()
 
 
@@ -651,6 +661,8 @@ def detect_event(text):
     if (
         "отбой по бпла" in normalized
         or "отбой бпла" in normalized
+        or "отбой по беспилотникам" in normalized
+        or "отбой беспилотной опасности" in normalized
         or "угроза бпла отменена" in normalized
         or "опасность бпла отменена" in normalized
         or "угроза атаки бпла снята" in normalized
@@ -659,6 +671,8 @@ def detect_event(text):
         or "опасность по бпла снята" in normalized
         or "внимание по бпла снято" in normalized
         or "внимание бпла снято" in normalized
+        or "опасность беспилотников снята" in normalized
+        or "угроза беспилотников снята" in normalized
     ):
 
         return (
@@ -870,11 +884,29 @@ def make_event_fingerprint(
 
     # --------------------------------------------------------
     # РАКЕТНАЯ ОПАСНОСТЬ
+    #
+    # ВАЖНО:
+    # Используем номер цикла, чтобы после:
+    #
+    # Ракетная опасность -> Отбой ->
+    # новая ракетная опасность
+    #
+    # новый Push не считался старым.
     # --------------------------------------------------------
 
     elif event_type == "rocket":
 
-        raw = "rocket|1"
+        if rocket_cycle is None:
+
+            rocket_cycle = state.get(
+                "rocket_cycle",
+                0,
+            )
+
+        raw = (
+            "rocket|"
+            + str(rocket_cycle)
+        )
 
 
     # --------------------------------------------------------
@@ -1323,15 +1355,31 @@ def apply_event(
                 "cities"
             ] = []
 
-            state[
-                "status"
-            ] = "green"
+            # Если ракетная опасность всё ещё активна,
+            # состояние должно остаться ракетным.
+            if old_rocket:
 
-            state[
-                "title"
-            ] = (
-                "🟢 Опасность не объявлена"
-            )
+                state[
+                    "status"
+                ] = "red"
+
+                state[
+                    "title"
+                ] = (
+                    "🚨 Ракетная опасность"
+                )
+
+            else:
+
+                state[
+                    "status"
+                ] = "green"
+
+                state[
+                    "title"
+                ] = (
+                    "🟢 Опасность не объявлена"
+                )
 
             state[
                 "source"
@@ -1883,13 +1931,49 @@ def format_status():
 
             lines.append(
                 "🕐 <b>Обновлено:</b> "
-                + state["updated_at"]
+                + format_msk_datetime(
+                    state["updated_at"]
+                )
             )
 
 
         return "\n".join(
             lines
         )
+
+
+# ============================================================
+# ФОРМАТИРОВАНИЕ ДАТЫ
+# ============================================================
+
+def format_msk_datetime(value):
+    """
+    Преобразует сохранённое время в МСК.
+    Если значение уже без timezone,
+    просто возвращает его.
+    """
+
+    if not value:
+        return ""
+
+    try:
+        dt = datetime.fromisoformat(
+            value
+        )
+
+        if dt.tzinfo is not None:
+
+            dt = dt.astimezone(
+                MSK
+            )
+
+        return dt.strftime(
+            "%d.%m.%Y %H:%M"
+        )
+
+    except Exception:
+
+        return str(value)
 
 
 # ============================================================
@@ -1988,6 +2072,22 @@ def format_history(
 
             lines.append(
                 f"📡 {source}"
+            )
+
+
+        timestamp = item.get(
+            "timestamp",
+            "",
+        )
+
+
+        if timestamp:
+
+            lines.append(
+                "🕐 "
+                + format_msk_datetime(
+                    timestamp
+                )
             )
 
 
@@ -2817,14 +2917,6 @@ async def process_post(
 
 
     # --------------------------------------------------------
-    # РАКЕТНАЯ ОПАСНОСТЬ
-    #
-    # Сохраняем старое поведение:
-    # сообщение о ракетной опасности обрабатывается.
-    # --------------------------------------------------------
-
-
-    # --------------------------------------------------------
     # ОТПЕЧАТОК КОНКРЕТНОГО ПОСТА
     # --------------------------------------------------------
 
@@ -3251,16 +3343,19 @@ def build_push_message(
 
 
     # --------------------------------------------------------
-    # Время
+    # Время — МСК
     # --------------------------------------------------------
 
     lines.append("")
 
     lines.append(
         "🕐 "
-        + datetime.now().strftime(
+        + datetime.now(
+            MSK
+        ).strftime(
             "%d.%m.%Y %H:%M"
         )
+        + " МСК"
     )
 
 
@@ -3668,6 +3763,11 @@ def main():
 
     logger.info(
         "Регион: Костромская область"
+    )
+
+
+    logger.info(
+        "Время: МСК (UTC+3)"
     )
 
 
