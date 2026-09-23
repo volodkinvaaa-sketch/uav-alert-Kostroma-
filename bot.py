@@ -5,7 +5,7 @@ import time
 import hashlib
 import threading
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 from bs4 import BeautifulSoup
@@ -39,13 +39,16 @@ from telegram.ext import (
 # - Push на все уровни тревоги
 # - Push на отбои
 # - Несколько районов одновременно
-# - Районы и города разделены
+# - Муниципальные округа
+# - Города
+# - Каждый населённый пункт/район показывается отдельно
 # - История событий
 # - Статистика
 # - Источники
 # - Подписчики
 # - Автоматический мониторинг Telegram-источников
 # - Жёсткая защита от повторных пушей
+# - Московское время
 # ============================================================
 
 
@@ -69,10 +72,21 @@ DEDUP_HOURS = int(os.getenv("DEDUP_HOURS", "24"))
 
 
 # ============================================================
+# МОСКОВСКОЕ ВРЕМЯ
+# ============================================================
+
+MSK = timezone(
+    timedelta(hours=3)
+)
+
+
+# ============================================================
 # ФАЙЛЫ
 # ============================================================
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(
+    os.path.abspath(__file__)
+)
 
 SUBSCRIBERS_FILE = os.path.join(
     BASE_DIR,
@@ -109,7 +123,9 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-logger = logging.getLogger("UAV_ALERT")
+logger = logging.getLogger(
+    "UAV_ALERT"
+)
 
 
 # ============================================================
@@ -144,8 +160,15 @@ SOURCES = {
 #
 # ВАЖНО:
 # Названия районов используются отдельно от городов.
-# Поэтому слово "Макарьев" не означает автоматически
-# "Макарьевский район".
+#
+# Например:
+#
+# "Макарьев" -> город Макарьев
+#
+# "Макарьевский район" -> Макарьевский район
+#
+# "Макарьевский муниципальный округ" ->
+# муниципальный округ
 # ============================================================
 
 DISTRICTS = {
@@ -173,10 +196,42 @@ DISTRICTS = {
 
 
 # ============================================================
+# МУНИЦИПАЛЬНЫЕ ОКРУГА
+#
+# Бот ищет их отдельно от районов.
+# ============================================================
+
+MUNICIPAL_DISTRICTS = {
+    "антроповский": "Антроповский муниципальный округ",
+    "буйский": "Буйский муниципальный округ",
+    "вохомский": "Вохомский муниципальный округ",
+    "галичский": "Галичский муниципальный округ",
+    "кадийский": "Кадыйский муниципальный округ",
+    "кологривский": "Кологривский муниципальный округ",
+    "макарьевский": "Макарьевский муниципальный округ",
+    "мантуровский": "Мантуровский муниципальный округ",
+    "межевский": "Межевский муниципальный округ",
+    "нейский": "Нейский муниципальный округ",
+    "октябрьский": "Октябрьский муниципальный округ",
+    "островский": "Островский муниципальный округ",
+    "павинский": "Павинский муниципальный округ",
+    "парфеньевский": "Парфеньевский муниципальный округ",
+    "поназыревский": "Поназыревский муниципальный округ",
+    "пыщугский": "Пыщугский муниципальный округ",
+    "солигаличский": "Солигаличский муниципальный округ",
+    "сусанинский": "Сусанинский муниципальный округ",
+    "чухломский": "Чухломский муниципальный округ",
+    "шарьинский": "Шарьинский муниципальный округ",
+}
+
+
+# ============================================================
 # ГОРОДА
 #
 # Они используются только для определения места в тексте.
-# Они НЕ добавляются в список районов под опасностью.
+#
+# ВАЖНО:
+# Город не превращается автоматически в район.
 # ============================================================
 
 CITIES = [
@@ -230,6 +285,22 @@ DEFAULT_STATE = {
     # Активные районы
     "districts": [],
 
+    # Активные муниципальные округа
+    "municipal_districts": [],
+
+    # Активные места в едином списке.
+    #
+    # Например:
+    # [
+    #   "Нейский район",
+    #   "Кострома",
+    #   "Шарьинский муниципальный округ"
+    # ]
+    #
+    # Здесь находятся ТОЛЬКО места,
+    # где есть активная информация о БПЛА.
+    "active_locations": [],
+
     # Найденные города для информационного отображения
     "cities": [],
 
@@ -243,12 +314,6 @@ DEFAULT_STATE = {
 
     # --------------------------------------------------------
     # НОМЕР ЦИКЛА БПЛА
-    #
-    # Нужен для того, чтобы:
-    #
-    # Тревога -> Отбой -> новая тревога -> Отбой
-    #
-    # считались разными событиями.
     # --------------------------------------------------------
     "uav_cycle": 0,
 
@@ -259,14 +324,18 @@ DEFAULT_STATE = {
 
     # --------------------------------------------------------
     # Последний уровень БПЛА.
-    #
-    # Нужен для корректного текста отбоя.
     # --------------------------------------------------------
     "last_uav_level": 0,
 
     # Районы, которые были активны перед последним отбоем.
-    # Используются для push-сообщения.
     "last_uav_districts": [],
+
+    # Муниципальные округа,
+    # которые были активны перед последним отбоем.
+    "last_uav_municipal_districts": [],
+
+    # Все активные места перед последним отбоем.
+    "last_uav_locations": [],
 }
 
 
@@ -277,9 +346,17 @@ state_lock = threading.Lock()
 # ЗАГРУЗКА / СОХРАНЕНИЕ JSON
 # ============================================================
 
-def load_json(filename, default):
+def load_json(
+    filename,
+    default,
+):
+
     try:
-        if not os.path.exists(filename):
+
+        if not os.path.exists(
+            filename
+        ):
+
             return default
 
         with open(
@@ -287,9 +364,13 @@ def load_json(filename, default):
             "r",
             encoding="utf-8",
         ) as f:
-            return json.load(f)
+
+            return json.load(
+                f
+            )
 
     except Exception as e:
+
         logger.error(
             "Ошибка чтения %s: %s",
             filename,
@@ -299,8 +380,13 @@ def load_json(filename, default):
         return default
 
 
-def save_json(filename, data):
+def save_json(
+    filename,
+    data,
+):
+
     try:
+
         tmp = filename + ".tmp"
 
         with open(
@@ -308,6 +394,7 @@ def save_json(filename, data):
             "w",
             encoding="utf-8",
         ) as f:
+
             json.dump(
                 data,
                 f,
@@ -321,6 +408,7 @@ def save_json(filename, data):
         )
 
     except Exception as e:
+
         logger.error(
             "Ошибка сохранения %s: %s",
             filename,
@@ -363,60 +451,154 @@ notification_events = load_json(
 # ============================================================
 
 def normalize_state():
+
     global state
 
-    if not isinstance(state, dict):
+    if not isinstance(
+        state,
+        dict,
+    ):
+
         state = DEFAULT_STATE.copy()
+
 
     for key, value in DEFAULT_STATE.items():
 
         if key not in state:
 
-            # Для списков создаём отдельный список.
-            if isinstance(value, list):
+            if isinstance(
+                value,
+                list,
+            ):
+
                 state[key] = []
 
             else:
+
                 state[key] = value
+
 
     if not isinstance(
         state.get("districts"),
         list,
     ):
+
         state["districts"] = []
+
+
+    if not isinstance(
+        state.get("municipal_districts"),
+        list,
+    ):
+
+        state["municipal_districts"] = []
+
+
+    if not isinstance(
+        state.get("active_locations"),
+        list,
+    ):
+
+        state["active_locations"] = []
+
 
     if not isinstance(
         state.get("cities"),
         list,
     ):
+
         state["cities"] = []
+
 
     if not isinstance(
         state.get("last_uav_districts"),
         list,
     ):
+
         state["last_uav_districts"] = []
 
+
+    if not isinstance(
+        state.get("last_uav_municipal_districts"),
+        list,
+    ):
+
+        state["last_uav_municipal_districts"] = []
+
+
+    if not isinstance(
+        state.get("last_uav_locations"),
+        list,
+    ):
+
+        state["last_uav_locations"] = []
+
+
     try:
+
         state["uav_cycle"] = int(
-            state.get("uav_cycle", 0)
+            state.get(
+                "uav_cycle",
+                0,
+            )
         )
+
     except Exception:
+
         state["uav_cycle"] = 0
 
-    try:
-        state["rocket_cycle"] = int(
-            state.get("rocket_cycle", 0)
-        )
-    except Exception:
-        state["rocket_cycle"] = 0
 
     try:
-        state["last_uav_level"] = int(
-            state.get("last_uav_level", 0)
+
+        state["rocket_cycle"] = int(
+            state.get(
+                "rocket_cycle",
+                0,
+            )
         )
+
     except Exception:
+
+        state["rocket_cycle"] = 0
+
+
+    try:
+
+        state["last_uav_level"] = int(
+            state.get(
+                "last_uav_level",
+                0,
+            )
+        )
+
+    except Exception:
+
         state["last_uav_level"] = 0
+
+
+    # --------------------------------------------------------
+    # Если active_locations ещё нет,
+    # собираем его из старых данных.
+    # --------------------------------------------------------
+
+    if not state.get(
+        "active_locations"
+    ):
+
+        state["active_locations"] = unique_list(
+            state.get(
+                "districts",
+                [],
+            )
+            + state.get(
+                "municipal_districts",
+                [],
+            )
+            + state.get(
+                "cities",
+                [],
+            )
+        )
 
 
 normalize_state()
@@ -427,13 +609,18 @@ normalize_state()
 # ============================================================
 
 def now_iso():
+
     return datetime.now(
-        timezone.utc
+        MSK
     ).isoformat()
 
 
-def clean_text(text):
+def clean_text(
+    text,
+):
+
     if not text:
+
         return ""
 
     text = text.replace(
@@ -450,19 +637,20 @@ def clean_text(text):
     return text.strip()
 
 
-def normalize_text(text):
+def normalize_text(
+    text,
+):
+
     text = clean_text(
         text
     ).lower()
 
-    # Убираем URL
     text = re.sub(
         r"https?://\S+",
         "",
         text,
     )
 
-    # Убираем лишние символы
     text = re.sub(
         r"[^\w\sа-яё-]",
         " ",
@@ -479,19 +667,30 @@ def normalize_text(text):
     return text.strip()
 
 
-def make_hash(text):
+def make_hash(
+    text,
+):
+
     return hashlib.sha256(
-        text.encode("utf-8")
+        text.encode(
+            "utf-8"
+        )
     ).hexdigest()
 
 
-def unique_list(items):
+def unique_list(
+    items,
+):
+
     result = []
 
     for item in items:
 
         if item not in result:
-            result.append(item)
+
+            result.append(
+                item
+            )
 
     return result
 
@@ -500,21 +699,14 @@ def unique_list(items):
 # ОПРЕДЕЛЕНИЕ РАЙОНОВ
 # ============================================================
 
-def detect_districts(text):
-    """
-    Определяет именно районы.
-
-    Например:
-    "Нейский район" -> Нейский район
-
-    "Макарьев" -> НЕ Макарьевский район
-
-    "Макарьевский район" -> Макарьевский район
-    """
+def detect_districts(
+    text,
+):
 
     text_lower = text.lower()
 
     found = []
+
 
     for key, district_name in DISTRICTS.items():
 
@@ -524,14 +716,19 @@ def detect_districts(text):
             key,
         ]
 
-        # Для неоднозначных названий требуем
-        # именно форму с "район".
+
+        # ----------------------------------------------------
+        # Для неоднозначных названий
+        # обязательно требуем "район".
+        # ----------------------------------------------------
+
         if key == "макарьевский":
 
             variants = [
                 "макарьевский район",
                 "макарьевский р-н",
             ]
+
 
         if key == "буйский":
 
@@ -540,12 +737,14 @@ def detect_districts(text):
                 "буйский р-н",
             ]
 
+
         if key == "галичский":
 
             variants = [
                 "галичский район",
                 "галичский р-н",
             ]
+
 
         for variant in variants:
 
@@ -557,17 +756,133 @@ def detect_districts(text):
 
                 break
 
-    return unique_list(found)
+
+    return unique_list(
+        found
+    )
+
+
+# ============================================================
+# ОПРЕДЕЛЕНИЕ МУНИЦИПАЛЬНЫХ ОКРУГОВ
+# ============================================================
+
+def detect_municipal_districts(
+    text,
+):
+
+    text_lower = text.lower()
+
+    found = []
+
+
+    for key, district_name in MUNICIPAL_DISTRICTS.items():
+
+        variants = [
+            f"{key} муниципальный округ",
+            f"{key} мунициальный округ",
+            f"{key} мо",
+        ]
+
+
+        for variant in variants:
+
+            if variant in text_lower:
+
+                found.append(
+                    district_name
+                )
+
+                break
+
+
+    # --------------------------------------------------------
+    # Дополнительно ловим формы:
+    #
+    # "Нейский муниципальный округ"
+    # "Костромской муниципальный округ"
+    #
+    # даже если конкретного названия нет в словаре.
+    # --------------------------------------------------------
+
+    generic_matches = re.findall(
+        r"\b([а-яё-]+)\s+муниципальн(?:ый|ого|ом|ым)\s+округ\b",
+        text_lower,
+        flags=re.IGNORECASE,
+    )
+
+
+    for match in generic_matches:
+
+        words = match.strip(
+            " -"
+        ).split()
+
+
+        if not words:
+
+            continue
+
+
+        name = words[0].capitalize()
+
+        generic_name = (
+            name
+            + " муниципальный округ"
+        )
+
+
+        if generic_name not in found:
+
+            found.append(
+                generic_name
+            )
+
+
+    # --------------------------------------------------------
+    # Городские округа.
+    # --------------------------------------------------------
+
+    city_matches = re.findall(
+        r"\b([а-яё-]+)\s+городск(?:ой|ого|ом|им)\s+округ\b",
+        text_lower,
+        flags=re.IGNORECASE,
+    )
+
+
+    for match in city_matches:
+
+        name = match.capitalize()
+
+        generic_name = (
+            name
+            + " городской округ"
+        )
+
+
+        if generic_name not in found:
+
+            found.append(
+                generic_name
+            )
+
+
+    return unique_list(
+        found
+    )
 
 
 # ============================================================
 # ОПРЕДЕЛЕНИЕ ГОРОДОВ
 # ============================================================
 
-def detect_cities(text):
+def detect_cities(
+    text,
+):
+
     text_lower = text.lower()
 
     found = []
+
 
     for city in CITIES:
 
@@ -576,6 +891,7 @@ def detect_cities(text):
             + re.escape(city)
             + r"(?![а-яё])"
         )
+
 
         if re.search(
             pattern,
@@ -587,7 +903,50 @@ def detect_cities(text):
                 city.capitalize()
             )
 
-    return unique_list(found)
+
+    return unique_list(
+        found
+    )
+
+
+# ============================================================
+# ОПРЕДЕЛЕНИЕ ВСЕХ МЕСТ
+#
+# Здесь собираются только конкретно найденные места.
+# ============================================================
+
+def detect_locations(
+    text,
+):
+
+    districts = detect_districts(
+        text
+    )
+
+    municipal_districts = (
+        detect_municipal_districts(
+            text
+        )
+    )
+
+    cities = detect_cities(
+        text
+    )
+
+
+    locations = unique_list(
+        districts
+        + municipal_districts
+        + cities
+    )
+
+
+    return {
+        "districts": districts,
+        "municipal_districts": municipal_districts,
+        "cities": cities,
+        "locations": locations,
+    }
 
 
 # ============================================================
@@ -595,6 +954,7 @@ def detect_cities(text):
 # ============================================================
 
 UAV_LEVELS = {
+
     0: {
         "name": "Нет опасности",
         "title": "🟢 Опасность не объявлена",
@@ -625,24 +985,14 @@ UAV_LEVELS = {
 # ОПРЕДЕЛЕНИЕ ТИПА СОБЫТИЯ
 # ============================================================
 
-def detect_event(text):
-    """
-    Возвращает:
-
-        None
-
-        ("uav", level)
-
-        ("uav_cancel", 0)
-
-        ("rocket", 1)
-
-        ("rocket_cancel", 0)
-    """
+def detect_event(
+    text,
+):
 
     normalized = normalize_text(
         text
     )
+
 
     # --------------------------------------------------------
     # ОТБОЙ БПЛА
@@ -754,29 +1104,69 @@ def detect_event(text):
 # ПРОВЕРКА ОТНОШЕНИЯ К КОСТРОМСКОЙ ОБЛАСТИ
 # ============================================================
 
-def is_kostroma_related(text):
+def is_kostroma_related(
+    text,
+):
+
     normalized = normalize_text(
         text
     )
 
+
+    # --------------------------------------------------------
+    # Прямое упоминание региона.
+    # --------------------------------------------------------
+
     for word in REGION_WORDS:
 
         if word in normalized:
+
             return True
+
+
+    # --------------------------------------------------------
+    # Районы.
+    # --------------------------------------------------------
 
     districts = detect_districts(
         text
     )
 
+
     if districts:
+
         return True
+
+
+    # --------------------------------------------------------
+    # Муниципальные округа.
+    # --------------------------------------------------------
+
+    municipal_districts = (
+        detect_municipal_districts(
+            text
+        )
+    )
+
+
+    if municipal_districts:
+
+        return True
+
+
+    # --------------------------------------------------------
+    # Города.
+    # --------------------------------------------------------
 
     cities = detect_cities(
         text
     )
 
+
     if cities:
+
         return True
+
 
     return False
 
@@ -785,38 +1175,20 @@ def is_kostroma_related(text):
 # ФОРМИРОВАНИЕ ОПИСАНИЯ СОБЫТИЯ
 # ============================================================
 
-def build_event_description(text):
+def build_event_description(
+    text,
+):
 
-    districts = detect_districts(
+    detected = detect_locations(
         text
     )
 
-    cities = detect_cities(
-        text
-    )
 
-    return {
-        "districts": districts,
-        "cities": cities,
-    }
+    return detected
 
 
 # ============================================================
 # СОЗДАНИЕ ОТПЕЧАТКА СОБЫТИЯ
-#
-# ГЛАВНАЯ ЗАЩИТА ОТ ПОВТОРНЫХ PUSH.
-#
-# Теперь для ОТБОЯ используется номер цикла.
-#
-# Например:
-#
-# Цикл 1:
-# Опасность -> Отбой
-#
-# Цикл 2:
-# Опасность -> Отбой
-#
-# Оба отбоя считаются разными событиями.
 # ============================================================
 
 def make_event_fingerprint(
@@ -828,9 +1200,13 @@ def make_event_fingerprint(
     uav_cycle=None,
     rocket_cycle=None,
 ):
+
     districts_sorted = sorted(
-        set(districts or [])
+        set(
+            districts or []
+        )
     )
+
 
     # --------------------------------------------------------
     # БПЛА
@@ -842,15 +1218,14 @@ def make_event_fingerprint(
             "uav|"
             + str(level)
             + "|"
-            + "|".join(districts_sorted)
+            + "|".join(
+                districts_sorted
+            )
         )
 
 
     # --------------------------------------------------------
     # ОТБОЙ БПЛА
-    #
-    # ВАЖНО:
-    # Используем номер цикла.
     # --------------------------------------------------------
 
     elif event_type == "uav_cancel":
@@ -862,6 +1237,7 @@ def make_event_fingerprint(
                 0,
             )
 
+
         raw = (
             "uav_cancel|"
             + str(uav_cycle)
@@ -870,11 +1246,24 @@ def make_event_fingerprint(
 
     # --------------------------------------------------------
     # РАКЕТНАЯ ОПАСНОСТЬ
+    #
+    # Теперь учитываем цикл.
     # --------------------------------------------------------
 
     elif event_type == "rocket":
 
-        raw = "rocket|1"
+        if rocket_cycle is None:
+
+            rocket_cycle = state.get(
+                "rocket_cycle",
+                0,
+            )
+
+
+        raw = (
+            "rocket|1|"
+            + str(rocket_cycle)
+        )
 
 
     # --------------------------------------------------------
@@ -890,15 +1279,12 @@ def make_event_fingerprint(
                 0,
             )
 
+
         raw = (
             "rocket_cancel|"
             + str(rocket_cycle)
         )
 
-
-    # --------------------------------------------------------
-    # ДРУГИЕ СОБЫТИЯ
-    # --------------------------------------------------------
 
     else:
 
@@ -907,10 +1293,15 @@ def make_event_fingerprint(
             + "|"
             + str(level)
             + "|"
-            + "|".join(districts_sorted)
+            + "|".join(
+                districts_sorted
+            )
             + "|"
-            + normalize_text(text)
+            + normalize_text(
+                text
+            )
         )
+
 
     return make_hash(
         raw
@@ -926,6 +1317,7 @@ def make_post_fingerprint(
     post_id,
     text,
 ):
+
     if post_id:
 
         raw = (
@@ -939,8 +1331,11 @@ def make_post_fingerprint(
         raw = (
             source_key
             + "|"
-            + normalize_text(text)
+            + normalize_text(
+                text
+            )
         )
+
 
     return make_hash(
         raw
@@ -971,6 +1366,7 @@ def cleanup_dedup():
 
     new_sent_posts = {}
 
+
     for key, value in sent_posts.items():
 
         try:
@@ -982,6 +1378,7 @@ def cleanup_dedup():
                 )
             )
 
+
             if (
                 current - timestamp
                 <= max_age
@@ -991,9 +1388,11 @@ def cleanup_dedup():
                     key
                 ] = value
 
+
         except Exception:
 
             pass
+
 
     sent_posts = new_sent_posts
 
@@ -1003,6 +1402,7 @@ def cleanup_dedup():
     # --------------------------------------------------------
 
     new_events = {}
+
 
     for key, value in notification_events.items():
 
@@ -1015,6 +1415,7 @@ def cleanup_dedup():
                 )
             )
 
+
             if (
                 current - timestamp
                 <= max_age
@@ -1024,9 +1425,11 @@ def cleanup_dedup():
                     key
                 ] = value
 
+
         except Exception:
 
             pass
+
 
     notification_events = new_events
 
@@ -1035,6 +1438,7 @@ def cleanup_dedup():
         SENT_POSTS_FILE,
         sent_posts,
     )
+
 
     save_json(
         NOTIFICATION_EVENTS_FILE,
@@ -1049,6 +1453,7 @@ def cleanup_dedup():
 def post_was_processed(
     post_fingerprint,
 ):
+
     return (
         post_fingerprint
         in sent_posts
@@ -1072,6 +1477,7 @@ def mark_post_processed(
         "post_id": post_id,
     }
 
+
     save_json(
         SENT_POSTS_FILE,
         sent_posts,
@@ -1085,12 +1491,16 @@ def mark_post_processed(
 def event_was_notified(
     event_fingerprint,
 ):
+
     data = notification_events.get(
         event_fingerprint
     )
 
+
     if not data:
+
         return False
+
 
     try:
 
@@ -1101,6 +1511,7 @@ def event_was_notified(
             )
         )
 
+
         if (
             time.time()
             - timestamp
@@ -1109,9 +1520,11 @@ def event_was_notified(
 
             return True
 
+
     except Exception:
 
         pass
+
 
     return False
 
@@ -1139,6 +1552,7 @@ def mark_event_notified(
 
         "districts": districts,
     }
+
 
     save_json(
         NOTIFICATION_EVENTS_FILE,
@@ -1168,9 +1582,11 @@ def get_status_title():
                 ]["title"]
             )
 
+
         return (
             "🚨 Ракетная опасность"
         )
+
 
     return UAV_LEVELS[
         state.get(
@@ -1192,33 +1608,36 @@ def apply_event(
     source_url="",
     post_id="",
 ):
-    """
-    Возвращает словарь:
-
-    {
-        "changed": bool,
-        "should_notify": bool,
-        "event_fingerprint": str,
-        "previous_level": int,
-        "previous_districts": list,
-        "previous_rocket": bool,
-        "cycle": int
-    }
-    """
 
     global state
+
 
     description = build_event_description(
         text
     )
 
+
     found_districts = description[
         "districts"
     ]
 
+
+    found_municipal_districts = (
+        description[
+            "municipal_districts"
+        ]
+    )
+
+
     found_cities = description[
         "cities"
     ]
+
+
+    found_locations = description[
+        "locations"
+    ]
+
 
     with state_lock:
 
@@ -1229,12 +1648,14 @@ def apply_event(
             )
         )
 
+
         old_rocket = bool(
             state.get(
                 "rocket_active",
                 False,
             )
         )
+
 
         old_districts = sorted(
             set(
@@ -1245,12 +1666,34 @@ def apply_event(
             )
         )
 
+
+        old_municipal_districts = sorted(
+            set(
+                state.get(
+                    "municipal_districts",
+                    [],
+                )
+            )
+        )
+
+
+        old_active_locations = sorted(
+            set(
+                state.get(
+                    "active_locations",
+                    [],
+                )
+            )
+        )
+
+
         current_uav_cycle = int(
             state.get(
                 "uav_cycle",
                 0,
             )
         )
+
 
         current_rocket_cycle = int(
             state.get(
@@ -1266,84 +1709,129 @@ def apply_event(
 
         if event_type == "uav_cancel":
 
-            # ------------------------------------------------
-            # Запоминаем предыдущие данные ДО очистки.
-            # ------------------------------------------------
-
             previous_level = old_level
 
             previous_districts = list(
                 old_districts
             )
 
-            # ------------------------------------------------
-            # Отбой имеет смысл только тогда,
-            # когда действительно была активная тревога.
-            # ------------------------------------------------
+
+            previous_municipal_districts = list(
+                old_municipal_districts
+            )
+
+
+            previous_locations = list(
+                old_active_locations
+            )
+
 
             changed = (
                 old_level != 0
-                or len(old_districts) > 0
+                or len(
+                    old_districts
+                ) > 0
+                or len(
+                    old_municipal_districts
+                ) > 0
+                or len(
+                    old_active_locations
+                ) > 0
             )
 
-            # ------------------------------------------------
-            # Если тревоги не было, пуш не отправляем.
-            # ------------------------------------------------
 
             should_notify = changed
 
 
-            # ------------------------------------------------
-            # Сохраняем информацию для последующего
-            # отображения отбоя.
-            # ------------------------------------------------
-
             state[
                 "last_uav_level"
             ] = previous_level
+
 
             state[
                 "last_uav_districts"
             ] = previous_districts
 
 
+            state[
+                "last_uav_municipal_districts"
+            ] = previous_municipal_districts
+
+
+            state[
+                "last_uav_locations"
+            ] = previous_locations
+
+
             # ------------------------------------------------
-            # Очищаем активное состояние.
+            # Очищаем активную БПЛА-опасность.
             # ------------------------------------------------
 
             state[
                 "uav_level"
             ] = 0
 
+
             state[
                 "districts"
             ] = []
+
+
+            state[
+                "municipal_districts"
+            ] = []
+
+
+            state[
+                "active_locations"
+            ] = []
+
 
             state[
                 "cities"
             ] = []
 
-            state[
-                "status"
-            ] = "green"
+
+            # ------------------------------------------------
+            # Если ракетной опасности нет,
+            # статус становится зелёным.
+            #
+            # Если ракеты всё ещё активны,
+            # get_status_title() оставит ракетную опасность.
+            # ------------------------------------------------
+
+            if not old_rocket:
+
+                state[
+                    "status"
+                ] = "green"
+
+            else:
+
+                state[
+                    "status"
+                ] = "red"
+
 
             state[
                 "title"
-            ] = (
-                "🟢 Опасность не объявлена"
-            )
+            ] = get_status_title()
+
 
             state[
                 "source"
             ] = source_name
 
+
             state[
                 "source_url"
             ] = source_url
 
+
             state[
                 "updated_at"
             ] = now_iso()
+
 
             state[
                 "event_post_id"
@@ -1352,17 +1840,11 @@ def apply_event(
             )
 
 
-            # ------------------------------------------------
-            # Номер текущего цикла НЕ сбрасываем.
-            #
-            # Следующая новая тревога увеличит его.
-            # ------------------------------------------------
-
             fingerprint = make_event_fingerprint(
                 "uav_cancel",
                 0,
-                previous_districts,
-                False,
+                previous_locations,
+                old_rocket,
                 text,
                 uav_cycle=current_uav_cycle,
             )
@@ -1380,6 +1862,8 @@ def apply_event(
                 "event_fingerprint": fingerprint,
                 "previous_level": previous_level,
                 "previous_districts": previous_districts,
+                "previous_municipal_districts": previous_municipal_districts,
+                "previous_locations": previous_locations,
                 "previous_rocket": old_rocket,
                 "cycle": current_uav_cycle,
             }
@@ -1401,16 +1885,6 @@ def apply_event(
             ] = False
 
 
-            # ------------------------------------------------
-            # После отбоя ракетной опасности:
-            #
-            # если БПЛА ещё активен,
-            # возвращаем статус БПЛА.
-            #
-            # если БПЛА нет —
-            # зелёный статус.
-            # ------------------------------------------------
-
             state[
                 "status"
             ] = UAV_LEVELS[
@@ -1427,13 +1901,16 @@ def apply_event(
                 "source"
             ] = source_name
 
+
             state[
                 "source_url"
             ] = source_url
 
+
             state[
                 "updated_at"
             ] = now_iso()
+
 
             state[
                 "event_post_id"
@@ -1464,6 +1941,8 @@ def apply_event(
                 "event_fingerprint": fingerprint,
                 "previous_level": old_level,
                 "previous_districts": old_districts,
+                "previous_municipal_districts": old_municipal_districts,
+                "previous_locations": old_active_locations,
                 "previous_rocket": old_rocket,
                 "cycle": current_rocket_cycle,
             }
@@ -1474,11 +1953,6 @@ def apply_event(
         # ====================================================
 
         if event_type == "rocket":
-
-            # ------------------------------------------------
-            # Если ракеты ещё не были активны,
-            # начинаем новый цикл.
-            # ------------------------------------------------
 
             if not old_rocket:
 
@@ -1498,13 +1972,16 @@ def apply_event(
                 "source"
             ] = source_name
 
+
             state[
                 "source_url"
             ] = source_url
 
+
             state[
                 "updated_at"
             ] = now_iso()
+
 
             state[
                 "event_post_id"
@@ -1517,11 +1994,10 @@ def apply_event(
                 "status"
             ] = "red"
 
+
             state[
                 "title"
-            ] = (
-                "🚨 Ракетная опасность"
-            )
+            ] = get_status_title()
 
 
             save_json(
@@ -1551,6 +2027,8 @@ def apply_event(
                 "event_fingerprint": fingerprint,
                 "previous_level": old_level,
                 "previous_districts": old_districts,
+                "previous_municipal_districts": old_municipal_districts,
+                "previous_locations": old_active_locations,
                 "previous_rocket": old_rocket,
                 "cycle": current_rocket_cycle,
             }
@@ -1561,11 +2039,6 @@ def apply_event(
         # ====================================================
 
         if event_type == "uav":
-
-            # ------------------------------------------------
-            # Если раньше БПЛА-опасности не было,
-            # начинаем новый цикл.
-            # ------------------------------------------------
 
             if old_level == 0:
 
@@ -1578,10 +2051,6 @@ def apply_event(
 
             # ------------------------------------------------
             # Не понижаем уровень из-за старого сообщения.
-            #
-            # Внимание = 1
-            # Угроза = 2
-            # Опасность = 3
             # ------------------------------------------------
 
             new_level = max(
@@ -1591,8 +2060,7 @@ def apply_event(
 
 
             # ------------------------------------------------
-            # Добавляем новые районы,
-            # а не заменяем старые.
+            # Добавляем новые районы.
             # ------------------------------------------------
 
             merged_districts = unique_list(
@@ -1600,13 +2068,29 @@ def apply_event(
                 + found_districts
             )
 
+
             merged_districts = sorted(
                 merged_districts
             )
 
 
             # ------------------------------------------------
-            # Города только для информации.
+            # Добавляем муниципальные округа.
+            # ------------------------------------------------
+
+            merged_municipal_districts = unique_list(
+                old_municipal_districts
+                + found_municipal_districts
+            )
+
+
+            merged_municipal_districts = sorted(
+                merged_municipal_districts
+            )
+
+
+            # ------------------------------------------------
+            # Города.
             # ------------------------------------------------
 
             merged_cities = unique_list(
@@ -1618,19 +2102,53 @@ def apply_event(
             )
 
 
+            # ------------------------------------------------
+            # Единый список активных мест.
+            #
+            # Только места, которые реально были
+            # обнаружены в сообщениях.
+            # ------------------------------------------------
+
+            merged_locations = unique_list(
+                old_active_locations
+                + found_locations
+            )
+
+
+            merged_locations = sorted(
+                merged_locations
+            )
+
+
             level_changed = (
                 new_level
                 != old_level
             )
+
 
             districts_changed = (
                 merged_districts
                 != old_districts
             )
 
+
+            municipal_changed = (
+                merged_municipal_districts
+                != old_municipal_districts
+            )
+
+
+            locations_changed = (
+                merged_locations
+                != old_active_locations
+            )
+
+
             changed = (
                 level_changed
                 or districts_changed
+                or municipal_changed
+                or locations_changed
             )
 
 
@@ -1650,6 +2168,16 @@ def apply_event(
 
 
             state[
+                "municipal_districts"
+            ] = merged_municipal_districts
+
+
+            state[
+                "active_locations"
+            ] = merged_locations
+
+
+            state[
                 "cities"
             ] = merged_cities
 
@@ -1665,13 +2193,16 @@ def apply_event(
                 "source"
             ] = source_name
 
+
             state[
                 "source_url"
             ] = source_url
 
+
             state[
                 "updated_at"
             ] = now_iso()
+
 
             state[
                 "event_post_id"
@@ -1694,7 +2225,7 @@ def apply_event(
             fingerprint = make_event_fingerprint(
                 "uav",
                 new_level,
-                merged_districts,
+                merged_locations,
                 state.get(
                     "rocket_active",
                     False,
@@ -1710,6 +2241,8 @@ def apply_event(
                 "event_fingerprint": fingerprint,
                 "previous_level": old_level,
                 "previous_districts": old_districts,
+                "previous_municipal_districts": old_municipal_districts,
+                "previous_locations": old_active_locations,
                 "previous_rocket": old_rocket,
                 "cycle": current_uav_cycle,
             }
@@ -1721,6 +2254,8 @@ def apply_event(
         "event_fingerprint": "",
         "previous_level": 0,
         "previous_districts": [],
+        "previous_municipal_districts": [],
+        "previous_locations": [],
         "previous_rocket": False,
         "cycle": 0,
     }
@@ -1738,12 +2273,12 @@ def add_history(
     source_url,
     post_id,
     districts_override=None,
+    municipal_districts_override=None,
+    locations_override=None,
 ):
+
     # --------------------------------------------------------
-    # Для обычного события определяем районы из текста.
-    #
-    # Для отбоя можно передать районы,
-    # которые были активны до отбоя.
+    # Районы.
     # --------------------------------------------------------
 
     if districts_override is None:
@@ -1756,6 +2291,46 @@ def add_history(
 
         districts = list(
             districts_override
+        )
+
+
+    # --------------------------------------------------------
+    # Муниципальные округа.
+    # --------------------------------------------------------
+
+    if municipal_districts_override is None:
+
+        municipal_districts = (
+            detect_municipal_districts(
+                text
+            )
+        )
+
+    else:
+
+        municipal_districts = list(
+            municipal_districts_override
+        )
+
+
+    # --------------------------------------------------------
+    # Активные места.
+    # --------------------------------------------------------
+
+    if locations_override is None:
+
+        locations = unique_list(
+            districts
+            + municipal_districts
+            + detect_cities(
+                text
+            )
+        )
+
+    else:
+
+        locations = list(
+            locations_override
         )
 
 
@@ -1780,6 +2355,10 @@ def add_history(
 
         "districts": districts,
 
+        "municipal_districts": municipal_districts,
+
+        "locations": locations,
+
         "cities": detect_cities(
             text
         ),
@@ -1792,7 +2371,6 @@ def add_history(
     )
 
 
-    # Храним последние 200 событий.
     del history[200:]
 
 
@@ -1812,6 +2390,7 @@ def format_status():
 
         title = get_status_title()
 
+
         lines = [
             "🛰️ <b>UAV ALERT</b>",
             "",
@@ -1821,49 +2400,63 @@ def format_status():
         ]
 
 
-        districts = state.get(
-            "districts",
+        # ----------------------------------------------------
+        # Только активные места.
+        # ----------------------------------------------------
+
+        active_locations = state.get(
+            "active_locations",
             [],
         )
 
 
-        if districts:
+        if (
+            active_locations
+            and state.get(
+                "uav_level",
+                0,
+            ) > 0
+        ):
 
             lines.append("")
 
             lines.append(
-                "📌 <b>Районы:</b>"
+                "📌 <b>Места с активной "
+                "опасностью по БПЛА:</b>"
             )
 
 
-            for district in districts:
+            for location in active_locations:
 
                 lines.append(
-                    f"• {district}"
+                    f"• {location}"
                 )
 
 
-        cities = state.get(
-            "cities",
-            [],
-        )
+        # ----------------------------------------------------
+        # Если уровень БПЛА есть,
+        # но конкретное место не указано.
+        # ----------------------------------------------------
 
-
-        if cities:
+        elif (
+            state.get(
+                "uav_level",
+                0,
+            ) > 0
+            and not active_locations
+        ):
 
             lines.append("")
 
             lines.append(
-                "🏙 <b>Упомянутые города:</b>"
+                "📌 <b>Место в источнике "
+                "не указано.</b>"
             )
 
 
-            for city in cities[:10]:
-
-                lines.append(
-                    f"• {city}"
-                )
-
+        # ----------------------------------------------------
+        # Источник.
+        # ----------------------------------------------------
 
         if state.get(
             "source"
@@ -1877,14 +2470,37 @@ def format_status():
             )
 
 
+        # ----------------------------------------------------
+        # Время МСК.
+        # ----------------------------------------------------
+
         if state.get(
             "updated_at"
         ):
 
-            lines.append(
-                "🕐 <b>Обновлено:</b> "
-                + state["updated_at"]
-            )
+            try:
+
+                updated = datetime.fromisoformat(
+                    state["updated_at"]
+                )
+
+
+                lines.append(
+                    "🕐 <b>Обновлено:</b> "
+                    + updated.astimezone(
+                        MSK
+                    ).strftime(
+                        "%d.%m.%Y %H:%M"
+                    )
+                    + " МСК"
+                )
+
+            except Exception:
+
+                lines.append(
+                    "🕐 <b>Обновлено:</b> "
+                    + state["updated_at"]
+                )
 
 
         return "\n".join(
@@ -1957,25 +2573,59 @@ def format_history(
             )["title"]
 
 
-        districts = item.get(
-            "districts",
-            [],
-        )
-
-
         lines.append(
             title
         )
 
 
-        if districts:
+        # ----------------------------------------------------
+        # Места события.
+        # ----------------------------------------------------
+
+        locations = item.get(
+            "locations",
+            [],
+        )
+
+
+        if locations:
 
             lines.append(
-                "📌 "
+                "📍 "
                 + ", ".join(
-                    districts
+                    locations[:10]
                 )
             )
+
+
+        else:
+
+            districts = item.get(
+                "districts",
+                [],
+            )
+
+
+            municipal_districts = item.get(
+                "municipal_districts",
+                [],
+            )
+
+
+            old_locations = unique_list(
+                districts
+                + municipal_districts
+            )
+
+
+            if old_locations:
+
+                lines.append(
+                    "📍 "
+                    + ", ".join(
+                        old_locations[:10]
+                    )
+                )
 
 
         source = item.get(
@@ -1989,6 +2639,37 @@ def format_history(
             lines.append(
                 f"📡 {source}"
             )
+
+
+        timestamp = item.get(
+            "timestamp",
+            "",
+        )
+
+
+        if timestamp:
+
+            try:
+
+                dt = datetime.fromisoformat(
+                    timestamp
+                )
+
+
+                lines.append(
+                    "🕐 "
+                    + dt.astimezone(
+                        MSK
+                    ).strftime(
+                        "%d.%m.%Y %H:%M"
+                    )
+                    + " МСК"
+                )
+
+
+            except Exception:
+
+                pass
 
 
         lines.append("")
@@ -2009,6 +2690,7 @@ def format_stats():
         history
     )
 
+
     uav_attention = 0
     uav_threat = 0
     uav_danger = 0
@@ -2023,6 +2705,7 @@ def format_stats():
             "event_type",
             "",
         )
+
 
         level = item.get(
             "level",
@@ -2091,9 +2774,11 @@ def format_sources():
             f"• <b>{source['name']}</b>"
         )
 
+
         lines.append(
             source["url"]
         )
+
 
         lines.append("")
 
@@ -2414,48 +3099,60 @@ async def callback_handler(
 
     if data == "locations":
 
-        districts = state.get(
-            "districts",
+        active_locations = state.get(
+            "active_locations",
             [],
         )
 
 
-        cities = state.get(
-            "cities",
-            [],
+        uav_level = state.get(
+            "uav_level",
+            0,
         )
 
 
-        if districts:
+        if (
+            active_locations
+            and uav_level > 0
+        ):
+
+            level_title = UAV_LEVELS[
+                uav_level
+            ]["title"]
+
 
             text = (
-                "📍 <b>Районы под текущим "
-                "статусом БПЛА:</b>\n\n"
+                "📍 <b>Места с активной "
+                "опасностью по БПЛА:</b>\n\n"
+                + level_title
+                + "\n\n"
                 + "\n".join(
                     f"• {x}"
-                    for x in districts
+                    for x in active_locations
                 )
+            )
+
+
+        elif uav_level > 0:
+
+            text = (
+                "📍 <b>Активные места</b>\n\n"
+                + UAV_LEVELS[
+                    uav_level
+                ]["title"]
+                + "\n\n"
+                "Конкретное место "
+                "в источнике не указано."
             )
 
 
         else:
 
             text = (
-                "📍 <b>Активные районы</b>\n\n"
-                "Сейчас районы под угрозой "
-                "не зафиксированы."
-            )
-
-
-        if cities:
-
-            text += (
-                "\n\n🏙 <b>Города, упомянутые "
-                "в источниках:</b>\n"
-                + "\n".join(
-                    f"• {x}"
-                    for x in cities[:10]
-                )
+                "📍 <b>Активные места</b>\n\n"
+                "🟢 Сейчас конкретных районов, "
+                "округов или городов "
+                "под опасностью БПЛА не зафиксировано."
             )
 
 
@@ -2695,6 +3392,7 @@ def fetch_source(
 
 
             if not text:
+
                 continue
 
 
@@ -2785,7 +3483,7 @@ async def process_post(
 
 
     # --------------------------------------------------------
-    # Определяем событие
+    # Определяем событие.
     # --------------------------------------------------------
 
     detected = detect_event(
@@ -2794,6 +3492,7 @@ async def process_post(
 
 
     if not detected:
+
         return
 
 
@@ -2801,10 +3500,10 @@ async def process_post(
 
 
     # --------------------------------------------------------
-    # Для тревожных UAV-событий проверяем регион.
+    # БПЛА.
     #
-    # Отбой БПЛА не требует повторного указания региона,
-    # потому что он относится к уже активному событию.
+    # Для тревожных сообщений обязательно проверяем,
+    # что они относятся к Костромской области.
     # --------------------------------------------------------
 
     if event_type == "uav":
@@ -2813,19 +3512,60 @@ async def process_post(
             text
         ):
 
+            logger.info(
+                "БПЛА-сообщение не относится "
+                "к Костромской области. Пропуск."
+            )
+
             return
 
 
     # --------------------------------------------------------
-    # РАКЕТНАЯ ОПАСНОСТЬ
+    # РАКЕТНАЯ ОПАСНОСТЬ.
     #
-    # Сохраняем старое поведение:
-    # сообщение о ракетной опасности обрабатывается.
+    # ВАЖНО:
+    # Теперь НЕ берём любое сообщение,
+    # где встречается "ракетная опасность".
+    #
+    # Обрабатываем только если сообщение связано
+    # с Костромской областью.
     # --------------------------------------------------------
+
+    if event_type == "rocket":
+
+        if not is_kostroma_related(
+            text
+        ):
+
+            logger.info(
+                "Ракетная опасность в сообщении "
+                "не относится к Костромской области. Пропуск."
+            )
+
+            return
 
 
     # --------------------------------------------------------
-    # ОТПЕЧАТОК КОНКРЕТНОГО ПОСТА
+    # Отбой ракетной опасности тоже проверяем
+    # по Костромской области.
+    # --------------------------------------------------------
+
+    if event_type == "rocket_cancel":
+
+        if not is_kostroma_related(
+            text
+        ):
+
+            logger.info(
+                "Отбой ракетной опасности "
+                "не относится к Костромской области. Пропуск."
+            )
+
+            return
+
+
+    # --------------------------------------------------------
+    # Отбой БПЛА не требует повторного указания региона.
     # --------------------------------------------------------
 
     post_fingerprint = (
@@ -2838,8 +3578,8 @@ async def process_post(
 
 
     # --------------------------------------------------------
-    # ЕСЛИ ЭТОТ ПОСТ УЖЕ ОБРАБАТЫВАЛИ —
-    # ВООБЩЕ НИЧЕГО НЕ ДЕЛАЕМ.
+    # Если этот пост уже обрабатывали —
+    # ничего не делаем.
     # --------------------------------------------------------
 
     if post_was_processed(
@@ -2850,7 +3590,7 @@ async def process_post(
 
 
     # --------------------------------------------------------
-    # Сначала помечаем пост обработанным.
+    # Помечаем пост обработанным.
     # --------------------------------------------------------
 
     mark_post_processed(
@@ -2878,28 +3618,39 @@ async def process_post(
         "changed"
     ]
 
+
     should_notify = result[
         "should_notify"
     ]
+
 
     event_fingerprint = result[
         "event_fingerprint"
     ]
 
+
     previous_level = result[
         "previous_level"
     ]
+
 
     previous_districts = result[
         "previous_districts"
     ]
 
 
+    previous_municipal_districts = result[
+        "previous_municipal_districts"
+    ]
+
+
+    previous_locations = result[
+        "previous_locations"
+    ]
+
+
     # --------------------------------------------------------
-    # СОХРАНЯЕМ ИСТОРИЮ
-    #
-    # Для отбоя передаём старые районы,
-    # чтобы они отображались в истории.
+    # СОХРАНЯЕМ ИСТОРИЮ.
     # --------------------------------------------------------
 
     if event_type == "uav_cancel":
@@ -2912,6 +3663,8 @@ async def process_post(
             source_url=source_url,
             post_id=post_id,
             districts_override=previous_districts,
+            municipal_districts_override=previous_municipal_districts,
+            locations_override=previous_locations,
         )
 
 
@@ -2928,8 +3681,8 @@ async def process_post(
 
 
     # --------------------------------------------------------
-    # ЕСЛИ ОТБОЙ ПРИШЁЛ, КОГДА НИКАКОЙ ТРЕВОГИ НЕ БЫЛО,
-    # PUSH НЕ ОТПРАВЛЯЕМ.
+    # Если отбой пришёл, когда тревоги не было,
+    # push не отправляем.
     # --------------------------------------------------------
 
     if not should_notify:
@@ -2944,7 +3697,7 @@ async def process_post(
 
 
     # --------------------------------------------------------
-    # ГЛАВНАЯ ЗАЩИТА ОТ ПОВТОРНЫХ PUSH
+    # ГЛАВНАЯ ЗАЩИТА ОТ ПОВТОРНЫХ PUSH.
     # --------------------------------------------------------
 
     if event_was_notified(
@@ -2960,13 +3713,13 @@ async def process_post(
 
 
     # --------------------------------------------------------
-    # НОВОЕ СОБЫТИЕ
+    # НОВОЕ СОБЫТИЕ.
     # --------------------------------------------------------
 
     if event_type == "uav_cancel":
 
-        districts_for_notification = (
-            previous_districts
+        locations_for_notification = (
+            previous_locations
         )
 
         level_for_notification = (
@@ -2975,8 +3728,8 @@ async def process_post(
 
     else:
 
-        districts_for_notification = state.get(
-            "districts",
+        locations_for_notification = state.get(
+            "active_locations",
             [],
         )
 
@@ -2987,12 +3740,12 @@ async def process_post(
         event_fingerprint=event_fingerprint,
         event_type=event_type,
         level=level_for_notification,
-        districts=districts_for_notification,
+        districts=locations_for_notification,
     )
 
 
     # --------------------------------------------------------
-    # ФОРМИРУЕМ PUSH
+    # ФОРМИРУЕМ PUSH.
     # --------------------------------------------------------
 
     message = build_push_message(
@@ -3004,14 +3757,16 @@ async def process_post(
             "link",
             "",
         ),
-        districts_override=districts_for_notification,
+        districts_override=locations_for_notification,
         previous_level=previous_level,
         previous_districts=previous_districts,
+        previous_municipal_districts=previous_municipal_districts,
+        previous_locations=previous_locations,
     )
 
 
     # --------------------------------------------------------
-    # ОТПРАВЛЯЕМ ПОДПИСЧИКАМ
+    # ОТПРАВЛЯЕМ ПОДПИСЧИКАМ.
     # --------------------------------------------------------
 
     await send_pushes(
@@ -3033,6 +3788,8 @@ def build_push_message(
     districts_override=None,
     previous_level=0,
     previous_districts=None,
+    previous_municipal_districts=None,
+    previous_locations=None,
 ):
 
     # --------------------------------------------------------
@@ -3075,30 +3832,28 @@ def build_push_message(
 
 
     # --------------------------------------------------------
-    # РАЙОНЫ
-    #
-    # Для обычного события:
-    # районы из текста/состояния.
-    #
-    # Для отбоя:
-    # районы, которые были активны ДО отбоя.
+    # МЕСТА.
     # --------------------------------------------------------
 
     if districts_override is not None:
 
-        districts = list(
+        locations = list(
             districts_override
         )
 
     else:
 
-        districts = detect_districts(
+        detected = detect_locations(
             text
         )
 
+        locations = detected[
+            "locations"
+        ]
+
 
     # --------------------------------------------------------
-    # СООБЩЕНИЕ
+    # СООБЩЕНИЕ.
     # --------------------------------------------------------
 
     lines = [
@@ -3116,20 +3871,30 @@ def build_push_message(
 
     if event_type == "uav":
 
-        if districts:
+        if locations:
 
             lines.append("")
 
             lines.append(
-                "📌 <b>Районы:</b>"
+                "📌 <b>Места с активной "
+                "опасностью:</b>"
             )
 
 
-            for district in districts:
+            for location in locations:
 
                 lines.append(
-                    f"• {district}"
+                    f"• {location}"
                 )
+
+        else:
+
+            lines.append("")
+
+            lines.append(
+                "📌 <b>Конкретное место "
+                "в источнике не указано.</b>"
+            )
 
 
     # ========================================================
@@ -3151,6 +3916,7 @@ def build_push_message(
                 "ℹ️ <b>Предыдущий статус:</b>"
             )
 
+
             lines.append(
                 previous_title
             )
@@ -3163,19 +3929,19 @@ def build_push_message(
         )
 
 
-        if districts:
+        if locations:
 
             lines.append("")
 
             lines.append(
-                "📍 <b>Ранее активные районы:</b>"
+                "📍 <b>Ранее активные места:</b>"
             )
 
 
-            for district in districts:
+            for location in locations:
 
                 lines.append(
-                    f"• {district}"
+                    f"• {location}"
                 )
 
 
@@ -3208,23 +3974,31 @@ def build_push_message(
 
 
     # --------------------------------------------------------
-    # Для города показываем информацию,
-    # но НЕ объявляем город опасным автоматически.
+    # Города.
+    #
+    # Для БПЛА они уже входят в locations,
+    # но отдельно показывать их второй раз не нужно.
     # --------------------------------------------------------
 
-    cities = detect_cities(
+    detected_cities = detect_cities(
         text
     )
 
 
-    if cities:
+    if (
+        detected_cities
+        and event_type not in (
+            "uav",
+            "uav_cancel",
+        )
+    ):
 
         lines.append("")
 
         lines.append(
             "🏙 <b>Упомянуто:</b> "
             + ", ".join(
-                cities[:10]
+                detected_cities[:10]
             )
         )
 
@@ -3251,16 +4025,19 @@ def build_push_message(
 
 
     # --------------------------------------------------------
-    # Время
+    # Время МСК
     # --------------------------------------------------------
 
     lines.append("")
 
     lines.append(
         "🕐 "
-        + datetime.now().strftime(
+        + datetime.now(
+            MSK
+        ).strftime(
             "%d.%m.%Y %H:%M"
         )
+        + " МСК"
     )
 
 
@@ -3318,10 +4095,6 @@ async def send_pushes(
                 e,
             )
 
-
-            # Если пользователь заблокировал бота,
-            # Telegram может вернуть ошибку.
-            # Удаляем его из подписчиков.
 
             error_text = str(
                 e
@@ -3633,7 +4406,7 @@ async def post_init(
 
 
     # --------------------------------------------------------
-    # Запускаем мониторинг в фоне
+    # Запускаем мониторинг в фоне.
     # --------------------------------------------------------
 
     application.create_task(
@@ -3683,8 +4456,13 @@ def main():
     )
 
 
+    logger.info(
+        "Часовой пояс: МСК (UTC+3)"
+    )
+
+
     # --------------------------------------------------------
-    # Flask запускаем отдельным потоком
+    # Flask запускаем отдельным потоком.
     # --------------------------------------------------------
 
     flask_thread = threading.Thread(
@@ -3710,7 +4488,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # Основные команды
+    # Основные команды.
     # --------------------------------------------------------
 
     application.add_handler(
@@ -3770,7 +4548,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # Админские команды
+    # Админские команды.
     # --------------------------------------------------------
 
     application.add_handler(
@@ -3790,7 +4568,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # Кнопки
+    # Кнопки.
     # --------------------------------------------------------
 
     application.add_handler(
@@ -3801,7 +4579,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # Запуск
+    # Запуск.
     # --------------------------------------------------------
 
     logger.info(
