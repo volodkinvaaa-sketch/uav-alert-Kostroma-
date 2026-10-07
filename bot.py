@@ -4,10 +4,13 @@
 #
 # Полная версия:
 # - мониторинг Telegram-источников
-# - определение Внимание / Угроза / Опасность
+# - определение Внимание / Угроза / Опасность / Тревога
 # - определение Отбоя
 # - ракетная опасность
 # - отдельные территории
+# - города
+# - районы
+# - муниципальные округа
 # - история
 # - статистика
 # - источники
@@ -54,19 +57,53 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "1421675956"))
+ADMIN_ID = int(
+    os.getenv(
+        "ADMIN_ID",
+        "1421675956",
+    )
+)
 
-PORT = int(os.getenv("PORT", "10000"))
+PORT = int(
+    os.getenv(
+        "PORT",
+        "10000",
+    )
+)
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
+CHECK_INTERVAL = int(
+    os.getenv(
+        "CHECK_INTERVAL",
+        "30",
+    )
+)
 
-DATA_DIR = os.getenv("DATA_DIR", ".").strip() or "."
+DATA_DIR = (
+    os.getenv(
+        "DATA_DIR",
+        ".",
+    ).strip()
+    or "."
+)
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = os.getenv(
+    "LOG_LEVEL",
+    "INFO",
+).upper()
 
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
+REQUEST_TIMEOUT = int(
+    os.getenv(
+        "REQUEST_TIMEOUT",
+        "15",
+    )
+)
 
-SOURCE_LIMIT = int(os.getenv("SOURCE_LIMIT", "30"))
+SOURCE_LIMIT = int(
+    os.getenv(
+        "SOURCE_LIMIT",
+        "30",
+    )
+)
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -80,18 +117,31 @@ USER_AGENT = (
 # ============================================================
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=getattr(
+        logging,
+        LOG_LEVEL,
+        logging.INFO,
+    ),
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(name)s | "
+        "%(message)s"
+    ),
 )
 
-logger = logging.getLogger("UAV_ALERT")
+logger = logging.getLogger(
+    "UAV_ALERT"
+)
 
 
 # ============================================================
 # TIMEZONE
 # ============================================================
 
-MSK = timezone(timedelta(hours=3))
+MSK = timezone(
+    timedelta(hours=3)
+)
 
 
 def now_msk():
@@ -108,28 +158,56 @@ def format_time(value=None):
 
     if isinstance(value, str):
         try:
-            value = datetime.fromisoformat(value)
+            value = datetime.fromisoformat(
+                value
+            )
         except Exception:
             return value
 
-    return value.astimezone(MSK).strftime("%d.%m.%Y %H:%M")
+    try:
+        return value.astimezone(
+            MSK
+        ).strftime(
+            "%d.%m.%Y %H:%M"
+        )
+    except Exception:
+        return str(value)
 
 
 # ============================================================
 # FILES
 # ============================================================
 
-os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(
+    DATA_DIR,
+    exist_ok=True,
+)
 
+STATE_FILE = os.path.join(
+    DATA_DIR,
+    "state.json",
+)
 
-STATE_FILE = os.path.join(DATA_DIR, "state.json")
-HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
-SUBSCRIBERS_FILE = os.path.join(DATA_DIR, "subscribers.json")
-SENT_POSTS_FILE = os.path.join(DATA_DIR, "sent_posts.json")
+HISTORY_FILE = os.path.join(
+    DATA_DIR,
+    "history.json",
+)
+
+SUBSCRIBERS_FILE = os.path.join(
+    DATA_DIR,
+    "subscribers.json",
+)
+
+SENT_POSTS_FILE = os.path.join(
+    DATA_DIR,
+    "sent_posts.json",
+)
+
 NOTIFICATION_EVENTS_FILE = os.path.join(
     DATA_DIR,
     "notification_events.json",
 )
+
 SOURCE_STATE_FILE = os.path.join(
     DATA_DIR,
     "source_state.json",
@@ -167,8 +245,14 @@ DEFAULT_STATE = {
 # FILE HELPERS
 # ============================================================
 
-def atomic_write_json(path, data):
-    temp_path = path + ".tmp"
+def atomic_write_json(
+    path,
+    data,
+):
+    temp_path = (
+        path
+        + ".tmp"
+    )
 
     try:
         with open(
@@ -183,7 +267,10 @@ def atomic_write_json(path, data):
                 indent=2,
             )
 
-        os.replace(temp_path, path)
+        os.replace(
+            temp_path,
+            path,
+        )
 
     except Exception:
         logger.exception(
@@ -192,7 +279,10 @@ def atomic_write_json(path, data):
         )
 
 
-def load_json(path, default):
+def load_json(
+    path,
+    default,
+):
     if not os.path.exists(path):
         return default
 
@@ -202,7 +292,9 @@ def load_json(path, default):
             "r",
             encoding="utf-8",
         ) as file:
-            return json.load(file)
+            return json.load(
+                file
+            )
 
     except Exception:
         logger.exception(
@@ -214,11 +306,25 @@ def load_json(path, default):
 
 
 def ensure_list(value):
-    return value if isinstance(value, list) else []
+    return (
+        value
+        if isinstance(
+            value,
+            list,
+        )
+        else []
+    )
 
 
 def ensure_dict(value):
-    return value if isinstance(value, dict) else {}
+    return (
+        value
+        if isinstance(
+            value,
+            dict,
+        )
+        else {}
+    )
 
 
 # ============================================================
@@ -230,7 +336,10 @@ state = load_json(
     DEFAULT_STATE.copy(),
 )
 
-if not isinstance(state, dict):
+if not isinstance(
+    state,
+    dict,
+):
     state = DEFAULT_STATE.copy()
 
 
@@ -303,7 +412,9 @@ def save_history():
 def save_subscribers():
     atomic_write_json(
         SUBSCRIBERS_FILE,
-        sorted(subscribers),
+        sorted(
+            subscribers
+        ),
     )
 
 
@@ -339,18 +450,29 @@ SOURCES = {
     },
 
     "monitoring": {
-        "name": "Russia Monitoring Radar BPLA",
-        "url": "https://t.me/s/russiamonitoring_radar_bpla",
+        "name": (
+            "Russia Monitoring Radar BPLA"
+        ),
+        "url": (
+            "https://t.me/s/"
+            "russiamonitoring_radar_bpla"
+        ),
     },
 
     "radar": {
         "name": "Radar Russia",
-        "url": "https://t.me/s/radarrussiia",
+        "url": (
+            "https://t.me/s/"
+            "radarrussiia"
+        ),
     },
 
     "bpla": {
         "name": "BPLA Russia",
-        "url": "https://t.me/s/bplarussiaru",
+        "url": (
+            "https://t.me/s/"
+            "bplarussiaru"
+        ),
     },
 }
 
@@ -359,9 +481,8 @@ SOURCES = {
 # KOSTROMA LOCATIONS
 # ============================================================
 
-KOSTROMA_LOCATIONS = [
-    "Костромская область",
-
+# Города и населённые пункты.
+KOSTROMA_CITIES = [
     "Кострома",
     "Буй",
     "Волгореченск",
@@ -387,26 +508,200 @@ KOSTROMA_LOCATIONS = [
     "Поназырево",
     "Пыщуг",
     "Судиславль",
-    "Сусанинский",
+    "Сусанинское",
     "Сусанино",
-    "Чухломский",
-    "Островский",
-    "Нейский",
-    "Мантуровский",
-    "Нерехтский",
-    "Буйский",
-    "Галичский",
-    "Костромской",
-    "Макарьевский",
-    "Шарьинский",
-    "Солигаличский",
-    "Кологривский",
 ]
 
 
-# Длинные названия проверяем раньше коротких.
+# Районы / муниципальные территории.
+KOSTROMA_DISTRICTS = [
+    "Антроповский район",
+    "Буйский район",
+    "Вохомский район",
+    "Галичский район",
+    "Кадыйский район",
+    "Кологривский район",
+    "Костромской район",
+    "Красносельский район",
+    "Макарьевский район",
+    "Мантуровский район",
+    "Межевской район",
+    "Нерехтский район",
+    "Островский район",
+    "Островский муниципальный округ",
+    "Парфеньевский район",
+    "Поназыревский район",
+    "Пыщугский район",
+    "Солигаличский район",
+    "Судиславский район",
+    "Сусанинский район",
+    "Чухломский район",
+    "Шарьинский район",
+]
+
+
+KOSTROMA_OKRUGS = [
+    "Антроповский муниципальный округ",
+    "Буйский муниципальный округ",
+    "Вохомский муниципальный округ",
+    "Галичский муниципальный округ",
+    "Кадыйский муниципальный округ",
+    "Кологривский муниципальный округ",
+    "Костромской муниципальный округ",
+    "Красносельский муниципальный округ",
+    "Макарьевский муниципальный округ",
+    "Мантуровский муниципальный округ",
+    "Межевской муниципальный округ",
+    "Нерехтский муниципальный округ",
+    "Островский муниципальный округ",
+    "Парфеньевский муниципальный округ",
+    "Поназыревский муниципальный округ",
+    "Пыщугский муниципальный округ",
+    "Солигаличский муниципальный округ",
+    "Судиславский муниципальный округ",
+    "Сусанинский муниципальный округ",
+    "Чухломский муниципальный округ",
+    "Шарьинский муниципальный округ",
+    "Нейский муниципальный округ",
+]
+
+
+# Область отдельно.
+KOSTROMA_REGION = [
+    "Костромская область",
+    "Костромской области",
+]
+
+
+# ============================================================
+# LOCATION ALIASES
+# ============================================================
+
+LOCATION_ALIASES = {
+    # Города.
+    "город Кострома": "Кострома",
+    "г. Кострома": "Кострома",
+
+    "город Буй": "Буй",
+    "г. Буй": "Буй",
+
+    "город Галич": "Галич",
+    "г. Галич": "Галич",
+
+    "город Нерехта": "Нерехта",
+    "г. Нерехта": "Нерехта",
+
+    "город Шарья": "Шарья",
+    "г. Шарья": "Шарья",
+
+    "город Мантурово": "Мантурово",
+    "г. Мантурово": "Мантурово",
+
+    "город Макарьев": "Макарьев",
+    "г. Макарьев": "Макарьев",
+
+    "город Солигалич": "Солигалич",
+    "г. Солигалич": "Солигалич",
+
+    "город Кологрив": "Кологрив",
+    "г. Кологрив": "Кологрив",
+
+    "город Нея": "Нея",
+    "г. Нея": "Нея",
+
+    "город Чухлома": "Чухлома",
+    "г. Чухлома": "Чухлома",
+
+    "город Волгореченск": "Волгореченск",
+    "г. Волгореченск": "Волгореченск",
+
+    # Округа.
+    "Костромской округ":
+        "Костромской муниципальный округ",
+
+    "Костромской муниципальный округ":
+        "Костромской муниципальный округ",
+
+    "Нерехтский округ":
+        "Нерехтский муниципальный округ",
+
+    "Нерехтский муниципальный округ":
+        "Нерехтский муниципальный округ",
+
+    "Буйский округ":
+        "Буйский муниципальный округ",
+
+    "Буйский муниципальный округ":
+        "Буйский муниципальный округ",
+
+    "Галичский округ":
+        "Галичский муниципальный округ",
+
+    "Галичский муниципальный округ":
+        "Галичский муниципальный округ",
+
+    "Шарьинский округ":
+        "Шарьинский муниципальный округ",
+
+    "Шарьинский муниципальный округ":
+        "Шарьинский муниципальный округ",
+
+    "Мантуровский округ":
+        "Мантуровский муниципальный округ",
+
+    "Мантуровский муниципальный округ":
+        "Мантуровский муниципальный округ",
+
+    "Макарьевский округ":
+        "Макарьевский муниципальный округ",
+
+    "Макарьевский муниципальный округ":
+        "Макарьевский муниципальный округ",
+
+    "Солигаличский округ":
+        "Солигаличский муниципальный округ",
+
+    "Солигаличский муниципальный округ":
+        "Солигаличский муниципальный округ",
+
+    "Кологривский округ":
+        "Кологривский муниципальный округ",
+
+    "Кологривский муниципальный округ":
+        "Кологривский муниципальный округ",
+
+    "Чухломский округ":
+        "Чухломский муниципальный округ",
+
+    "Чухломский муниципальный округ":
+        "Чухломский муниципальный округ",
+
+    "Нейский округ":
+        "Нейский муниципальный округ",
+
+    "Нейский муниципальный округ":
+        "Нейский муниципальный округ",
+}
+
+
+# ============================================================
+# ALL LOCATIONS
+# ============================================================
+
+KOSTROMA_LOCATIONS = (
+    KOSTROMA_REGION
+    + KOSTROMA_CITIES
+    + KOSTROMA_DISTRICTS
+    + KOSTROMA_OKRUGS
+    + list(
+        LOCATION_ALIASES.keys()
+    )
+)
+
 KOSTROMA_LOCATIONS_SORTED = sorted(
-    KOSTROMA_LOCATIONS,
+    set(
+        KOSTROMA_LOCATIONS
+    ),
     key=len,
     reverse=True,
 )
@@ -421,6 +716,7 @@ UAV_LEVEL_NAMES = {
     1: "🟡 Внимание по БПЛА",
     2: "🟠 Угроза по БПЛА",
     3: "🔴 Опасность по БПЛА",
+    4: "🚨 Тревога по БПЛА",
 }
 
 
@@ -429,6 +725,7 @@ UAV_LEVEL_SHORT = {
     1: "Внимание",
     2: "Угроза",
     3: "Опасность",
+    4: "Тревога",
 }
 
 
@@ -441,7 +738,9 @@ session = requests.Session()
 session.headers.update(
     {
         "User-Agent": USER_AGENT,
-        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Accept-Language": (
+            "ru-RU,ru;q=0.9,en;q=0.8"
+        ),
     }
 )
 
@@ -450,13 +749,16 @@ session.headers.update(
 # TELEGRAM SOURCE FETCH
 # ============================================================
 
-def fetch_source(source_key, source_info):
+def fetch_source(
+    source_key,
+    source_info,
+):
     """
-    Получает последние посты публичного Telegram-канала.
+    Получает последние посты
+    публичного Telegram-канала.
 
-    Важно:
-    эта функция только читает источник.
-    Никаких уведомлений здесь не отправляется.
+    Эта функция только читает источник.
+    Уведомления здесь не отправляются.
     """
 
     url = source_info["url"]
@@ -561,33 +863,28 @@ def fetch_source(source_key, source_info):
             )
 
             if time_node:
-                date_value = (
-                    time_node.get(
-                        "datetime"
-                    )
+                date_value = time_node.get(
+                    "datetime"
                 )
+
+            # ------------------------------------------------
+            # Нормальная ссылка на пост.
+            # ------------------------------------------------
+
+            username = (
+                source_info["url"]
+                .replace(
+                    "https://t.me/s/",
+                    "",
+                )
+                .strip("/")
+            )
 
             post_url = (
                 f"https://t.me/"
-                f"{data_post.replace('/', '/s/')}"
-                if data_post
-                else ""
+                f"{username}/"
+                f"{post_id}"
             )
-
-            if not post_url:
-                username = (
-                    source_info["url"]
-                    .replace(
-                        "https://t.me/s/",
-                        "",
-                    )
-                    .strip("/")
-                )
-
-                post_url = (
-                    f"https://t.me/"
-                    f"{username}/{post_id}"
-                )
 
             stable_key = (
                 f"{source_key}:{post_id}"
@@ -609,7 +906,9 @@ def fetch_source(source_key, source_info):
             posts.append(
                 {
                     "source": source_key,
-                    "source_name": source_info["name"],
+                    "source_name": (
+                        source_info["name"]
+                    ),
                     "post_id": post_id,
                     "text": text_value,
                     "date": date_value,
@@ -626,31 +925,129 @@ def fetch_source(source_key, source_info):
             )
 
     posts.sort(
-        key=lambda item: item["post_id"]
+        key=lambda item: item[
+            "post_id"
+        ]
     )
 
     if len(posts) > SOURCE_LIMIT:
-        posts = posts[-SOURCE_LIMIT:]
+        posts = posts[
+            -SOURCE_LIMIT:
+        ]
 
     return posts
+
+
+# ============================================================
+# TEXT NORMALIZATION
+# ============================================================
+
+def normalize_text(text):
+    if not text:
+        return ""
+
+    text = text.replace(
+        "\u00a0",
+        " ",
+    )
+
+    text = re.sub(
+        r"[ \t]+",
+        " ",
+        text,
+    )
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text,
+    )
+
+    return text.strip()
 
 
 # ============================================================
 # LOCATION DETECTION
 # ============================================================
 
+def location_is_already_found(
+    found,
+    candidate,
+):
+    """
+    Не допускает ситуации, когда одновременно
+    записываются:
+
+    Костромской муниципальный округ
+    Костромской
+
+    """
+
+    candidate_lower = (
+        candidate.lower()
+    )
+
+    for existing in found:
+        existing_lower = (
+            existing.lower()
+        )
+
+        if (
+            candidate_lower
+            in existing_lower
+        ):
+            return True
+
+    return False
+
+
+def canonical_location(
+    location,
+):
+    if not location:
+        return location
+
+    return LOCATION_ALIASES.get(
+        location,
+        location,
+    )
+
+
 def find_locations(text):
+    """
+    Ищет только реально указанные в тексте
+    территории Костромской области.
+
+    Никакой территории здесь не придумывается.
+    """
+
     if not text:
         return []
 
+    text_normalized = normalize_text(
+        text
+    )
+
+    text_lower = (
+        text_normalized.lower()
+    )
+
     found = []
 
-    text_lower = text.lower()
+    # --------------------------------------------------------
+    # Сначала длинные и точные названия.
+    # --------------------------------------------------------
 
     for location in KOSTROMA_LOCATIONS_SORTED:
+        location_lower = (
+            location.lower()
+        )
+
         pattern = (
             r"(?<![а-яёa-z])"
-            + re.escape(location.lower())
+            + re.escape(
+                location_lower
+            )
             + r"(?![а-яёa-z])"
         )
 
@@ -659,16 +1056,101 @@ def find_locations(text):
             text_lower,
             flags=re.IGNORECASE,
         ):
-            found.append(location)
+            canonical = canonical_location(
+                location
+            )
 
-    # Убираем дубликаты
-    unique = []
+            if not location_is_already_found(
+                found,
+                canonical,
+            ):
+                found.append(
+                    canonical
+                )
 
-    for location in found:
-        if location not in unique:
-            unique.append(location)
+    # --------------------------------------------------------
+    # Дополнительные естественные формулировки.
+    # --------------------------------------------------------
 
-    return unique
+    extra_patterns = {
+        r"\bв\s+костроме\b":
+            "Кострома",
+
+        r"\bв\s+буе\b":
+            "Буй",
+
+        r"\bв\s+галиче\b":
+            "Галич",
+
+        r"\bв\s+нерехте\b":
+            "Нерехта",
+
+        r"\bв\s+шарье\b":
+            "Шарья",
+
+        r"\bв\s+мантурово\b":
+            "Мантурово",
+
+        r"\bв\s+макарьеве\b":
+            "Макарьев",
+
+        r"\bв\s+солигаличе\b":
+            "Солигалич",
+
+        r"\bв\s+кологриве\b":
+            "Кологрив",
+
+        r"\bв\s+нее\b":
+            "Нея",
+
+        r"\bв\s+чухломе\b":
+            "Чухлома",
+
+        r"\bв\s+волгореченске\b":
+            "Волгореченск",
+
+        r"\bв\s+кадые\b":
+            "Кадый",
+
+        r"\bв\s+вохме\b":
+            "Вохма",
+
+        r"\bв\s+антропове\b":
+            "Антропово",
+
+        r"\bв\s+павино\b":
+            "Павино",
+
+        r"\bв\s+пыщу\w*\b":
+            "Пыщуг",
+
+        r"\bв\s+судиславле\b":
+            "Судиславль",
+
+        r"\bв\s+сусанинском\b":
+            "Сусанинское",
+
+        r"\bв\s+островском\b":
+            "Островское",
+    }
+
+    for pattern, location in (
+        extra_patterns.items()
+    ):
+        if re.search(
+            pattern,
+            text_lower,
+            flags=re.IGNORECASE,
+        ):
+            if not location_is_already_found(
+                found,
+                location,
+            ):
+                found.append(
+                    location
+                )
+
+    return found
 
 
 # ============================================================
@@ -681,6 +1163,9 @@ UAV_WORDS = [
     "дрон",
     "дроны",
     "дронов",
+    "дрона",
+    "дронам",
+    "дронами",
     "беспилотник",
     "беспилотники",
     "беспилотного",
@@ -716,13 +1201,20 @@ def detect_cancel(text):
         r"\bотбой\b",
         r"\bопасность\s+отмен",
         r"\bугроза\s+отмен",
+        r"\bтревога\s+отмен",
         r"\bопасность\s+снята",
         r"\bугроза\s+снята",
+        r"\bтревога\s+снята",
         r"\bопасность\s+ликвидирован",
         r"\bугроза\s+ликвидирован",
+        r"\bтревога\s+ликвидирован",
         r"\bотменяется\s+опасность",
         r"\bотменена\s+опасность",
         r"\bотменена\s+угроза",
+        r"\bотменена\s+тревога",
+        r"\bснят\s+режим\s+опасности",
+        r"\bснят\s+режим\s+угрозы",
+        r"\bснят\s+режим\s+тревоги",
     ]
 
     return any(
@@ -788,12 +1280,50 @@ def detect_rocket_cancel(text):
 # ============================================================
 
 def detect_uav_level(text):
+    """
+    Возвращает:
+
+    0 = нет статуса
+    1 = Внимание
+    2 = Угроза
+    3 = Опасность
+    4 = Тревога
+
+    ВАЖНО:
+    "фиксация БПЛА" сама по себе НЕ становится
+    автоматически угрозой или опасностью.
+    """
+
     if not text:
         return 0
 
     text_lower = text.lower()
 
-    # Сначала самая высокая степень.
+    # --------------------------------------------------------
+    # ТРЕВОГА
+    # Проверяется отдельно и только при явном указании.
+    # --------------------------------------------------------
+
+    alert_patterns = [
+        r"\bтревога\s+по\s+бпла\b",
+        r"\bтревога\s+бпла\b",
+        r"\bтревога.*беспилот",
+        r"\bтревога.*дрон",
+        r"\bбеспилотная\s+тревога\b",
+    ]
+
+    for pattern in alert_patterns:
+        if re.search(
+            pattern,
+            text_lower,
+            flags=re.IGNORECASE,
+        ):
+            return 4
+
+    # --------------------------------------------------------
+    # ОПАСНОСТЬ
+    # --------------------------------------------------------
+
     danger_patterns = [
         r"\bопасность\s+по\s+бпла\b",
         r"\bопасность\s+бпла\b",
@@ -808,6 +1338,10 @@ def detect_uav_level(text):
             flags=re.IGNORECASE,
         ):
             return 3
+
+    # --------------------------------------------------------
+    # УГРОЗА
+    # --------------------------------------------------------
 
     threat_patterns = [
         r"\bугроза\s+по\s+бпла\b",
@@ -824,6 +1358,10 @@ def detect_uav_level(text):
         ):
             return 2
 
+    # --------------------------------------------------------
+    # ВНИМАНИЕ
+    # --------------------------------------------------------
+
     attention_patterns = [
         r"\bвнимание\s+по\s+бпла\b",
         r"\bвнимание\s+бпла\b",
@@ -839,22 +1377,31 @@ def detect_uav_level(text):
         ):
             return 1
 
-    # Дополнительные формулировки.
+    # --------------------------------------------------------
+    # Дополнительные точные формулировки.
+    # --------------------------------------------------------
+
     if (
-        "опасность бпла" in text_lower
-        or "опасность беспилотников" in text_lower
+        "опасность бпла"
+        in text_lower
+        or "опасность беспилотников"
+        in text_lower
     ):
         return 3
 
     if (
-        "угроза бпла" in text_lower
-        or "угроза беспилотников" in text_lower
+        "угроза бпла"
+        in text_lower
+        or "угроза беспилотников"
+        in text_lower
     ):
         return 2
 
     if (
-        "внимание бпла" in text_lower
-        or "внимание беспилотников" in text_lower
+        "внимание бпла"
+        in text_lower
+        or "внимание беспилотников"
+        in text_lower
     ):
         return 1
 
@@ -865,16 +1412,24 @@ def detect_uav_level(text):
 # RELEVANCE
 # ============================================================
 
-def is_relevant_uav_post(text, locations):
+def is_relevant_uav_post(
+    text,
+    locations,
+):
     """
     Для Костромского бота пост должен:
-    - содержать БПЛА/беспилот/дрон
-    - и относиться к Костромской области/территории.
 
-    Отбой допускается, если активное состояние уже есть.
+    - содержать БПЛА/беспилот/дрон
+    - и относиться к Костромской области
+      или конкретной территории.
+
+    Отбой допускается отдельно,
+    если активное состояние уже есть.
     """
 
-    if not contains_uav(text):
+    if not contains_uav(
+        text
+    ):
         return False
 
     if locations:
@@ -893,15 +1448,25 @@ def parse_post(post):
         "",
     )
 
-    locations = find_locations(text)
+    locations = find_locations(
+        text
+    )
 
-    cancel = detect_cancel(text)
+    cancel = detect_cancel(
+        text
+    )
 
-    rocket = detect_rocket(text)
+    rocket = detect_rocket(
+        text
+    )
 
-    rocket_cancel = detect_rocket_cancel(text)
+    rocket_cancel = detect_rocket_cancel(
+        text
+    )
 
-    uav_level = detect_uav_level(text)
+    uav_level = detect_uav_level(
+        text
+    )
 
     relevant_uav = is_relevant_uav_post(
         text,
@@ -940,24 +1505,31 @@ def add_history(
             level,
             "Неизвестно",
         ),
-        "locations": list(locations),
+        "locations": list(
+            locations
+        ),
         "source": source,
         "post_id": (
-            post.get("post_id")
+            post.get(
+                "post_id"
+            )
             if post
             else None
         ),
         "url": (
-            post.get("url")
+            post.get(
+                "url"
+            )
             if post
             else None
         ),
         "details": details,
     }
 
-    history.append(item)
+    history.append(
+        item
+    )
 
-    # Храним последние 500 событий.
     if len(history) > 500:
         del history[:-500]
 
@@ -969,15 +1541,6 @@ def add_history(
 # ============================================================
 
 def cleanup_sent_posts():
-    """
-    sent_posts больше не является главным механизмом защиты
-    от старых Telegram-постов.
-
-    Основная защита находится в source_state.
-
-    Здесь оставляем ограниченный журнал обработанных постов.
-    """
-
     if len(sent_posts) <= 2000:
         return
 
@@ -986,8 +1549,12 @@ def cleanup_sent_posts():
     )
 
     items.sort(
-        key=lambda item: item[1]
-        if isinstance(item[1], str)
+        key=lambda item:
+        item[1]
+        if isinstance(
+            item[1],
+            str,
+        )
         else ""
     )
 
@@ -1001,8 +1568,12 @@ def cleanup_sent_posts():
     save_sent_posts()
 
 
-def post_was_processed(post):
-    key = post.get("key")
+def post_was_processed(
+    post,
+):
+    key = post.get(
+        "key"
+    )
 
     if not key:
         return False
@@ -1010,8 +1581,12 @@ def post_was_processed(post):
     return key in sent_posts
 
 
-def mark_post_processed(post):
-    key = post.get("key")
+def mark_post_processed(
+    post,
+):
+    key = post.get(
+        "key"
+    )
 
     if not key:
         return
@@ -1027,13 +1602,18 @@ def mark_post_processed(post):
 # SOURCE CURSOR
 # ============================================================
 
-def get_source_cursor(source_key):
+def get_source_cursor(
+    source_key,
+):
     data = source_state.get(
         source_key,
         {},
     )
 
-    if not isinstance(data, dict):
+    if not isinstance(
+        data,
+        dict,
+    ):
         return 0
 
     try:
@@ -1052,26 +1632,39 @@ def set_source_cursor(
     post_id,
 ):
     if source_key not in source_state:
-        source_state[source_key] = {}
+        source_state[
+            source_key
+        ] = {}
 
-    source_state[source_key][
+    source_state[
+        source_key
+    ][
         "last_post_id"
-    ] = int(post_id)
+    ] = int(
+        post_id
+    )
 
-    source_state[source_key][
+    source_state[
+        source_key
+    ][
         "updated_at"
     ] = now_iso()
 
     save_source_state()
 
 
-def source_has_baseline(source_key):
+def source_has_baseline(
+    source_key,
+):
     data = source_state.get(
         source_key,
         {},
     )
 
-    if not isinstance(data, dict):
+    if not isinstance(
+        data,
+        dict,
+    ):
         return False
 
     return bool(
@@ -1087,17 +1680,27 @@ def set_source_baseline(
     post_id,
 ):
     if source_key not in source_state:
-        source_state[source_key] = {}
+        source_state[
+            source_key
+        ] = {}
 
-    source_state[source_key][
+    source_state[
+        source_key
+    ][
         "baseline_done"
     ] = True
 
-    source_state[source_key][
+    source_state[
+        source_key
+    ][
         "last_post_id"
-    ] = int(post_id)
+    ] = int(
+        post_id
+    )
 
-    source_state[source_key][
+    source_state[
+        source_key
+    ][
         "updated_at"
     ] = now_iso()
 
@@ -1145,11 +1748,15 @@ def notification_key(
     )
 
     return hashlib.sha256(
-        raw.encode("utf-8")
+        raw.encode(
+            "utf-8"
+        )
     ).hexdigest()
 
 
-def notification_already_sent(key):
+def notification_already_sent(
+    key,
+):
     return key in notification_events
 
 
@@ -1157,22 +1764,30 @@ def mark_notification_sent(
     key,
     event_type,
 ):
-    notification_events[key] = {
+    notification_events[
+        key
+    ] = {
         "time": now_iso(),
         "event": event_type,
     }
 
-    # Не даём файлу бесконечно расти.
-    if len(notification_events) > 3000:
+    if len(
+        notification_events
+    ) > 3000:
         items = list(
             notification_events.items()
         )
 
-        items = items[-2000:]
+        items = items[
+            -2000:
+        ]
 
         notification_events.clear()
 
-        for item_key, item_value in items:
+        for (
+            item_key,
+            item_value,
+        ) in items:
             notification_events[
                 item_key
             ] = item_value
@@ -1181,18 +1796,54 @@ def mark_notification_sent(
 
 
 # ============================================================
-# PUSH MESSAGE BUILDERS
+# LOCATION FORMAT
 # ============================================================
 
-def format_locations(locations):
+def format_location_name(
+    location,
+):
+    if not location:
+        return (
+            "Костромская область"
+        )
+
+    if location in KOSTROMA_REGION:
+        return (
+            "Костромская область"
+        )
+
+    return location
+
+
+def format_locations(
+    locations,
+):
     if not locations:
-        return "Костромская область"
+        return (
+            "Костромская область"
+        )
+
+    unique = []
+
+    for location in locations:
+        location = format_location_name(
+            location
+        )
+
+        if location not in unique:
+            unique.append(
+                location
+            )
 
     return "\n".join(
         f"• {escape(location)}"
-        for location in locations
+        for location in unique
     )
 
+
+# ============================================================
+# PUSH MESSAGE BUILDERS
+# ============================================================
 
 def build_uav_push(
     event_type,
@@ -1219,7 +1870,10 @@ def build_uav_push(
     )
 
     if event_type == "uav_cancel":
-        title = "🟢 ОТБОЙ ПО БПЛА"
+        title = (
+            "🟢 ОТБОЙ ПО БПЛА"
+        )
+
         status = (
             "Опасность по БПЛА отменена."
         )
@@ -1251,7 +1905,9 @@ def build_uav_push(
             [
                 "",
                 "<b>Источник:</b> "
-                + escape(source_name),
+                + escape(
+                    source_name
+                ),
             ]
         )
 
@@ -1259,13 +1915,18 @@ def build_uav_push(
         parts.extend(
             [
                 "",
-                f'<a href="{escape(source_url)}">'
-                "Открыть источник"
-                "</a>",
+                (
+                    f'<a href="'
+                    f'{escape(source_url)}">'
+                    "Открыть источник"
+                    "</a>"
+                ),
             ]
         )
 
-    return "\n".join(parts)
+    return "\n".join(
+        parts
+    )
 
 
 def build_rocket_push(
@@ -1321,13 +1982,18 @@ def build_rocket_push(
             parts.extend(
                 [
                     "",
-                    f'<a href="{escape(source_url)}">'
-                    "Открыть источник"
-                    "</a>",
+                    (
+                        f'<a href="'
+                        f'{escape(source_url)}">'
+                        "Открыть источник"
+                        "</a>"
+                    ),
                 ]
             )
 
-    return "\n".join(parts)
+    return "\n".join(
+        parts
+    )
 
 
 # ============================================================
@@ -1343,16 +2009,6 @@ async def send_push(
     cycle=None,
     post=None,
 ):
-    """
-    Центральная функция push-уведомлений.
-
-    Очень важно:
-    здесь проверяется notification_key.
-
-    Поэтому одно и то же событие не отправляется
-    повторно после повторной проверки источника.
-    """
-
     key = notification_key(
         event_type=event_type,
         level=level,
@@ -1361,7 +2017,9 @@ async def send_push(
         post=post,
     )
 
-    if notification_already_sent(key):
+    if notification_already_sent(
+        key
+    ):
         logger.info(
             "Push уже отправлялся: %s",
             event_type,
@@ -1372,7 +2030,9 @@ async def send_push(
 
     dead_users = []
 
-    for chat_id in list(subscribers):
+    for chat_id in list(
+        subscribers
+    ):
         try:
             await application.bot.send_message(
                 chat_id=int(chat_id),
@@ -1390,13 +2050,19 @@ async def send_push(
                 exc,
             )
 
-            error_text = str(exc).lower()
+            error_text = str(
+                exc
+            ).lower()
 
             if (
-                "chat not found" in error_text
-                or "bot was blocked" in error_text
-                or "user is deactivated" in error_text
-                or "forbidden" in error_text
+                "chat not found"
+                in error_text
+                or "bot was blocked"
+                in error_text
+                or "user is deactivated"
+                in error_text
+                or "forbidden"
+                in error_text
             ):
                 dead_users.append(
                     str(chat_id)
@@ -1410,7 +2076,6 @@ async def send_push(
     if dead_users:
         save_subscribers()
 
-    # Запоминаем событие только после попытки отправки.
     mark_notification_sent(
         key,
         event_type,
@@ -1437,22 +2102,14 @@ async def apply_uav_event(
     post,
 ):
     """
-    Применяет новое состояние БПЛА.
+    0 = отбой
+    1 = внимание
+    2 = угроза
+    3 = опасность
+    4 = тревога
 
-    Правила:
-
-    0 -> 1 = push Внимание
-    1 -> 2 = push Угроза
-    2 -> 3 = push Опасность
-
-    1 -> 1 = без повторного push
-    2 -> 2 = без повторного push
-    3 -> 3 = без повторного push
-
-    3 -> 2 = НЕ понижаем автоматически.
-    Для этого нужен явный Отбой.
-
-    active_locations при этом обновляются.
+    Уровень автоматически не понижается.
+    Для снятия активного статуса нужен явный отбой.
     """
 
     locations = list(
@@ -1483,27 +2140,42 @@ async def apply_uav_event(
         if old_level <= 0:
             return False
 
-        state["uav_level"] = 0
-        state["active_locations"] = []
+        state[
+            "uav_level"
+        ] = 0
 
-        state["uav_cycle"] = int(
+        state[
+            "active_locations"
+        ] = []
+
+        state[
+            "uav_cycle"
+        ] = int(
             state.get(
                 "uav_cycle",
                 0,
             )
         ) + 1
 
-        state["last_uav_update"] = now_iso()
+        state[
+            "last_uav_update"
+        ] = now_iso()
 
-        state["last_uav_source"] = post.get(
+        state[
+            "last_uav_source"
+        ] = post.get(
             "source_name"
         )
 
-        state["last_uav_post"] = post.get(
+        state[
+            "last_uav_post"
+        ] = post.get(
             "url"
         )
 
-        state["last_update"] = now_iso()
+        state[
+            "last_update"
+        ] = now_iso()
 
         save_state()
 
@@ -1538,10 +2210,6 @@ async def apply_uav_event(
 
         return True
 
-    # --------------------------------------------------------
-    # НЕТ НОВОГО СТАТУСА
-    # --------------------------------------------------------
-
     if new_level <= 0:
         return False
 
@@ -1550,30 +2218,42 @@ async def apply_uav_event(
     # --------------------------------------------------------
 
     if old_level == 0:
-        state["uav_level"] = new_level
+        state[
+            "uav_level"
+        ] = new_level
 
-        state["active_locations"] = (
-            locations
-        )
+        state[
+            "active_locations"
+        ] = locations
 
-        state["uav_cycle"] = int(
+        state[
+            "uav_cycle"
+        ] = int(
             state.get(
                 "uav_cycle",
                 0,
             )
         ) + 1
 
-        state["last_uav_update"] = now_iso()
+        state[
+            "last_uav_update"
+        ] = now_iso()
 
-        state["last_uav_source"] = post.get(
+        state[
+            "last_uav_source"
+        ] = post.get(
             "source_name"
         )
 
-        state["last_uav_post"] = post.get(
+        state[
+            "last_uav_post"
+        ] = post.get(
             "url"
         )
 
-        state["last_update"] = now_iso()
+        state[
+            "last_update"
+        ] = now_iso()
 
         save_state()
 
@@ -1664,7 +2344,7 @@ async def apply_uav_event(
         return False
 
     # --------------------------------------------------------
-    # УРОВЕНЬ НИЖЕ ТЕКУЩЕГО
+    # АВТОМАТИЧЕСКОЕ ПОНИЖЕНИЕ ЗАПРЕЩЕНО
     # --------------------------------------------------------
 
     if new_level < old_level:
@@ -1676,7 +2356,6 @@ async def apply_uav_event(
             new_level,
         )
 
-        # Но территории можем обновить.
         merged = list(
             dict.fromkeys(
                 old_locations
@@ -1701,26 +2380,38 @@ async def apply_uav_event(
     # ПОВЫШЕНИЕ
     # --------------------------------------------------------
 
-    state["uav_level"] = new_level
+    state[
+        "uav_level"
+    ] = new_level
 
-    state["active_locations"] = list(
+    state[
+        "active_locations"
+    ] = list(
         dict.fromkeys(
             old_locations
             + locations
         )
     )
 
-    state["last_uav_update"] = now_iso()
+    state[
+        "last_uav_update"
+    ] = now_iso()
 
-    state["last_uav_source"] = post.get(
+    state[
+        "last_uav_source"
+    ] = post.get(
         "source_name"
     )
 
-    state["last_uav_post"] = post.get(
+    state[
+        "last_uav_post"
+    ] = post.get(
         "url"
     )
 
-    state["last_update"] = now_iso()
+    state[
+        "last_update"
+    ] = now_iso()
 
     save_state()
 
@@ -1736,7 +2427,8 @@ async def apply_uav_event(
         post=post,
         details=(
             f"Повышение уровня "
-            f"{old_level} -> {new_level}"
+            f"{old_level} -> "
+            f"{new_level}"
         ),
     )
 
@@ -1782,13 +2474,16 @@ async def apply_rocket_event(
         )
     )
 
-    # Нет изменения.
     if active == old_active:
         return False
 
-    state["rocket_active"] = active
+    state[
+        "rocket_active"
+    ] = active
 
-    state["rocket_cycle"] = int(
+    state[
+        "rocket_cycle"
+    ] = int(
         state.get(
             "rocket_cycle",
             0,
@@ -1811,7 +2506,9 @@ async def apply_rocket_event(
         "url"
     )
 
-    state["last_update"] = now_iso()
+    state[
+        "last_update"
+    ] = now_iso()
 
     save_state()
 
@@ -1859,17 +2556,9 @@ async def process_post(
     application,
     post,
 ):
-    """
-    Обрабатывает один НОВЫЙ пост.
-
-    Важно:
-    сюда попадают только посты, которые прошли
-    source cursor.
-
-    Старые посты сюда повторно не попадут.
-    """
-
-    if post_was_processed(post):
+    if post_was_processed(
+        post
+    ):
         logger.info(
             "Пост уже обработан: %s",
             post.get("key"),
@@ -1894,7 +2583,9 @@ async def process_post(
     # --------------------------------------------------------
 
     if (
-        parsed["rocket_cancel"]
+        parsed[
+            "rocket_cancel"
+        ]
         and state.get(
             "rocket_active",
             False,
@@ -1906,7 +2597,9 @@ async def process_post(
             post,
         )
 
-    elif parsed["rocket"]:
+    elif parsed[
+        "rocket"
+    ]:
         await apply_rocket_event(
             application,
             True,
@@ -1918,15 +2611,16 @@ async def process_post(
     # --------------------------------------------------------
 
     if (
-        parsed["cancel"]
-        and contains_uav(text)
-        and (
-            state.get(
-                "uav_level",
-                0,
-            )
-            > 0
+        parsed[
+            "cancel"
+        ]
+        and contains_uav(
+            text
         )
+        and state.get(
+            "uav_level",
+            0,
+        ) > 0
     ):
         await apply_uav_event(
             application,
@@ -1936,12 +2630,18 @@ async def process_post(
         )
 
     elif (
-        parsed["relevant_uav"]
-        and parsed["uav_level"] > 0
+        parsed[
+            "relevant_uav"
+        ]
+        and parsed[
+            "uav_level"
+        ] > 0
     ):
         await apply_uav_event(
             application,
-            parsed["uav_level"],
+            parsed[
+                "uav_level"
+            ],
             locations,
             post,
         )
@@ -1956,23 +2656,18 @@ async def process_post(
 # ============================================================
 
 async def make_startup_baseline():
-    """
-    Первый запуск:
-
-    Мы читаем существующие посты источников,
-    запоминаем последний ID,
-    но НИЧЕГО не отправляем пользователям.
-
-    Это критично для защиты от старых пушей.
-    """
-
     logger.info(
-        "Создание первоначальной базы источников..."
+        "Создание первоначальной "
+        "базы источников..."
     )
 
     changed = False
 
-    for source_key, source_info in SOURCES.items():
+    for (
+        source_key,
+        source_info,
+    ) in SOURCES.items():
+
         posts = await asyncio.to_thread(
             fetch_source,
             source_key,
@@ -1990,7 +2685,9 @@ async def make_startup_baseline():
 
         set_source_baseline(
             source_key,
-            latest["post_id"],
+            latest[
+                "post_id"
+            ],
         )
 
         changed = True
@@ -1998,7 +2695,9 @@ async def make_startup_baseline():
         logger.info(
             "Baseline %s: post_id=%s",
             source_key,
-            latest["post_id"],
+            latest[
+                "post_id"
+            ],
         )
 
     if changed:
@@ -2013,7 +2712,8 @@ async def make_startup_baseline():
         save_state()
 
     logger.info(
-        "Первоначальная база источников создана."
+        "Первоначальная база "
+        "источников создана."
     )
 
 
@@ -2025,19 +2725,6 @@ def get_new_posts_for_source(
     source_key,
     posts,
 ):
-    """
-    Возвращает только действительно новые посты.
-
-    Главная защита от старых сообщений.
-
-    Если cursor найден:
-        post_id > cursor
-
-    Если cursor НЕ найден среди старой страницы:
-        НЕ берём posts[-10:].
-        Вместо этого создаём новый baseline.
-    """
-
     if not posts:
         return []
 
@@ -2045,7 +2732,6 @@ def get_new_posts_for_source(
         "post_id"
     ]
 
-    # Первый запуск конкретного источника.
     if not source_has_baseline(
         source_key
     ):
@@ -2073,17 +2759,17 @@ def get_new_posts_for_source(
 
         return []
 
-    # Нормальный случай.
     newer = [
         post
         for post in posts
-        if post["post_id"] > cursor
+        if post[
+            "post_id"
+        ] > cursor
     ]
 
     if newer:
         return newer
 
-    # Ничего нового.
     return []
 
 
@@ -2097,19 +2783,20 @@ monitor_lock = asyncio.Lock()
 async def check_sources(
     application,
 ):
-    """
-    Один цикл мониторинга всех источников.
-    """
-
     if monitor_lock.locked():
         logger.warning(
-            "Предыдущая проверка источников "
-            "ещё выполняется."
+            "Предыдущая проверка "
+            "источников ещё выполняется."
         )
         return
 
     async with monitor_lock:
-        for source_key, source_info in SOURCES.items():
+
+        for (
+            source_key,
+            source_info,
+        ) in SOURCES.items():
+
             try:
                 posts = await asyncio.to_thread(
                     fetch_source,
@@ -2120,43 +2807,41 @@ async def check_sources(
                 if not posts:
                     continue
 
-                # ------------------------------------------------
-                # Получаем новые посты.
-                # ------------------------------------------------
-
-                new_posts = get_new_posts_for_source(
-                    source_key,
-                    posts,
+                new_posts = (
+                    get_new_posts_for_source(
+                        source_key,
+                        posts,
+                    )
                 )
 
                 if not new_posts:
                     continue
 
                 logger.info(
-                    "Источник %s: новых постов %s",
+                    "Источник %s: "
+                    "новых постов %s",
                     source_key,
                     len(new_posts),
                 )
 
-                # ------------------------------------------------
-                # Обрабатываем от старого к новому.
-                # ------------------------------------------------
-
                 for post in new_posts:
+
                     await process_post(
                         application,
                         post,
                     )
 
-                    # Cursor двигаем ПОСЛЕ обработки.
                     set_source_cursor(
                         source_key,
-                        post["post_id"],
+                        post[
+                            "post_id"
+                        ],
                     )
 
             except Exception:
                 logger.exception(
-                    "Ошибка проверки источника %s",
+                    "Ошибка проверки "
+                    "источника %s",
                     source_key,
                 )
 
@@ -2172,26 +2857,25 @@ async def monitor_loop(
     application,
 ):
     logger.info(
-        "Мониторинг источников запущен. "
-        "Интервал: %s сек.",
+        "Мониторинг источников "
+        "запущен. Интервал: %s сек.",
         CHECK_INTERVAL,
     )
 
-    # Первый запуск:
-    # только baseline.
     if not state.get(
         "startup_completed",
         False,
     ):
         try:
             await make_startup_baseline()
+
         except Exception:
             logger.exception(
-                "Ошибка создания startup baseline"
+                "Ошибка создания "
+                "startup baseline"
             )
 
     else:
-        # На уже работающем боте сразу проверяем.
         await check_sources(
             application
         )
@@ -2232,11 +2916,6 @@ def main_keyboard():
             "uav_level",
             0,
         )
-    )
-
-    status_text = UAV_LEVEL_NAMES.get(
-        level,
-        "🟢 Нет опасности",
     )
 
     keyboard = [
@@ -2300,8 +2979,15 @@ def format_status():
     lines = [
         "<b>UAV ALERT</b>",
         "",
-        f"<b>Статус:</b> "
-        f"{escape(UAV_LEVEL_NAMES.get(level, 'Неизвестно'))}",
+        (
+            "<b>Статус:</b> "
+            + escape(
+                UAV_LEVEL_NAMES.get(
+                    level,
+                    "Неизвестно",
+                )
+            )
+        ),
     ]
 
     if locations:
@@ -2319,14 +3005,21 @@ def format_status():
         lines.extend(
             [
                 "",
-                "<b>🟥 Ракетная опасность:</b> активна",
+                (
+                    "<b>🟥 Ракетная "
+                    "опасность:</b> активна"
+                ),
             ]
         )
+
     else:
         lines.extend(
             [
                 "",
-                "<b>🟥 Ракетная опасность:</b> нет",
+                (
+                    "<b>🟥 Ракетная "
+                    "опасность:</b> нет"
+                ),
             ]
         )
 
@@ -2338,37 +3031,48 @@ def format_status():
         lines.extend(
             [
                 "",
-                "<b>Последнее обновление:</b> "
-                + escape(
-                    format_time(
-                        last_update
+                (
+                    "<b>Последнее "
+                    "обновление:</b> "
+                    + escape(
+                        format_time(
+                            last_update
+                        )
                     )
                 ),
             ]
         )
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 # ============================================================
 # HISTORY TEXT
 # ============================================================
 
-def format_history(limit=15):
+def format_history(
+    limit=15,
+):
     if not history:
         return (
             "<b>История</b>\n\n"
             "История пока пустая."
         )
 
-    items = history[-limit:]
+    items = history[
+        -limit:
+    ]
 
     lines = [
         "<b>📜 Последние события</b>",
         "",
     ]
 
-    for item in reversed(items):
+    for item in reversed(
+        items
+    ):
         event_type = item.get(
             "type",
             "",
@@ -2391,7 +3095,9 @@ def format_history(limit=15):
         )
 
         if event_type == "uav_cancel":
-            title = "🟢 Отбой по БПЛА"
+            title = (
+                "🟢 Отбой по БПЛА"
+            )
 
         elif event_type == "uav_location":
             title = (
@@ -2419,20 +3125,28 @@ def format_history(limit=15):
             f"{escape(format_time(timestamp))}"
         )
 
-        lines.append(line)
+        lines.append(
+            line
+        )
 
         if locations:
             lines.append(
                 "Территории: "
                 + ", ".join(
-                    escape(x)
+                    escape(
+                        format_location_name(
+                            x
+                        )
+                    )
                     for x in locations
                 )
             )
 
         lines.append("")
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 # ============================================================
@@ -2445,7 +3159,11 @@ def format_sources():
         "",
     ]
 
-    for source_key, source_info in SOURCES.items():
+    for (
+        source_key,
+        source_info,
+    ) in SOURCES.items():
+
         cursor = get_source_cursor(
             source_key
         )
@@ -2453,15 +3171,20 @@ def format_sources():
         lines.append(
             "• <b>"
             + escape(
-                source_info["name"]
+                source_info[
+                    "name"
+                ]
             )
             + "</b>"
         )
 
         lines.append(
-            f'<a href="{escape(source_info["url"])}">'
-            "Открыть источник"
-            "</a>"
+            (
+                f'<a href="'
+                f'{escape(source_info["url"])}">'
+                "Открыть источник"
+                "</a>"
+            )
         )
 
         if cursor:
@@ -2471,7 +3194,9 @@ def format_sources():
 
         lines.append("")
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 # ============================================================
@@ -2501,30 +3226,49 @@ def format_stats():
         ):
             rocket_events += 1
 
+    current_level = int(
+        state.get(
+            "uav_level",
+            0,
+        )
+    )
+
     lines = [
         "<b>📈 Статистика UAV ALERT</b>",
         "",
-        f"Подписчиков: <b>{len(subscribers)}</b>",
-        f"Событий БПЛА: <b>{uav_events}</b>",
-        f"Отбоев БПЛА: <b>{cancel_events}</b>",
-        f"Ракетных событий: <b>{rocket_events}</b>",
-        f"Записей истории: <b>{len(history)}</b>",
+        (
+            "Подписчиков: "
+            f"<b>{len(subscribers)}</b>"
+        ),
+        (
+            "Событий БПЛА: "
+            f"<b>{uav_events}</b>"
+        ),
+        (
+            "Отбоев БПЛА: "
+            f"<b>{cancel_events}</b>"
+        ),
+        (
+            "Ракетных событий: "
+            f"<b>{rocket_events}</b>"
+        ),
+        (
+            "Записей истории: "
+            f"<b>{len(history)}</b>"
+        ),
         "",
         "<b>Текущий уровень:</b>",
         escape(
             UAV_LEVEL_NAMES.get(
-                int(
-                    state.get(
-                        "uav_level",
-                        0,
-                    )
-                ),
+                current_level,
                 "Неизвестно",
             )
         ),
     ]
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 # ============================================================
@@ -2542,18 +3286,21 @@ async def start_command(
         update.effective_chat.id
     )
 
-    subscribers.add(chat_id)
+    subscribers.add(
+        chat_id
+    )
 
     save_subscribers()
 
     text = (
         "<b>UAV ALERT</b>\n\n"
-        "Гражданский информационный сервис "
-        "по ситуации с БПЛА "
+        "Гражданский информационный "
+        "сервис по ситуации с БПЛА "
         "в Костромской области.\n\n"
-        "🔔 Вы подписаны на push-уведомления.\n\n"
-        "Уведомления будут приходить при "
-        "изменении статуса."
+        "🔔 Вы подписаны на "
+        "push-уведомления.\n\n"
+        "Уведомления будут приходить "
+        "при изменении статуса."
     )
 
     await update.effective_message.reply_text(
@@ -2586,7 +3333,8 @@ async def stop_command(
     save_subscribers()
 
     await update.effective_message.reply_text(
-        "🔕 Вы отписались от push-уведомлений.",
+        "🔕 Вы отписались "
+        "от push-уведомлений.",
         reply_markup=main_keyboard(),
     )
 
@@ -2670,7 +3418,9 @@ async def subscribe_command(
         update.effective_chat.id
     )
 
-    subscribers.add(chat_id)
+    subscribers.add(
+        chat_id
+    )
 
     save_subscribers()
 
@@ -2698,7 +3448,9 @@ async def unsubscribe_command(
 # ADMIN CHECK
 # ============================================================
 
-def is_admin(update):
+def is_admin(
+    update,
+):
     if not update.effective_user:
         return False
 
@@ -2716,9 +3468,12 @@ async def test_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not is_admin(update):
+    if not is_admin(
+        update
+    ):
         await update.effective_message.reply_text(
-            "⛔ Команда доступна только администратору."
+            "⛔ Команда доступна "
+            "только администратору."
         )
         return
 
@@ -2730,16 +3485,21 @@ async def test_command(
             "/test attention\n"
             "/test threat\n"
             "/test danger\n"
+            "/test alarm\n"
             "/test cancel\n"
             "/test rocket\n"
             "/test rocket_off"
         )
         return
 
-    test_type = args[0].lower()
+    test_type = (
+        args[0].lower()
+    )
 
     fake_post = {
-        "source_name": "UAV ALERT TEST",
+        "source_name": (
+            "UAV ALERT TEST"
+        ),
         "url": "",
         "post_id": 0,
         "key": (
@@ -2754,18 +3514,23 @@ async def test_command(
         ),
     }
 
+    test_locations = [
+        "Костромская область"
+    ]
+
     if test_type == "attention":
+
         await send_push(
             context.application,
             build_uav_push(
                 "uav",
                 1,
-                ["Костромская область"],
+                test_locations,
                 fake_post,
             ),
             "test_attention",
             1,
-            ["Костромская область"],
+            test_locations,
             int(
                 time.time()
             ),
@@ -2773,17 +3538,18 @@ async def test_command(
         )
 
     elif test_type == "threat":
+
         await send_push(
             context.application,
             build_uav_push(
                 "uav",
                 2,
-                ["Костромская область"],
+                test_locations,
                 fake_post,
             ),
             "test_threat",
             2,
-            ["Костромская область"],
+            test_locations,
             int(
                 time.time()
             ),
@@ -2791,17 +3557,37 @@ async def test_command(
         )
 
     elif test_type == "danger":
+
         await send_push(
             context.application,
             build_uav_push(
                 "uav",
                 3,
-                ["Костромская область"],
+                test_locations,
                 fake_post,
             ),
             "test_danger",
             3,
-            ["Костромская область"],
+            test_locations,
+            int(
+                time.time()
+            ),
+            post=None,
+        )
+
+    elif test_type == "alarm":
+
+        await send_push(
+            context.application,
+            build_uav_push(
+                "uav",
+                4,
+                test_locations,
+                fake_post,
+            ),
+            "test_alarm",
+            4,
+            test_locations,
             int(
                 time.time()
             ),
@@ -2809,17 +3595,18 @@ async def test_command(
         )
 
     elif test_type == "cancel":
+
         await send_push(
             context.application,
             build_uav_push(
                 "uav_cancel",
                 0,
-                ["Костромская область"],
+                test_locations,
                 fake_post,
             ),
             "test_cancel",
             0,
-            ["Костромская область"],
+            test_locations,
             int(
                 time.time()
             ),
@@ -2827,6 +3614,7 @@ async def test_command(
         )
 
     elif test_type == "rocket":
+
         await send_push(
             context.application,
             build_rocket_push(
@@ -2843,6 +3631,7 @@ async def test_command(
         )
 
     elif test_type == "rocket_off":
+
         await send_push(
             context.application,
             build_rocket_push(
@@ -2865,7 +3654,8 @@ async def test_command(
         return
 
     await update.effective_message.reply_text(
-        "✅ Тестовое push-уведомление отправлено."
+        "✅ Тестовое "
+        "push-уведомление отправлено."
     )
 
 
@@ -2877,7 +3667,9 @@ async def admin_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not is_admin(update):
+    if not is_admin(
+        update
+    ):
         await update.effective_message.reply_text(
             "⛔ Нет доступа."
         )
@@ -2916,6 +3708,7 @@ async def callback_handler(
     data = query.data
 
     if data == "status":
+
         await query.message.reply_text(
             format_status(),
             parse_mode=ParseMode.HTML,
@@ -2924,6 +3717,7 @@ async def callback_handler(
         )
 
     elif data == "history":
+
         await query.message.reply_text(
             format_history(),
             parse_mode=ParseMode.HTML,
@@ -2932,6 +3726,7 @@ async def callback_handler(
         )
 
     elif data == "sources":
+
         await query.message.reply_text(
             format_sources(),
             parse_mode=ParseMode.HTML,
@@ -2940,6 +3735,7 @@ async def callback_handler(
         )
 
     elif data == "stats":
+
         await query.message.reply_text(
             format_stats(),
             parse_mode=ParseMode.HTML,
@@ -2948,11 +3744,14 @@ async def callback_handler(
         )
 
     elif data == "subscribe":
+
         chat_id = str(
             query.message.chat.id
         )
 
-        subscribers.add(chat_id)
+        subscribers.add(
+            chat_id
+        )
 
         save_subscribers()
 
@@ -2979,7 +3778,9 @@ def index():
     )
 
 
-@flask_app.route("/status")
+@flask_app.route(
+    "/status"
+)
 def web_status():
     level = int(
         state.get(
@@ -3002,6 +3803,12 @@ def web_status():
                 False,
             )
         ),
+        "active_locations": (
+            state.get(
+                "active_locations",
+                [],
+            )
+        ),
         "subscribers": len(
             subscribers
         ),
@@ -3016,7 +3823,8 @@ def web_status():
 
 def run_flask():
     logger.info(
-        "Flask запускается на порту %s",
+        "Flask запускается "
+        "на порту %s",
         PORT,
     )
 
@@ -3078,9 +3886,11 @@ async def post_init(
         ]
     )
 
-    monitor_task = asyncio.create_task(
-        monitor_loop(
-            application
+    monitor_task = (
+        asyncio.create_task(
+            monitor_loop(
+                application
+            )
         )
     )
 
@@ -3099,10 +3909,12 @@ async def post_shutdown(
     global monitor_task
 
     if monitor_task:
+
         monitor_task.cancel()
 
         try:
             await monitor_task
+
         except asyncio.CancelledError:
             pass
 
@@ -3118,10 +3930,14 @@ async def post_shutdown(
 def main():
     if not BOT_TOKEN:
         raise RuntimeError(
-            "Переменная окружения BOT_TOKEN не задана."
+            "Переменная окружения "
+            "BOT_TOKEN не задана."
         )
 
-    # Flask запускаем отдельно.
+    # --------------------------------------------------------
+    # Flask
+    # --------------------------------------------------------
+
     flask_thread = threading.Thread(
         target=run_flask,
         daemon=True,
@@ -3130,11 +3946,19 @@ def main():
 
     flask_thread.start()
 
+    # --------------------------------------------------------
+    # Telegram application
+    # --------------------------------------------------------
+
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
+        .post_init(
+            post_init
+        )
+        .post_shutdown(
+            post_shutdown
+        )
         .build()
     )
 
@@ -3232,7 +4056,9 @@ def main():
 
     application.run_polling(
         drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
+        allowed_updates=(
+            Update.ALL_TYPES
+        ),
     )
 
 
