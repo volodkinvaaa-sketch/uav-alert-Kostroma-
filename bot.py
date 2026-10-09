@@ -6,16 +6,26 @@ import asyncio
 import hashlib
 import logging
 import threading
+
 from datetime import datetime, timezone, timedelta
 
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+)
 from telegram.constants import ParseMode
 from telegram.error import TelegramError, Forbidden, BadRequest, RetryAfter
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+)
 
 
 # ============================================================
@@ -333,20 +343,32 @@ def find_locations(text):
 # ============================================================
 
 UAV_CONTEXT_RE = re.compile(
-    r"(?:\bбпла\b|\bбеспилот\w*\b|\bдрон\w*\b|"
-    r"\bбезэкипажн\w*\b|\bмрлс\b|\bмрш\b|\bмрл\b|"
-    r"\bна шарах\b|"
+    r"(?:"
+    r"\bбпла\b|"
+    r"\bбеспилот\w*\b|"
+    r"\bдрон\w*\b|"
+    r"\bбезэкипажн\w*\b|"
+    r"\bмвш\b|"
+    r"\bмрш\b|"
+    r"\bмрлс\b|"
+    r"\bмрл\b|"
+    r"\bмалоразмерн\w*\s+воздушн\w*\s+шар\w*\b|"
+    r"\bвоздушн\w*\s+шар\w*\s+с\s+аппаратурой\b|"
     r"\bшар(?:ы|ов|ами)?\s+с\s+аппаратурой\b|"
+    r"\bна\s+шарах\b|"
     r"\bвоздушн\w*\s+цел\w*\b|"
-    r"\bлетательн\w*\s+аппарат\w*\b)",
+    r"\bлетательн\w*\s+аппарат\w*"
+    r")",
     re.IGNORECASE,
 )
 
 ROCKET_CONTEXT_RE = re.compile(
-    r"(?:\bракетн\w*\s+опасност\w*\b|"
+    r"(?:"
+    r"\bракетн\w*\s+опасност\w*\b|"
     r"\bракетн\w*\s+тревог\w*\b|"
     r"\bугроз\w*\s+ракетн\w*\b|"
-    r"\bракет\w*\s+опасност\w*\b)",
+    r"\bракет\w*\s+опасност\w*\b"
+    r")",
     re.IGNORECASE,
 )
 
@@ -395,15 +417,6 @@ def detect_rocket_cancel(text):
 
 
 def detect_uav_cancel(text):
-    """
-    Возвращает True только для сообщения, которое похоже
-    на отмену угрозы БПЛА.
-
-    Простого упоминания слова «отбой» недостаточно:
-    необходимо связать отмену с БПЛА, беспилотниками,
-    дронами или МРШ.
-    """
-
     value = normalize_text(text)
 
     if not detect_cancel(value):
@@ -412,39 +425,34 @@ def detect_uav_cancel(text):
     if not contains_uav(value):
         return False
 
-    # Отдельно ищем прямую связь отмены с БПЛА.
+    object_pattern = (
+        r"(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|"
+        r"малоразмерн\w*\s+воздушн\w*\s+шар\w*|"
+        r"воздушн\w*\s+шар\w*\s+с\s+аппаратурой)"
+    )
+
+    cancel_pattern = r"(?:отбой|отмен\w*|снят\w*|прекращен\w*)"
+
     explicit_uav_cancel = bool(
         re.search(
-            r"\b(?:отбой|отмен\w*|снят\w*|прекращен\w*)\b"
-            r"(?:\W+\w+){0,5}\W+"
-            r"(?:(?:опасност\w*|угроз\w*|тревог\w*)"
-            r"(?:\W+\w+){0,3}\W+)?"
-            r"(?:по\W*)?"
-            r"(?:бпла|беспилот\w*|дрон\w*|мрш|мрлс)\b"
-            r"|"
-            r"\b(?:бпла|беспилот\w*|дрон\w*|мрш|мрлс)\b"
-            r"(?:\W+\w+){0,5}\W+"
-            r"(?:(?:опасност\w*|угроз\w*|тревог\w*)"
-            r"(?:\W+\w+){0,3}\W+)?"
-            r"(?:отмен\w*|снят\w*|прекращен\w*|отбой)\b",
+            r"\b" + cancel_pattern
+            + r"(?:\W+\w+){0,8}\W+"
+            + object_pattern + r"\b"
+            + r"|"
+            + r"\b" + object_pattern
+            + r"(?:\W+\w+){0,8}\W+"
+            + cancel_pattern + r"\b",
             value,
         )
     )
 
-    # Если явно отменяется ракетная опасность, не сбрасываем
-    # статус БПЛА из-за соседнего упоминания беспилотников.
     if detect_rocket_cancel(value) and not explicit_uav_cancel:
-        logger.debug(
-            "Отмена БПЛА отклонена: обнаружена отмена ракетной опасности."
-        )
         return False
 
-    # Сообщение об активной угрозе не должно превращаться
-    # в отбой только из-за другого употребления слова «отбой».
     active_persists = bool(
         re.search(
             r"\b(?:угроз\w*|опасност\w*|внимание)\b"
-            r".{0,100}\b"
+            r".{0,120}\b"
             r"(?:сохраня\w*|действу\w*|продолжа\w*|"
             r"остает\w*|остаетс\w*)",
             value,
@@ -454,16 +462,7 @@ def detect_uav_cancel(text):
     if active_persists and not explicit_uav_cancel:
         return False
 
-    # Общий «отбой» без явной привязки к БПЛА не принимаем,
-    # если в тексте есть только упоминание беспилотников.
-    if not explicit_uav_cancel:
-        logger.debug(
-            "Не подтверждён явный отбой БПЛА: %s",
-            value[:250],
-        )
-        return False
-
-    return True
+    return explicit_uav_cancel
 
 
 def detect_uav_level(text):
@@ -473,48 +472,49 @@ def detect_uav_level(text):
         return 0
 
     danger_patterns = [
-        r"\bопасност\w*\s+по\s+бпла\b",
-        r"\bопасност\w*\s+бпла\b",
-        r"\bопасност\w*\s+по\s+мрш\b",
-        r"\bопасност\w*\s+мрш\b",
-        r"\bопасност\w*\s+беспилот\w*\b",
-        r"\bобъявлен\w*\s+опасност\w*\s+по\s+бпла\b",
-        r"\bкрасн\w*\s+уровен\w*\s+бпла\b",
-        r"\bтревог\w*\s+по\s+бпла\b",
-        r"\bтревог\w*\s+беспилот\w*\b",
+        r"\bопасност\w*\s+(?:по\s+)?(?:бпла|мвш|мрш)\b",
+        r"\bопасност\w*\s+(?:по\s+)?беспилот\w*\b",
+        r"\bобъявлен\w*\s+опасност\w*"
+        r".{0,50}(?:бпла|мвш|мрш|беспилот\w*)",
+        r"\bкрасн\w*\s+уровен\w*"
+        r".{0,40}(?:бпла|мвш|мрш|беспилот\w*)",
+        r"\bтревог\w*\s+(?:по\s+)?(?:бпла|мвш|мрш)\b",
+        r"\bопасност\w*\s+по\s+малоразмерн\w*"
+        r"\s+воздушн\w*\s+шар\w*\b",
     ]
 
     if any(re.search(pattern, value) for pattern in danger_patterns):
         return 3
 
     threat_patterns = [
-        r"\bугроз\w*\s+по\s+бпла\b",
-        r"\bугроз\w*\s+бпла\b",
-        r"\bугроз\w*\s+по\s+мрш\b",
-        r"\bугроз\w*\s+мрш\b",
-        r"\bугроз\w*\s+беспилот\w*\b",
-        r"\bобъявлен\w*\s+угроз\w*\s+бпла\b",
-        r"\bоранжев\w*\s+уровен\w*\s+бпла\b",
+        r"\bугроз\w*\s+(?:по\s+)?(?:бпла|мвш|мрш)\b",
+        r"\bугроз\w*\s+(?:по\s+)?беспилот\w*\b",
+        r"\bобъявлен\w*\s+угроз\w*"
+        r".{0,50}(?:бпла|мвш|мрш|беспилот\w*)",
+        r"\bоранжев\w*\s+уровен\w*"
+        r".{0,40}(?:бпла|мвш|мрш|беспилот\w*)",
+        r"\bугроз\w*\s+по\s+малоразмерн\w*"
+        r"\s+воздушн\w*\s+шар\w*\b",
     ]
 
     if any(re.search(pattern, value) for pattern in threat_patterns):
         return 2
 
     attention_patterns = [
-        r"\bвнимание\s+по\s+бпла\b",
-        r"\bвнимание\s+бпла\b",
-        r"\bвнимание\s+по\s+мрш\b",
-        r"\bвнимание\s+мрш\b",
-        r"\bвнимание\s+беспилот\w*\b",
-        r"\bжелт\w*\s+уровен\w*\s+бпла\b",
-        r"\bвнимание\s*:\s*бпла\b",
+        r"\bвнимание\s+(?:по\s+)?(?:бпла|мвш|мрш)\b",
+        r"\bвнимание\s+(?:по\s+)?беспилот\w*\b",
+        r"\bжелт\w*\s+уровен\w*"
+        r".{0,40}(?:бпла|мвш|мрш|беспилот\w*)",
+        r"\bвнимание\s*:\s*(?:бпла|мвш|мрш)\b",
+        r"\bвнимание\s+по\s+малоразмерн\w*"
+        r"\s+воздушн\w*\s+шар\w*\b",
     ]
 
     if any(re.search(pattern, value) for pattern in attention_patterns):
         return 1
 
     if contains_uav(value):
-        if re.search(r"\b(опасност\w*|тревог\w*)\b", value):
+        if re.search(r"\b(?:опасност\w*|тревог\w*)\b", value):
             return 3
 
         if re.search(r"\bугроз\w*\b", value):
@@ -772,7 +772,6 @@ async def send_push(
             "Уведомление %s уже успешно отправлено.",
             event_type,
         )
-
         return int(previous.get("sent_count", 0))
 
     if not subscribers:
@@ -791,30 +790,18 @@ async def send_push(
         }
 
         save_notification_events()
-
         return 0
 
     sent_count = 0
+    failed_count = 0
     dead_users = []
     errors = []
 
     for user_id in list(subscribers):
-        try:
-            await application.bot.send_message(
-                chat_id=user_id,
-                text=message,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
+        delivered = False
 
-            sent_count += 1
-
-        except RetryAfter as exc:
-            delay = getattr(exc, "retry_after", 2)
-
+        for attempt in range(2):
             try:
-                await asyncio.sleep(float(delay))
-
                 await application.bot.send_message(
                     chat_id=user_id,
                     text=message,
@@ -823,28 +810,37 @@ async def send_push(
                 )
 
                 sent_count += 1
+                delivered = True
+                break
 
-            except Forbidden:
-                dead_users.append(user_id)
+            except RetryAfter as exc:
+                delay = getattr(exc, "retry_after", 2)
 
-            except TelegramError as retry_exc:
-                errors.append(str(retry_exc))
+                if attempt == 0:
+                    await asyncio.sleep(float(delay))
+                    continue
 
-                logger.exception(
-                    "Повторная отправка пользователю %s не удалась",
+                errors.append(f"{user_id}: RetryAfter")
+                logger.warning(
+                    "Превышен лимит отправки пользователю %s",
                     user_id,
                 )
 
-        except Forbidden:
-            dead_users.append(user_id)
+            except Forbidden:
+                dead_users.append(user_id)
+                errors.append(f"{user_id}: Forbidden")
+                break
 
-        except (BadRequest, TelegramError) as exc:
-            errors.append(str(exc))
+            except (BadRequest, TelegramError) as exc:
+                errors.append(f"{user_id}: {exc}")
+                logger.exception(
+                    "Не удалось отправить push пользователю %s",
+                    user_id,
+                )
+                break
 
-            logger.exception(
-                "Не удалось отправить push пользователю %s",
-                user_id,
-            )
+        if not delivered:
+            failed_count += 1
 
     for user_id in dead_users:
         subscribers.discard(user_id)
@@ -852,22 +848,26 @@ async def send_push(
     if dead_users:
         save_subscribers()
 
+    # Отмечаем уведомление как полностью доставленное только
+    # когда оно доставлено всем действующим подписчикам.
+    # Если есть ошибки, следующая проверка сможет повторить отправку.
     notification_events[key] = {
-        "sent": sent_count > 0,
+        "sent": failed_count == 0 and sent_count > 0,
         "sent_count": sent_count,
+        "failed_count": failed_count,
         "attempted_at": now_msk().isoformat(timespec="seconds"),
         "event": event_type,
         "post": post.get("key"),
-        "error": "; ".join(errors[:5]) if errors else None,
+        "error": "; ".join(errors[:10]) if errors else None,
     }
 
     save_notification_events()
 
     logger.info(
-        "Push %s: доставлено %s; ошибок %s; подписчиков %s",
+        "Push %s: доставлено %s; не доставлено %s; подписчиков %s",
         event_type,
         sent_count,
-        len(errors),
+        failed_count,
         len(subscribers),
     )
 
@@ -911,14 +911,12 @@ async def retry_last_uav_notification(application, post=None):
     if event_type == "uav_cancel":
         message = build_uav_cancel_push(saved_post)
         push_level = 0
-
     else:
         message = build_uav_push(
             level,
             state.get("active_locations") or [],
             saved_post,
         )
-
         push_level = level
 
     return await send_push(
@@ -1012,13 +1010,9 @@ async def apply_uav_event(
     locations = locations or ["Костромская область"]
     post = post or {}
 
-    # Отбой разрешён только при переходе с активного уровня.
-    # Отсутствие новых сообщений само по себе не означает отбой.
     if new_level <= 0:
         if old_level <= 0 and not force_push:
-            logger.info(
-                "Отбой обнаружен, активного статуса нет."
-            )
+            logger.info("Отбой обнаружен, активного статуса нет.")
             return False
 
         state["uav_level"] = 0
@@ -1071,7 +1065,6 @@ async def apply_uav_event(
         )
 
         await retry_last_uav_notification(application, post)
-
         return False
 
     new_cycle = old_level == 0
@@ -1324,6 +1317,15 @@ async def check_sources(application):
                     source_key,
                 )
 
+        # Удаляем дубликаты, если одна публикация встретилась
+        # повторно в рамках одной проверки.
+        unique_posts = {}
+
+        for post in collected:
+            unique_posts[post.get("key")] = post
+
+        collected = list(unique_posts.values())
+
         collected.sort(
             key=lambda post: (
                 parse_datetime(post.get("date"))
@@ -1348,8 +1350,7 @@ async def check_sources(application):
         latest_uav = None
         latest_rocket = None
 
-        # Публикации обрабатываются от старых к новым.
-        # Последнее распознанное событие каждого типа побеждает.
+        # Анализируем сообщения от старых к новым.
         for post in collected:
             source_key = post.get("source", "")
 
@@ -1386,39 +1387,41 @@ async def check_sources(application):
         if latest_uav:
             post, event = latest_uav
 
-            if event["uav_event"] == "cancel":
-                if int(state.get("uav_level", 0)) > 0:
+            # Отрабатываем событие только если оно ещё не было
+            # отмечено обработанным. При этом новые события,
+            # найденные после запуска, не теряются.
+            already_processed = post.get("key") in sent_posts
+
+            if not already_processed:
+                if event["uav_event"] == "cancel":
+                    if int(state.get("uav_level", 0)) > 0:
+                        await apply_uav_event(
+                            application,
+                            0,
+                            event["locations"],
+                            post,
+                        )
+                    else:
+                        logger.info(
+                            "Последнее событие БПЛА — отбой, "
+                            "активного статуса нет."
+                        )
+
+                elif event["uav_event"] == "active":
                     await apply_uav_event(
                         application,
-                        0,
+                        int(event["uav_level"]),
                         event["locations"],
                         post,
                     )
 
-                else:
-                    logger.info(
-                        "Последнее событие БПЛА — отбой, "
-                        "активного статуса нет."
-                    )
-
-                    # Повторяем старое неотправленное уведомление
-                    # только при наличии сохранённого события.
-                    await retry_last_uav_notification(application, post)
-
-            elif event["uav_event"] == "active":
-                await apply_uav_event(
-                    application,
-                    int(event["uav_level"]),
-                    event["locations"],
-                    post,
-                )
+            elif int(state.get("uav_level", 0)) > 0:
+                await retry_last_uav_notification(application)
 
         elif int(state.get("uav_level", 0)) > 0:
-            # Если источник временно не отдал посты, не сбрасываем
-            # сохранённую опасность. Только повторяем push, если
-            # последнее уведомление не было доставлено.
             logger.info(
-                "Новых событий БПЛА нет. Сохранённый статус не сбрасывается."
+                "Новых событий БПЛА нет. "
+                "Сохранённый статус не сбрасывается."
             )
 
             await retry_last_uav_notification(application)
@@ -1429,12 +1432,14 @@ async def check_sources(application):
 
         if latest_rocket:
             post, event = latest_rocket
+            already_processed = post.get("key") in sent_posts
 
-            await apply_rocket_event(
-                application,
-                event["rocket_event"] == "active",
-                post,
-            )
+            if not already_processed:
+                await apply_rocket_event(
+                    application,
+                    event["rocket_event"] == "active",
+                    post,
+                )
 
         # ----------------------------------------------------
         # SAVE PROCESSED POSTS
@@ -1451,7 +1456,6 @@ async def check_sources(application):
 
             try:
                 previous_id = int(previous.get("last_post_id", 0))
-
             except (ValueError, TypeError):
                 previous_id = 0
 
@@ -1647,7 +1651,6 @@ def format_stats():
 
 def is_admin(update):
     user = update.effective_user
-
     return bool(user and user.id == ADMIN_ID)
 
 
@@ -1682,10 +1685,7 @@ async def subscribe_user(application, user_id):
     )
 
     if not already_subscribed:
-        await send_current_status_to_user(
-            application,
-            user_id,
-        )
+        await send_current_status_to_user(application, user_id)
 
 
 async def subscribe_command(update, context):
@@ -1847,7 +1847,6 @@ async def callback_handler(update, context):
             context.application,
             user.id,
         )
-
         text = "🔔 Подписка включена."
 
     elif data == "unsubscribe":
@@ -2020,45 +2019,16 @@ def main():
         .build()
     )
 
-    application.add_handler(
-        CommandHandler("start", start_command)
-    )
-
-    application.add_handler(
-        CommandHandler("subscribe", subscribe_command)
-    )
-
-    application.add_handler(
-        CommandHandler("unsubscribe", unsubscribe_command)
-    )
-
-    application.add_handler(
-        CommandHandler("status", status_command)
-    )
-
-    application.add_handler(
-        CommandHandler("history", history_command)
-    )
-
-    application.add_handler(
-        CommandHandler("sources", sources_command)
-    )
-
-    application.add_handler(
-        CommandHandler("stats", stats_command)
-    )
-
-    application.add_handler(
-        CommandHandler("test", test_command)
-    )
-
-    application.add_handler(
-        CommandHandler("admin", admin_command)
-    )
-
-    application.add_handler(
-        CommandHandler("help", help_command)
-    )
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("subscribe", subscribe_command))
+    application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("history", history_command))
+    application.add_handler(CommandHandler("sources", sources_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("test", test_command))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("help", help_command))
 
     application.add_handler(
         CallbackQueryHandler(callback_handler)
