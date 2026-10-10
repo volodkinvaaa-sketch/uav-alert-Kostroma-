@@ -31,7 +31,8 @@ REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "15")))
 SOURCE_LIMIT = max(30, int(os.getenv("SOURCE_LIMIT", "100")))
 DATA_DIR = os.getenv("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
-# Канал, куда автоматически публикуются подтверждённые изменения статуса БПЛА/МВШ.
+# Целевой канал для готовых постов. Бот присылает черновик администратору в личку,
+# а публикация в @RADAR_Kostroma выполняется вручную после проверки.
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@RADAR_Kostroma").strip() or "@RADAR_Kostroma"
 MSK = timezone(timedelta(hours=3))
 UTC = timezone.utc
@@ -141,6 +142,10 @@ CHANNEL_POSTS_FILE = json_path("channel_posts.json")
 channel_posts = load_json(CHANNEL_POSTS_FILE, {})
 if not isinstance(channel_posts, dict):
     channel_posts = {}
+ADMIN_DRAFTS_FILE = json_path("admin_drafts.json")
+admin_drafts = load_json(ADMIN_DRAFTS_FILE, {})
+if not isinstance(admin_drafts, dict):
+    admin_drafts = {}
 
 
 def save_state(): save_json(STATE_FILE, state)
@@ -157,6 +162,12 @@ def save_channel_posts():
         for old_key, _ in ordered[:-2500]:
             channel_posts.pop(old_key, None)
     save_json(CHANNEL_POSTS_FILE, channel_posts)
+def save_admin_drafts():
+    if len(admin_drafts) > 3000:
+        ordered = sorted(admin_drafts.items(), key=lambda x: str(x[1].get("attempted_at", "")))
+        for old_key, _ in ordered[:-2500]:
+            admin_drafts.pop(old_key, None)
+    save_json(ADMIN_DRAFTS_FILE, admin_drafts)
 def save_notification_events():
     if len(notification_events) > 3000:
         ordered = sorted(notification_events.items(), key=lambda x: str(x[1].get("attempted_at", "")))
@@ -507,6 +518,88 @@ async def send_push(application, message, event_type, level=0, cycle=0, post=Non
     return len(delivered_users.intersection(subscribers))
 
 
+def build_uav_admin_draft(level, locations, post):
+    """Формирует простой текст поста, который удобно скопировать в @RADAR_Kostroma."""
+    post = post or {}
+    territory = ", ".join(locations) if locations else "Костромская область"
+    category = uav_category_label(post)
+    detected_at = now_msk().strftime("%d.%m.%Y %H:%M МСК")
+    source_name = str(post.get("source_name") or "публичный источник")
+    source_url = str(post.get("url") or "")
+    if level <= 0:
+        headline = f"🟢 Отбой по опасности: {category}"
+        detail = "По опубликованному сообщению обнаружена информация об отбое. Сверяйтесь с официальными оповещениями региона."
+    else:
+        headline = uav_level_title_for_post(level, post)
+        detail = f"Категория: {category}"
+    lines = [
+        "🛰 UAV ALERT",
+        f"📍 Регион: {territory}",
+        "",
+        headline,
+    ]
+    if level > 0:
+        lines.append(detail)
+    else:
+        lines.append(detail)
+    lines.extend([
+        f"Время обнаружения: {detected_at}",
+        "",
+        f"Источник: {source_name}",
+    ])
+    if source_url:
+        lines.append(f"Ссылка на источник: {source_url}")
+    lines.extend([
+        "",
+        "Информация собрана из публичного сообщения и не заменяет официальные оповещения.",
+    ])
+    return "\n".join(lines)
+
+
+async def send_admin_post_draft(application, message, event_type, level=0, cycle=0, post=None, key_override=None):
+    """Присылает администратору готовый черновик в личные сообщения, не публикуя его в канал."""
+    post = post or {}
+    key = key_override or notification_key(event_type, level, cycle, post)
+    record = admin_drafts.get(key, {})
+    if record.get("sent"):
+        logger.info("Черновик события %s уже отправлен администратору.", event_type)
+        return True
+    try:
+        await application.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=("📝 ГОТОВЫЙ ПОСТ ДЛЯ ТГК @RADAR_Kostroma\n"
+                  "Скопируй текст ниже и опубликуй после проверки:\n\n" + message),
+            disable_web_page_preview=True,
+        )
+        admin_drafts[key] = {
+            "sent": True,
+            "admin_id": ADMIN_ID,
+            "event": event_type,
+            "level": level,
+            "cycle": cycle,
+            "source_post": post.get("key"),
+            "attempted_at": now_msk().isoformat(timespec="seconds"),
+            "error": None,
+        }
+        save_admin_drafts()
+        logger.info("Готовый пост по событию %s отправлен администратору %s.", event_type, ADMIN_ID)
+        return True
+    except TelegramError as exc:
+        admin_drafts[key] = {
+            "sent": False,
+            "admin_id": ADMIN_ID,
+            "event": event_type,
+            "level": level,
+            "cycle": cycle,
+            "source_post": post.get("key"),
+            "attempted_at": now_msk().isoformat(timespec="seconds"),
+            "error": str(exc)[:500],
+        }
+        save_admin_drafts()
+        logger.exception("Не удалось прислать черновик администратору. Открой бота в Telegram и нажми /start.")
+        return False
+
+
 async def publish_to_channel(application, message, event_type, level=0, cycle=0, post=None, key_override=None):
     """Публикует событие в канал один раз; неуспешная публикация повторяется при следующей проверке."""
     post = post or {}
@@ -571,14 +664,15 @@ async def retry_last_uav_notification(application):
     cycle = int(state.get("uav_cycle", 0))
     if event_type == "uav_cancel":
         message, level = build_uav_cancel_push(post), 0
-        channel_message = build_uav_cancel_channel_post(post)
+        draft = build_uav_admin_draft(0, [], post)
     else:
         level = int(state.get("uav_level", 0))
         message = build_uav_push(level, state.get("active_locations") or [], post)
-        channel_message = build_uav_channel_post(level, state.get("active_locations") or [], post)
+        draft = build_uav_admin_draft(level, state.get("active_locations") or [], post)
     if not previous.get("sent"):
         await send_push(application, message, event_type, level, cycle, post)
-    await publish_to_channel(application, channel_message, event_type, level, cycle, post, key_override=key)
+    if not admin_drafts.get(key, {}).get("sent"):
+        await send_admin_post_draft(application, draft, event_type, level, cycle, post, key_override=key)
     return int(notification_events.get(key, {}).get("sent_count", 0))
 
 
@@ -640,9 +734,9 @@ async def apply_uav_event(application, new_level, locations, post):
     add_history(event_type, title, post)
     message = build_uav_cancel_push(post) if level == 0 else build_uav_push(level, locations, post)
     await send_push(application, message, event_type, level, cycle, post)
-    channel_message = build_uav_cancel_channel_post(post) if level == 0 else build_uav_channel_post(level, locations, post)
-    await publish_to_channel(
-        application, channel_message, event_type, level, cycle, post,
+    draft = build_uav_admin_draft(level, locations, post)
+    await send_admin_post_draft(
+        application, draft, event_type, level, cycle, post,
         key_override=state["last_uav_notification_key"],
     )
     return True
@@ -964,7 +1058,7 @@ app = Flask(__name__)
 def index():
     return jsonify({"service": "UAV ALERT", "status": "running", "monitor_interval_seconds": CHECK_INTERVAL,
                     "history_window_hours": HISTORY_WINDOW_HOURS, "subscribers": len(subscribers),
-                    "channel_id": CHANNEL_ID, "last_scan_time": state.get("last_scan_time")}), 200
+                    "channel_id": CHANNEL_ID, "publication_mode": "admin_dm_draft", "last_scan_time": state.get("last_scan_time")}), 200
 
 @app.get("/status")
 def health_status():
