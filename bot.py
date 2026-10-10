@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -34,35 +35,19 @@ from telegram.ext import (
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID_RAW = os.getenv("ADMIN_ID", "1421675956").strip()
 
 try:
-    ADMIN_ID = int(ADMIN_ID_RAW)
-except (TypeError, ValueError):
+    ADMIN_ID = int(os.getenv("ADMIN_ID", "1421675956").strip())
+except (ValueError, TypeError):
     ADMIN_ID = 1421675956
 
 PORT = int(os.getenv("PORT", "10000"))
-
-CHECK_INTERVAL = max(
-    15,
-    int(os.getenv("CHECK_INTERVAL", "30")),
-)
-
+CHECK_INTERVAL = max(15, int(os.getenv("CHECK_INTERVAL", "30")))
 HISTORY_WINDOW_HOURS = max(
-    1,
-    int(os.getenv("HISTORY_WINDOW_HOURS", "5")),
+    1, int(os.getenv("HISTORY_WINDOW_HOURS", "5"))
 )
-
-REQUEST_TIMEOUT = max(
-    5,
-    int(os.getenv("REQUEST_TIMEOUT", "15")),
-)
-
-SOURCE_LIMIT = max(
-    10,
-    int(os.getenv("SOURCE_LIMIT", "100")),
-)
-
+REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "15")))
+SOURCE_LIMIT = max(10, int(os.getenv("SOURCE_LIMIT", "100")))
 DATA_DIR = os.getenv("DATA_DIR", ".").strip() or "."
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -82,12 +67,11 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-
 logger = logging.getLogger("UAV_ALERT")
 
 
 # ============================================================
-# SOURCES
+# TELEGRAM SOURCES
 # ============================================================
 
 SOURCES = {
@@ -114,12 +98,12 @@ HTTP_HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
-    ),
+    )
 }
 
 
 # ============================================================
-# REGION DEFINITIONS
+# REGION FILTER
 # ============================================================
 
 REGION_NAME = "Костромская область"
@@ -129,18 +113,22 @@ KOSTROMA_TERMS = [
     "костромской области",
     "костромской областью",
     "костромская обл",
-    "костромская",
     "кострома",
+    "костромской",
     "нерехта",
-    "нерехт",
-    "бую",
+    "нерехтский",
     "буй",
+    "буйский",
     "волгореченск",
     "галич",
+    "галичский",
     "шарья",
+    "шарьинский",
     "мантурово",
     "чухлома",
+    "чухломский",
     "макарьев",
+    "макарьевский",
     "солигалич",
     "кологрив",
     "нея",
@@ -156,17 +144,14 @@ KOSTROMA_TERMS = [
     "макарьевский район",
     "чухломский район",
     "межевской район",
-    "понáзыревский район",
     "поназыревский район",
     "парфеньевский район",
     "антроповский район",
-    "кады́йский район",
     "кадыйский район",
 ]
 
 OTHER_REGION_TERMS = [
     "московская область",
-    "москва",
     "тверская область",
     "ивановская область",
     "владимирская область",
@@ -200,30 +185,87 @@ OTHER_REGION_TERMS = [
 
 
 # ============================================================
-# EVENT KEYWORDS
+# UAV / MВШ / МРШ KEYWORDS
 # ============================================================
 
 UAV_TERMS = [
     "бпла",
     "беспилотник",
+    "беспилотники",
     "беспилотного летательного аппарата",
     "беспилотный летательный аппарат",
     "беспилотные летательные аппараты",
+    "беспилотных летательных аппаратов",
     "дрон",
     "дроны",
     "безэкипажный",
     "мрлс",
     "мрш",
+    "мрщ",
     "мвш",
     "малоразмерный воздушный шар",
+    "малоразмерные воздушные шары",
     "малоразмерных воздушных шаров",
+    "малоразмерным воздушным шарам",
+    "малоразмерными воздушными шарами",
     "малоразмерный разведывательный воздушный шар",
+    "малоразмерные разведывательные воздушные шары",
+    "малоразмерных разведывательных воздушных шаров",
     "воздушный шар",
+    "воздушные шары",
     "воздушных шаров",
+    "воздушным шарам",
+    "воздушными шарами",
     "шары с аппаратурой",
     "воздушная цель",
     "воздушные цели",
     "летательный аппарат",
+]
+
+ATTENTION_TERMS = [
+    "внимание по бпла",
+    "внимание бпла",
+    "внимание беспилотн",
+    "внимание по беспилот",
+    "внимание по мвш",
+    "внимание мвш",
+    "внимание по мрш",
+    "внимание мрш",
+    "внимание по воздушным шарам",
+    "внимание по малоразмерным воздушным шарам",
+    "внимание малоразмерные воздушные шары",
+]
+
+THREAT_TERMS = [
+    "угроза по бпла",
+    "угроза бпла",
+    "угроза беспилотн",
+    "угроза по беспилот",
+    "угроза по мвш",
+    "угроза мвш",
+    "угроза по мрш",
+    "угроза мрш",
+    "угроза по воздушным шарам",
+    "угроза по малоразмерным воздушным шарам",
+    "угроза малоразмерных воздушных шаров",
+]
+
+DANGER_TERMS = [
+    "опасность по бпла",
+    "опасность бпла",
+    "опасность беспилотн",
+    "опасность по беспилот",
+    "опасность по мвш",
+    "опасность мвш",
+    "опасность по мрш",
+    "опасность мрш",
+    "опасность по воздушным шарам",
+    "опасность по воздушному шару",
+    "опасность по малоразмерным воздушным шарам",
+    "опасность по малоразмерному воздушному шару",
+    "опасность малоразмерных воздушных шаров",
+    "опасность от малоразмерных воздушных шаров",
+    "опасность атаки бпла",
 ]
 
 ROCKET_TERMS = [
@@ -248,37 +290,9 @@ CANCEL_TERMS = [
     "режим отменён",
 ]
 
-ATTENTION_TERMS = [
-    "внимание по бпла",
-    "внимание беспилотн",
-    "внимание по беспилот",
-    "внимание по мвш",
-    "внимание по мрш",
-    "внимание по воздушным шарам",
-]
-
-THREAT_TERMS = [
-    "угроза по бпла",
-    "угроза беспилотн",
-    "угроза по беспилот",
-    "угроза по мвш",
-    "угроза по мрш",
-    "угроза по воздушным шарам",
-]
-
-DANGER_TERMS = [
-    "опасность по бпла",
-    "опасность беспилотн",
-    "опасность по беспилот",
-    "опасность по мвш",
-    "опасность по мрш",
-    "опасность по воздушным шарам",
-    "опасность атаки бпла",
-]
-
 
 # ============================================================
-# DEFAULT DATA
+# DEFAULT STATE AND SHARED DATA
 # ============================================================
 
 DEFAULT_STATE = {
@@ -290,6 +304,7 @@ DEFAULT_STATE = {
     "uav_post_date": "",
     "uav_post_key": "",
     "uav_event_type": "",
+    "uav_category": "",
     "rocket_active": False,
     "rocket_message": "",
     "rocket_source": "",
@@ -301,9 +316,6 @@ DEFAULT_STATE = {
     "started_at": datetime.now(MSK).isoformat(),
 }
 
-state_lock = threading.RLock()
-file_lock = threading.RLock()
-
 state: Dict[str, Any] = {}
 history: List[Dict[str, Any]] = []
 subscribers: List[int] = []
@@ -311,9 +323,12 @@ sent_posts: Dict[str, Any] = {}
 notification_events: Dict[str, Any] = {}
 source_state: Dict[str, Any] = {}
 
+state_lock = threading.RLock()
+file_lock = threading.RLock()
+
 
 # ============================================================
-# JSON HELPERS
+# JSON STORAGE
 # ============================================================
 
 def read_json(path: str, default: Any) -> Any:
@@ -334,18 +349,13 @@ def write_json(path: str, data: Any) -> bool:
 
     try:
         with file_lock:
-            with open(
-                temporary_path,
-                "w",
-                encoding="utf-8",
-            ) as file:
+            with open(temporary_path, "w", encoding="utf-8") as file:
                 json.dump(
                     data,
                     file,
                     ensure_ascii=False,
                     indent=2,
                 )
-
             os.replace(temporary_path, path)
 
         return True
@@ -363,15 +373,12 @@ def write_json(path: str, data: Any) -> bool:
 
 
 def load_data() -> None:
-    global state
-    global history
-    global subscribers
-    global sent_posts
-    global notification_events
-    global source_state
+    global state, history, subscribers
+    global sent_posts, notification_events, source_state
 
     loaded_state = read_json(STATE_FILE, {})
     state = dict(DEFAULT_STATE)
+
     if isinstance(loaded_state, dict):
         state.update(loaded_state)
 
@@ -379,8 +386,9 @@ def load_data() -> None:
     history = loaded_history if isinstance(loaded_history, list) else []
 
     loaded_subscribers = read_json(SUBSCRIBERS_FILE, [])
+    subscribers = []
+
     if isinstance(loaded_subscribers, list):
-        subscribers = []
         for item in loaded_subscribers:
             try:
                 user_id = int(item)
@@ -388,8 +396,6 @@ def load_data() -> None:
                     subscribers.append(user_id)
             except (ValueError, TypeError):
                 continue
-    else:
-        subscribers = []
 
     loaded_sent = read_json(SENT_POSTS_FILE, {})
     sent_posts = loaded_sent if isinstance(loaded_sent, dict) else {}
@@ -411,7 +417,6 @@ def load_data() -> None:
 def save_state() -> None:
     with state_lock:
         snapshot = dict(state)
-
     write_json(STATE_FILE, snapshot)
 
 
@@ -451,7 +456,9 @@ def parse_datetime(value: Any) -> Optional[datetime]:
         result = value
     else:
         try:
-            result = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            result = datetime.fromisoformat(
+                str(value).replace("Z", "+00:00")
+            )
         except (ValueError, TypeError):
             return None
 
@@ -487,10 +494,39 @@ def contains_rocket(text: str) -> bool:
     return contains_any(text, ROCKET_TERMS)
 
 
+def contains_mwsh(text: str) -> bool:
+    normalized = normalize_text(text)
+
+    mwsh_terms = [
+        "мвш",
+        "малоразмерный воздушный шар",
+        "малоразмерные воздушные шары",
+        "малоразмерных воздушных шаров",
+        "малоразмерным воздушным шарам",
+        "малоразмерными воздушными шарами",
+    ]
+
+    return contains_any(normalized, mwsh_terms)
+
+
+def get_uav_category(text: str) -> str:
+    if contains_mwsh(text):
+        return "МВШ — малоразмерные воздушные шары"
+
+    normalized = normalize_text(text)
+
+    if "мрш" in normalized or "разведывательный воздушный шар" in normalized:
+        return "МРШ — малоразмерные разведывательные воздушные шары"
+
+    if contains_uav(text):
+        return "БПЛА и другие воздушные цели"
+
+    return "Воздушная опасность"
+
+
 def has_clear_cancel(text: str) -> bool:
     normalized = normalize_text(text)
 
-    # Фразы о продолжении угрозы не должны трактоваться как отбой.
     continuation_patterns = [
         r"опасность\s+сохраняется",
         r"угроза\s+сохраняется",
@@ -499,9 +535,13 @@ def has_clear_cancel(text: str) -> bool:
         r"угроза\s+продолжается",
         r"отбой\s+не\s+объявлен",
         r"отмены\s+не\s+было",
+        r"отбой\s+не\s+подтвержден",
     ]
 
-    if any(re.search(pattern, normalized) for pattern in continuation_patterns):
+    if any(
+        re.search(pattern, normalized)
+        for pattern in continuation_patterns
+    ):
         return False
 
     return contains_any(normalized, CANCEL_TERMS)
@@ -512,8 +552,22 @@ def split_sentences(text: str) -> List[str]:
     return [piece.strip() for piece in pieces if piece.strip()]
 
 
+def event_fragments(text: str) -> List[str]:
+    fragments = split_sentences(text)
+
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line and line not in fragments:
+            fragments.append(line)
+
+    if not fragments and text.strip():
+        fragments = [text.strip()]
+
+    return fragments
+
+
 # ============================================================
-# REGION FILTERING
+# REGION FILTER
 # ============================================================
 
 def has_kostroma_reference(text: str) -> bool:
@@ -533,87 +587,58 @@ def has_other_region_reference(text: str) -> bool:
 
 
 def is_kostroma_post(text: str) -> bool:
-    """
-    Пост принимается, если в нём есть упоминание Костромской области
-    или одного из её населённых пунктов.
-
-    Если текст относится исключительно к другому региону, он отбрасывается.
-    """
-    normalized = normalize_text(text)
-
-    if not has_kostroma_reference(normalized):
-        return False
-
-    # Если в посте упоминаются несколько регионов, дальнейшая проверка
-    # проводится на уровне предложений/фрагментов в event_matches_region().
-    return True
+    return has_kostroma_reference(text)
 
 
 def event_matches_region(text: str, event_type: str) -> bool:
     """
-    Проверяет, относится ли конкретный фрагмент с событием к Костромской
-    области. Это снижает риск применения чужого регионального отбоя.
+    Событие должно быть привязано к Костромской области.
+    Не применяем общий отбой из другого региона к Костроме.
     """
-    normalized = normalize_text(text)
-
-    if has_kostroma_reference(normalized):
+    if has_kostroma_reference(text):
         return True
 
-    # Заголовок региона может относиться к нескольким последующим строкам.
-    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    lines = [
+        line.strip()
+        for line in (text or "").splitlines()
+        if line.strip()
+    ]
 
     for index, line in enumerate(lines):
         if has_kostroma_reference(line):
             nearby = " ".join(lines[index:index + 4])
+
             if event_type == "rocket" and contains_rocket(nearby):
                 return True
+
             if event_type == "uav" and contains_uav(nearby):
                 return True
 
-    # Без географического указания нельзя достоверно приписать событие
-    # Костромской области.
     return False
 
 
-def event_fragments(text: str) -> List[str]:
-    """
-    Делит публикацию на предложения и строки, сохраняя возможность
-    учитывать короткие сообщения без пунктуации.
-    """
-    fragments = split_sentences(text)
-
-    for line in (text or "").splitlines():
-        line = line.strip()
-        if line and line not in fragments:
-            fragments.append(line)
-
-    if not fragments and text.strip():
-        fragments = [text.strip()]
-
-    return fragments
-
-
 # ============================================================
-# UAV EVENT PARSING
+# UAV LEVEL DETECTION: БПЛА / МВШ / МРШ
 # ============================================================
 
 def detect_uav_level(text: str) -> int:
     """
     Возвращает:
-      0 — отмена/отбой;
+      0 — явный отбой;
       1 — внимание;
       2 — угроза;
       3 — опасность;
-     -1 — событие не определено.
+     -1 — уровень не определён.
+
+    Уровень не повышается автоматически только из-за того,
+    что в публикации встретилось слово «опасность».
     """
     fragments = event_fragments(text)
 
-    # Сначала ищем явный отбой в контексте БПЛА/МВШ/МРШ.
     for fragment in fragments:
         if contains_uav(fragment) and has_clear_cancel(fragment):
             return 0
 
-    # Проверяем конкретные формулировки, не просто слово «опасность».
     for fragment in fragments:
         normalized = normalize_text(fragment)
 
@@ -632,8 +657,6 @@ def detect_uav_level(text: str) -> int:
         if contains_any(normalized, ATTENTION_TERMS):
             return 1
 
-        # Поддержка вариантов, когда сначала написано «Угроза»,
-        # а далее в той же фразе указан БПЛА/МВШ/МРШ.
         if re.search(r"\bопасност\w*", normalized):
             if not re.search(r"\bнет\s+опасност", normalized):
                 return 3
@@ -650,20 +673,18 @@ def detect_uav_level(text: str) -> int:
 
 def detect_rocket(text: str) -> Optional[bool]:
     """
-    True  — ракетная опасность объявлена;
-    False — ракетная опасность отменена;
-    None  — нет достоверного события.
+    True — активное сообщение о ракетной опасности.
+    False — явный отбой/отмена.
+    None — событие не определено.
     """
-    fragments = event_fragments(text)
-
-    for fragment in fragments:
+    for fragment in event_fragments(text):
         if not contains_rocket(fragment):
             continue
 
+        normalized = normalize_text(fragment)
+
         if has_clear_cancel(fragment):
             return False
-
-        normalized = normalize_text(fragment)
 
         negative_patterns = [
             r"ракетной опасности\s+нет",
@@ -672,7 +693,10 @@ def detect_rocket(text: str) -> Optional[bool]:
             r"ракетная угроза\s+отсутствует",
         ]
 
-        if any(re.search(pattern, normalized) for pattern in negative_patterns):
+        if any(
+            re.search(pattern, normalized)
+            for pattern in negative_patterns
+        ):
             return False
 
         active_patterns = [
@@ -683,7 +707,10 @@ def detect_rocket(text: str) -> Optional[bool]:
             r"опасность ракетного удара",
         ]
 
-        if any(re.search(pattern, normalized) for pattern in active_patterns):
+        if any(
+            re.search(pattern, normalized)
+            for pattern in active_patterns
+        ):
             return True
 
     return None
@@ -726,15 +753,14 @@ def extract_locations(text: str) -> List[str]:
     found = []
 
     for location in location_names:
-        if normalize_text(location) in normalized:
-            if location not in found:
-                found.append(location)
+        if normalize_text(location) in normalized and location not in found:
+            found.append(location)
 
     return found
 
 
 # ============================================================
-# TELEGRAM SOURCE SCRAPER
+# PUBLIC TELEGRAM SOURCE SCRAPER
 # ============================================================
 
 def fetch_source_sync(
@@ -756,10 +782,12 @@ def fetch_source_sync(
 
         for node in soup.select(".tgme_widget_message"):
             text_node = node.select_one(".tgme_widget_message_text")
+
             if not text_node:
                 continue
 
             text = text_node.get_text("\n", strip=True)
+
             if not text:
                 continue
 
@@ -775,15 +803,12 @@ def fetch_source_sync(
             post_date = parse_datetime(date_value)
 
             if post_date is None:
-                post_date = now_msk()
+                # Не подменяем неизвестное время текущим временем:
+                # иначе старая публикация может выглядеть новой.
+                continue
 
-            link_node = node.select_one(
-                ".tgme_widget_message_date"
-            )
-
-            post_url = ""
-            if link_node:
-                post_url = link_node.get("href", "")
+            link_node = node.select_one(".tgme_widget_message_date")
+            post_url = link_node.get("href", "") if link_node else ""
 
             if not post_url:
                 post_url = url
@@ -841,7 +866,7 @@ async def fetch_source(
 
 
 # ============================================================
-# HISTORY AND STATUS HELPERS
+# HISTORY AND STATUS
 # ============================================================
 
 def add_history(
@@ -853,7 +878,7 @@ def add_history(
     locations: Optional[List[str]] = None,
     post_key: str = "",
 ) -> None:
-    entry = {
+    history.append({
         "time": iso_datetime(),
         "post_date": (
             post_date.isoformat() if post_date else iso_datetime()
@@ -864,9 +889,7 @@ def add_history(
         "url": source_url,
         "locations": locations or [],
         "key": post_key,
-    }
-
-    history.append(entry)
+    })
 
     if len(history) > 500:
         del history[:-500]
@@ -875,14 +898,12 @@ def add_history(
 
 
 def status_level_text(level: int) -> str:
-    statuses = {
+    return {
         0: "🟢 Опасность не объявлена",
-        1: "🟡 Внимание по БПЛА",
-        2: "🟠 Угроза по БПЛА",
-        3: "🔴 Опасность по БПЛА",
-    }
-
-    return statuses.get(level, statuses[0])
+        1: "🟡 Внимание по БПЛА/МВШ",
+        2: "🟠 Угроза по БПЛА/МВШ",
+        3: "🔴 Опасность по БПЛА/МВШ",
+    }.get(level, "🟢 Опасность не объявлена")
 
 
 def get_state_snapshot() -> Dict[str, Any]:
@@ -892,36 +913,45 @@ def get_state_snapshot() -> Dict[str, Any]:
 
 def format_status() -> str:
     current = get_state_snapshot()
+    level = int(current.get("uav_level", 0))
+    category = current.get("uav_category") or "БПЛА / МВШ / МРШ"
+
+    if level == 0:
+        uav_line = "🟢 Опасность по БПЛА/МВШ не объявлена"
+    else:
+        uav_line = f"{status_level_text(level)}"
 
     lines = [
         "🛰 <b>UAV ALERT</b>",
         f"📍 Регион: <b>{html.escape(REGION_NAME)}</b>",
         "",
-        status_level_text(int(current.get("uav_level", 0))),
+        uav_line,
     ]
 
+    if level > 0:
+        lines.append(f"Категория: {html.escape(str(category))}")
+
     locations = current.get("uav_locations", [])
+
     if locations:
         lines.append("")
         lines.append("<b>Указанные территории:</b>")
         for location in locations:
             lines.append(f"• {html.escape(str(location))}")
 
-    if current.get("rocket_active"):
-        lines.extend([
-            "",
-            "🟥 <b>Ракетная опасность объявлена</b>",
-        ])
-    else:
-        lines.extend([
-            "",
-            "🟢 Ракетная опасность не подтверждена",
-        ])
+    lines.extend([
+        "",
+        (
+            "🟥 Ракетная опасность объявлена"
+            if current.get("rocket_active")
+            else "🟢 Ракетная опасность не подтверждена"
+        ),
+    ])
 
     if current.get("uav_message"):
         lines.extend([
             "",
-            "<b>Последнее сообщение по БПЛА:</b>",
+            "<b>Последнее сообщение по БПЛА/МВШ:</b>",
             html.escape(str(current["uav_message"])[:700]),
         ])
 
@@ -933,10 +963,12 @@ def format_status() -> str:
         ])
 
     last_check = parse_datetime(current.get("last_check"))
+
     if last_check:
         lines.extend([
             "",
-            f"🕒 Последняя проверка: {last_check.strftime('%d.%m.%Y %H:%M:%S')} МСК",
+            "🕒 Последняя проверка: "
+            + last_check.strftime("%d.%m.%Y %H:%M:%S МСК"),
         ])
 
     last_success = parse_datetime(
@@ -964,10 +996,9 @@ def format_status() -> str:
 
     lines.extend([
         "",
-        "ℹ️ Сервис собирает сообщения открытых источников. "
-        "Сведения могут быть неполными или запаздывать. "
-        "Принимайте решения по официальным оповещениям "
-        "экстренных служб.",
+        "ℹ️ UAV ALERT анализирует открытые публикации. "
+        "Информация может быть неполной или запаздывать. "
+        "Проверяйте официальные оповещения экстренных служб.",
     ])
 
     return "\n".join(lines)
@@ -997,9 +1028,11 @@ def format_history(limit: int = 15) -> str:
         lines.append(f"  Источник: {source}")
 
         url = entry.get("url")
+
         if url and str(url).startswith("https://"):
             lines.append(
-                f'  <a href="{html.escape(str(url), quote=True)}">Открыть сообщение</a>'
+                f'<a href="{html.escape(str(url), quote=True)}">'
+                "Открыть сообщение</a>"
             )
 
         lines.append("")
@@ -1008,7 +1041,7 @@ def format_history(limit: int = 15) -> str:
 
 
 # ============================================================
-# KEYBOARDS
+# MAIN MENU
 # ============================================================
 
 def main_keyboard() -> InlineKeyboardMarkup:
@@ -1045,7 +1078,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
 
 
 # ============================================================
-# PUSH NOTIFICATIONS
+# PUSH NOTIFICATION BUILDERS
 # ============================================================
 
 def notification_key(
@@ -1064,21 +1097,35 @@ def make_uav_push(
     source_url: str,
     locations: List[str],
     cancelled: bool = False,
+    category: str = "",
 ) -> str:
+    category = category or get_uav_category(message)
+
     if cancelled:
-        title = "🟢 <b>Отбой по опасности БПЛА</b>"
+        title = f"🟢 <b>Отбой по {html.escape(category)}</b>"
+    elif contains_mwsh(message):
+        if level == 1:
+            title = "🟡 <b>Внимание по МВШ — малоразмерным воздушным шарам</b>"
+        elif level == 2:
+            title = "🟠 <b>Угроза по МВШ — малоразмерным воздушным шарам</b>"
+        else:
+            title = "🔴 <b>Опасность по МВШ — малоразмерным воздушным шарам</b>"
+    elif level == 1:
+        title = "🟡 <b>Внимание по БПЛА</b>"
+    elif level == 2:
+        title = "🟠 <b>Угроза по БПЛА</b>"
     else:
-        title = status_level_text(level)
+        title = "🔴 <b>Опасность по БПЛА</b>"
 
     lines = [
         title,
         "",
         f"📍 Регион: <b>{html.escape(REGION_NAME)}</b>",
+        f"Категория: <b>{html.escape(category)}</b>",
     ]
 
     if locations:
-        lines.append("")
-        lines.append("<b>Указанные территории:</b>")
+        lines.extend(["", "<b>Указанные территории:</b>"])
         for location in locations:
             lines.append(f"• {html.escape(location)}")
 
@@ -1092,7 +1139,8 @@ def make_uav_push(
 
     if source_url and source_url.startswith("https://"):
         lines.append(
-            f'<a href="{html.escape(source_url, quote=True)}">Открыть публикацию</a>'
+            f'<a href="{html.escape(source_url, quote=True)}">'
+            "Открыть публикацию</a>"
         )
 
     lines.extend([
@@ -1110,10 +1158,11 @@ def make_rocket_push(
     source_name: str,
     source_url: str,
 ) -> str:
-    if active:
-        title = "🟥 <b>Сообщение о ракетной опасности</b>"
-    else:
-        title = "🟢 <b>Сообщение об отбое ракетной опасности</b>"
+    title = (
+        "🟥 <b>Сообщение о ракетной опасности</b>"
+        if active
+        else "🟢 <b>Сообщение об отбое ракетной опасности</b>"
+    )
 
     lines = [
         title,
@@ -1128,7 +1177,8 @@ def make_rocket_push(
 
     if source_url and source_url.startswith("https://"):
         lines.append(
-            f'<a href="{html.escape(source_url, quote=True)}">Открыть публикацию</a>'
+            f'<a href="{html.escape(source_url, quote=True)}">'
+            "Открыть публикацию</a>"
         )
 
     lines.extend([
@@ -1139,6 +1189,10 @@ def make_rocket_push(
     return "\n".join(lines)
 
 
+# ============================================================
+# PUSH DELIVERY AND RETRIES
+# ============================================================
+
 async def send_push(
     application: Application,
     key: str,
@@ -1146,11 +1200,6 @@ async def send_push(
     event_type: str,
     event_data: Optional[Dict[str, Any]] = None,
 ) -> int:
-    """
-    Хранит список уже получивших сообщение пользователей.
-    При повторной попытке сообщение отправляется только тем,
-    кому оно ещё не было доставлено.
-    """
     event = notification_events.get(key)
 
     if not isinstance(event, dict):
@@ -1193,12 +1242,11 @@ async def send_push(
             sent_count += 1
 
         except Forbidden:
-            # Пользователь заблокировал бота или запретил сообщения.
-            # Удаляем его из подписчиков.
             if user_id in subscribers:
                 subscribers.remove(user_id)
                 save_subscribers()
 
+            # Заблокировавший бота пользователь не сможет получить push.
             delivered.add(user_id)
 
         except BadRequest as exc:
@@ -1227,7 +1275,6 @@ async def send_push(
         notification_events[key] = event
         save_notification_events()
 
-        # Не делаем слишком много запросов подряд.
         await asyncio.sleep(0.05)
 
     event["delivered"] = sorted(delivered)
@@ -1255,13 +1302,11 @@ async def retry_pending_notifications(
     application: Application,
 ) -> None:
     for key, event in list(notification_events.items()):
-        if not isinstance(event, dict):
-            continue
-
-        if event.get("sent"):
+        if not isinstance(event, dict) or event.get("sent"):
             continue
 
         message = event.get("message")
+
         if not message:
             continue
 
@@ -1312,7 +1357,6 @@ def mark_post_processed(post: Dict[str, Any]) -> None:
         "processed_at": iso_datetime(),
     }
 
-    # Ограничиваем размер файла.
     if len(sent_posts) > 2000:
         sorted_items = sorted(
             sent_posts.items(),
@@ -1333,7 +1377,7 @@ def was_post_processed(post_key: str) -> bool:
 
 
 # ============================================================
-# APPLY UAV EVENTS
+# APPLY UAV / MВШ EVENTS
 # ============================================================
 
 async def apply_uav_event(
@@ -1359,8 +1403,8 @@ async def apply_uav_event(
     source_name = str(post.get("source_name", "UNKNOWN"))
     source_url = str(post.get("source_url", ""))
     locations = extract_locations(message)
-
     cancelled = level == 0
+    category = get_uav_category(message)
 
     with state_lock:
         state["uav_level"] = level
@@ -1373,14 +1417,24 @@ async def apply_uav_event(
         state["uav_event_type"] = (
             "cancel" if cancelled else "active"
         )
+        state["uav_category"] = category
 
     save_state()
 
     if cancelled:
-        history_title = "Отбой по опасности БПЛА"
+        history_title = f"Отбой по {category}"
         event_value = "cancel"
     else:
-        history_title = status_level_text(level)
+        if contains_mwsh(message):
+            if level == 1:
+                history_title = "Внимание по МВШ"
+            elif level == 2:
+                history_title = "Угроза по МВШ"
+            else:
+                history_title = "Опасность по МВШ"
+        else:
+            history_title = status_level_text(level)
+
         event_value = f"level_{level}"
 
     add_history(
@@ -1402,6 +1456,7 @@ async def apply_uav_event(
         source_url=source_url,
         locations=locations,
         cancelled=cancelled,
+        category=category,
     )
 
     await send_push(
@@ -1414,14 +1469,16 @@ async def apply_uav_event(
             "post_date": post_date.isoformat(),
             "level": level,
             "cancelled": cancelled,
+            "category": category,
         },
     )
 
     mark_post_processed(post)
 
     logger.info(
-        "Обновлён статус БПЛА: level=%s, post=%s",
+        "Обновлён статус воздушной опасности: level=%s category=%s post=%s",
         level,
+        category,
         post_key[:12],
     )
 
@@ -1513,7 +1570,7 @@ async def apply_rocket_event(
 
 
 # ============================================================
-# POST PROCESSING
+# PARSE POSTS
 # ============================================================
 
 def get_uav_event_for_post(
@@ -1538,15 +1595,14 @@ def get_uav_event_for_post(
         if level == -1:
             continue
 
+        # Если в событии прямо назван регион — используем этот фрагмент.
         if event_matches_region(fragment, "uav"):
             return level
 
-        # Если в сообщении указан региональный заголовок и дальше
-        # несколько строк, учитываем контекст всей публикации.
+        # Если регион вынесен в заголовок, учитываем всю публикацию.
         if event_matches_region(text, "uav"):
             return level
 
-    # Для сообщений с заголовком региона и отдельной строкой события.
     level = detect_uav_level(text)
 
     if level != -1 and event_matches_region(text, "uav"):
@@ -1600,8 +1656,6 @@ async def process_post(
     if not post_key:
         return
 
-    # Одно и то же сообщение может содержать сведения и о БПЛА,
-    # и о ракетной опасности. Поэтому эти типы проверяются независимо.
     uav_level = get_uav_event_for_post(post)
 
     if uav_level is not None:
@@ -1622,7 +1676,7 @@ async def process_post(
 
 
 # ============================================================
-# SOURCE CHECK LOOP
+# SOURCE MONITORING LOOP
 # ============================================================
 
 async def check_sources(application: Application) -> None:
@@ -1656,14 +1710,14 @@ async def check_sources(application: Application) -> None:
 
         all_posts.extend(posts)
 
-    # Сортировка по времени важна: более старый пост не должен
-    # перезаписать более новое событие.
+    # Старые сообщения обрабатываются раньше новых.
+    # Сравнение с сохранённой датой не даёт старому событию
+    # перезаписать уже установленный более свежий статус.
     all_posts.sort(
         key=lambda post: parse_datetime(post.get("date"))
         or datetime.min.replace(tzinfo=MSK)
     )
 
-    # Сохраняем сведения о состоянии опроса источников.
     with state_lock:
         state["last_check"] = check_time.isoformat()
         state["source_errors"] = {
@@ -1686,12 +1740,10 @@ async def check_sources(application: Application) -> None:
                 str(post.get("key", ""))[:12],
             )
 
-    # Повторяем только те уведомления, которые не были доставлены всем
-    # актуальным подписчикам.
     await retry_pending_notifications(application)
 
     logger.info(
-        "Проверка завершена: источников успешно %s/%s, публикаций %s",
+        "Проверка завершена: успешно %s/%s источников, публикаций %s",
         successful_sources,
         len(SOURCES),
         len(all_posts),
@@ -1751,11 +1803,12 @@ async def start_command(
         "🛰 <b>Добро пожаловать в UAV ALERT</b>\n\n"
         "Гражданский информационный сервис для отслеживания "
         "публикаций об опасностях в Костромской области.\n\n"
-        "Здесь доступны текущий статус, история событий и "
-        "уведомления по сообщениям отслеживаемых источников.\n\n"
+        "Поддерживается распознавание сообщений о БПЛА, "
+        "МВШ — малоразмерных воздушных шарах, МРШ и "
+        "ракетной опасности.\n\n"
+        "Чтобы получать уведомления, нажми кнопку подписки.\n\n"
         "⚠️ Бот не является официальной системой оповещения "
-        "и не заменяет сообщения экстренных служб.\n\n"
-        "Чтобы получать уведомления, нажми кнопку подписки."
+        "и не заменяет сообщения экстренных служб."
     )
 
     await update.effective_message.reply_text(
@@ -1782,11 +1835,13 @@ async def help_command(
         "/stats — статистика сервиса\n"
         "/subscribe — подписаться на уведомления\n"
         "/unsubscribe — отключить уведомления\n\n"
-        "Администратору доступны дополнительные команды:\n"
+        "Администратору доступны:\n"
         "/admin — панель администратора\n"
-        "/test — тестовое уведомление\n\n"
-        "⚠️ Информация собирается из открытых источников. "
-        "Всегда сверяй её с официальными оповещениями."
+        "/test — тестовое уведомление\n"
+        "/check — проверить источники\n\n"
+        "Сервис ищет публикации о БПЛА, МВШ, МРШ и "
+        "ракетной опасности. Всегда сверяй информацию "
+        "с официальными оповещениями."
     )
 
     await update.effective_message.reply_text(
@@ -1851,8 +1906,8 @@ async def sources_command(
 
     lines.extend([
         "",
-        "⚠️ Наличие публикации в источнике не означает, что "
-        "сведения подтверждены официальными службами.",
+        "⚠️ Публикации не обязательно являются официальными "
+        "подтверждениями событий.",
     ])
 
     await update.effective_message.reply_text(
@@ -1889,7 +1944,7 @@ async def stats_command(
         f"🛩 Событий БПЛА/МВШ/МРШ: <b>{uav_events}</b>\n"
         f"🚀 Событий ракетной опасности: <b>{rocket_events}</b>\n"
         f"🔎 Источников: <b>{len(SOURCES)}</b>\n"
-        f"⚠️ Источников с ошибками в последней проверке: <b>{error_count}</b>\n"
+        f"⚠️ Источников с ошибками: <b>{error_count}</b>\n"
         f"⏱ Интервал проверки: <b>{CHECK_INTERVAL} сек.</b>"
     )
 
@@ -1968,11 +2023,13 @@ async def admin_command(
         "🛠 <b>Панель администратора UAV ALERT</b>\n\n"
         f"👥 Подписчиков: {len(subscribers)}\n"
         f"📚 Записей истории: {len(history)}\n"
-        f"🛩 Уровень БПЛА: {current.get('uav_level', 0)}\n"
+        f"🛩 Уровень БПЛА/МВШ: {current.get('uav_level', 0)}\n"
+        f"📌 Категория: "
+        f"{html.escape(str(current.get('uav_category', 'не определена')))}\n"
         f"🚀 Ракетная опасность: "
         f"{'активна' if current.get('rocket_active') else 'не активна'}\n\n"
         "Команды:\n"
-        "/test — отправить тестовое уведомление\n"
+        "/test — тестовое уведомление\n"
         "/check — выполнить проверку источников"
     )
 
@@ -2000,9 +2057,7 @@ async def test_command(
 
     test_key = notification_key(
         "test",
-        hashlib.sha256(
-            iso_datetime().encode("utf-8")
-        ).hexdigest(),
+        hashlib.sha256(iso_datetime().encode("utf-8")).hexdigest(),
         "test",
     )
 
@@ -2055,7 +2110,7 @@ async def check_command(
 
 
 # ============================================================
-# CALLBACK BUTTONS
+# INLINE BUTTON CALLBACKS
 # ============================================================
 
 async def callback_handler(
@@ -2136,7 +2191,6 @@ async def callback_handler(
             reply_markup=main_keyboard(),
             disable_web_page_preview=True,
         )
-        return
 
 
 # ============================================================
@@ -2182,6 +2236,7 @@ def status_endpoint():
         "region": REGION_NAME,
         "uav_level": current.get("uav_level", 0),
         "uav_active": current.get("uav_active", False),
+        "uav_category": current.get("uav_category", ""),
         "uav_locations": current.get("uav_locations", []),
         "rocket_active": current.get("rocket_active", False),
         "last_check": current.get("last_check"),
@@ -2209,8 +2264,7 @@ def run_web_server() -> None:
 def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError(
-            "Не задан BOT_TOKEN. Добавь токен бота в Environment "
-            "на Render."
+            "Не задан BOT_TOKEN. Добавь токен бота в Environment на Render."
         )
 
     load_data()
