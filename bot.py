@@ -251,7 +251,8 @@ def detect_uav_cancel(text):
 
 def detect_uav_level(text):
     value = normalize_text(text)
-    if not contains_uav(value) or detect_cancel(value):
+    # Отбой ракетной опасности не должен обнулять уровень БПЛА.
+    if not contains_uav(value) or detect_uav_cancel(value):
         return 0
     ctx = r"(?:бпла|беспилот\w*|дрон\w*|безэкипажн\w*|мвш|мрш|мрлс|мрл|воздушн\w*\s+шар\w*|летательн\w*\s+аппарат\w*)"
     patterns = [
@@ -494,7 +495,7 @@ def sync_uav_summary():
         latest = max(active, key=lambda pair: str(pair[1].get("last_time") or ""))[1]
         state["last_uav_time"] = latest.get("last_time") or state.get("last_uav_time")
 
-async def apply_uav_event(application, new_level, locations, post, event_kind=None):
+async def apply_uav_event(application, new_level, locations, post, event_kind=None, notify=True):
     """Хранит статусы территорий раздельно, но отправляет одно событие на исходную публикацию."""
     post = post or {}
     territories = state.setdefault("uav_territories", {})
@@ -511,10 +512,11 @@ async def apply_uav_event(application, new_level, locations, post, event_kind=No
     now = now_msk().isoformat(timespec="seconds")
     cancel = int(new_level) <= 0
     if cancel:
-        if "Костромская область" in locations:
+        specific_locations = [name for name in locations if name != "Костромская область"]
+        if "Костромская область" in locations and not specific_locations:
             targets = [name for name, item in territories.items() if int(item.get("level", 0)) > 0]
         else:
-            targets = [name for name in locations if name in territories and int(territories[name].get("level", 0)) > 0]
+            targets = [name for name in specific_locations if name in territories and int(territories[name].get("level", 0)) > 0]
         if not targets:
             logger.info("Отбой найден, но активного статуса для территорий нет.")
             return False
@@ -525,11 +527,14 @@ async def apply_uav_event(application, new_level, locations, post, event_kind=No
                 "last_post_key": post.get("key"), "last_post_date": post.get("date"), "last_post_text": post.get("text", "")})
     else:
         targets = []
+        had_active_before = False
         for name in locations:
             item = territories.setdefault(name, {"level": 0, "cycle": 0})
             old_level = int(item.get("level", 0))
             if old_level == int(new_level):
                 continue
+            if old_level > 0:
+                had_active_before = True
             if old_level == 0:
                 item["cycle"] = int(item.get("cycle", 0)) + 1
             item.update({"level": int(new_level), "last_time": now, "last_source": post.get("source_name"),
@@ -539,7 +544,7 @@ async def apply_uav_event(application, new_level, locations, post, event_kind=No
         if not targets:
             logger.info("Статус %s не изменился для территорий %s", new_level, locations)
             return False
-    event_type = "uav_cancel" if cancel else ("uav_active" if any(int(territories[n].get("level", 0)) == int(new_level) for n in targets) else "uav_update")
+    event_type = "uav_cancel" if cancel else ("uav_update" if had_active_before else "uav_active")
     cycle = max((int(territories[n].get("cycle", 0)) for n in targets), default=int(state.get("uav_cycle", 0)))
     key = notification_key(event_type, int(new_level), cycle, post)
     state.update({"uav_cycle": max(int(state.get("uav_cycle", 0)), cycle), "last_uav_time": now,
@@ -556,8 +561,18 @@ async def apply_uav_event(application, new_level, locations, post, event_kind=No
     add_history(event_type, f"{title} — {', '.join(display_locations(targets))}", post)
     message = build_uav_cancel_push(post, targets) if cancel else build_uav_push(int(new_level), targets, post)
     draft = build_uav_admin_draft(0 if cancel else int(new_level), targets, post)
-    await send_push(application, message, event_type, int(new_level), cycle, post, key_override=key)
-    await send_admin_post_draft(application, draft, event_type, int(new_level), cycle, post, key_override=key)
+    if notify:
+        await send_push(application, message, event_type, int(new_level), cycle, post, key_override=key)
+        await send_admin_post_draft(application, draft, event_type, int(new_level), cycle, post, key_override=key)
+    else:
+        # При первом сканировании восстанавливаем состояние без рассылки старых событий.
+        notification_events[key] = {"sent": True, "sent_count": 0, "delivered_users": [],
+            "attempted_at": now_msk().isoformat(timespec="seconds"), "event": event_type,
+            "post": post.get("key"), "error": "Событие обработано без рассылки при восстановлении состояния."}
+        admin_drafts[key] = {"sent": True, "event": event_type, "source_post": post.get("key"),
+            "attempted_at": now_msk().isoformat(timespec="seconds"), "error": "Черновик подавлен при первом восстановлении состояния."}
+        save_notification_events()
+        save_admin_drafts()
     return True
 
 async def retry_last_uav_notification(application):
@@ -607,7 +622,7 @@ async def send_current_status_to_user(application, user_id):
         except TelegramError:
             logger.exception("Не удалось отправить ракетный статус пользователю %s", user_id)
 
-async def apply_rocket_event(application, active, post):
+async def apply_rocket_event(application, active, post, notify=True):
     if bool(state.get("rocket_active", False)) == bool(active):
         return False
     state["rocket_active"] = bool(active)
@@ -623,7 +638,13 @@ async def apply_rocket_event(application, active, post):
     state["last_rocket_notification_key"] = key
     save_state()
     add_history(event_type, "Ракетная опасность" if active else "Отбой ракетной опасности", post)
-    await send_push(application, build_rocket_push(active, post), event_type, 1 if active else 0, cycle, post, key_override=key)
+    if notify:
+        await send_push(application, build_rocket_push(active, post), event_type, 1 if active else 0, cycle, post, key_override=key)
+    else:
+        notification_events[key] = {"sent": True, "sent_count": 0, "delivered_users": [],
+            "attempted_at": now_msk().isoformat(timespec="seconds"), "event": event_type,
+            "post": post.get("key"), "error": "Событие обработано без рассылки при восстановлении состояния."}
+        save_notification_events()
     return True
 
 # ========================= PARSING / MONITOR LOOP =========================
@@ -674,15 +695,18 @@ async def check_sources(application):
         # Обрабатываем сообщения по времени, не объединяя отмену и новый статус в один итоговый снимок.
         for post in candidates:
             event = get_post_event(post)
+            # На первом сканировании только восстанавливаем актуальное состояние по хронологии.
+            # Старые события из окна не отправляем подписчикам как новые предупреждения.
+            notify_event = not first_scan
             if event["uav_event"] == "active":
-                await apply_uav_event(application, event["uav_level"], event["locations"], post)
+                await apply_uav_event(application, event["uav_level"], event["locations"], post, notify=notify_event)
             elif event["uav_event"] == "cancel":
-                await apply_uav_event(application, 0, event["locations"], post)
+                await apply_uav_event(application, 0, event["locations"], post, notify=notify_event)
             if event["rocket_event"] == "active":
-                await apply_rocket_event(application, True, post)
+                await apply_rocket_event(application, True, post, notify=notify_event)
             elif event["rocket_event"] == "cancel":
-                await apply_rocket_event(application, False, post)
-        if not candidates:
+                await apply_rocket_event(application, False, post, notify=notify_event)
+        if not candidates and not first_scan:
             await retry_last_uav_notification(application)
         for post in collected:
             mark_post_processed(post)
