@@ -721,10 +721,10 @@ async def send_admin_post_draft(application, message, event_type, level=0, cycle
     admin_drafts[key] = record
     save_admin_drafts()
     try:
+        # Администратору отправляем только сам текст поста, без служебной шапки.
         await application.bot.send_message(
             chat_id=ADMIN_ID,
-            text=("📝 ГОТОВЫЙ ПОСТ ДЛЯ ТГК @RADAR_Kostroma\n"
-                  "Скопируй текст ниже и опубликуй после проверки:\n\n" + message),
+            text=message,
             disable_web_page_preview=True,
         )
         record.update({"sent": True, "error": None,
@@ -888,7 +888,7 @@ def sync_uav_summary():
 
 
 async def apply_uav_event(application, new_level, locations, post):
-    """Обновляет каждую названную территорию отдельно; отбой не сбрасывает соседние районы."""
+    """Обновляет статусы территорий и отправляет одно общее уведомление на событие."""
     if not isinstance(state.get("uav_territories"), dict):
         state["uav_territories"] = {}
     territories = state["uav_territories"]
@@ -908,16 +908,19 @@ async def apply_uav_event(application, new_level, locations, post):
 
     locations = list(dict.fromkeys(locations or ["Костромская область"]))
     now = now_msk().isoformat(timespec="seconds")
-    changed = False
+    changed_locations = []
+    cycles = []
+    event_type = "uav_cancel" if new_level <= 0 else None
 
     if new_level <= 0:
-        # Явный общий отбой по области очищает все активные территории; локальный — только названные.
+        # Общий отбой по области очищает все активные территории; локальный — только названные.
         if "Костромская область" in locations:
             targets = [name for name, item in territories.items() if int(item.get("level", 0)) > 0]
         else:
             targets = [name for name in locations if name in territories and int(territories[name].get("level", 0)) > 0]
         if not targets:
             logger.info("Отбой найден, но для указанной территории активного статуса нет.")
+            await retry_pending_notifications(application)
             return False
 
         for territory in targets:
@@ -927,18 +930,9 @@ async def apply_uav_event(application, new_level, locations, post):
                          "last_source": post.get("source_name"), "last_post_url": post.get("url"),
                          "last_post_key": post.get("key"), "last_post_date": post.get("date"),
                          "last_post_text": post.get("text", ""), "last_event_type": "uav_cancel"})
-            event_post = dict(post)
-            event_post["key"] = f"{post.get('key', '')}|territory:{territory}"
-            key = notification_key("uav_cancel", 0, cycle, event_post)
-            item["last_notification_key"] = key
-            state["last_uav_notification_key"] = key
-            state["last_uav_event_type"] = "uav_cancel"
-            state["uav_cycle"] = max(int(state.get("uav_cycle", 0)), cycle)
+            cycles.append(cycle)
+            changed_locations.append(territory)
             add_history("uav_cancel", f"Отбой по опасности БПЛА — {territory}", post)
-            await send_push(application, build_uav_cancel_push(post, [territory]), "uav_cancel", 0, cycle, event_post, key_override=key)
-            await send_admin_post_draft(application, build_uav_admin_draft(0, [territory], post),
-                                        "uav_cancel", 0, cycle, event_post, key_override=key)
-            changed = True
     else:
         for territory in locations:
             item = territories.setdefault(territory, {"level": 0, "cycle": 0})
@@ -949,24 +943,15 @@ async def apply_uav_event(application, new_level, locations, post):
             cycle = int(item.get("cycle", 0))
             if old_level == 0:
                 cycle += 1
-            event_type = "uav_active" if old_level == 0 else "uav_update"
-            event_post = dict(post)
-            event_post["key"] = f"{post.get('key', '')}|territory:{territory}"
-            key = notification_key(event_type, int(new_level), cycle, event_post)
+            item_event_type = "uav_active" if old_level == 0 else "uav_update"
+            event_type = item_event_type if event_type is None else event_type
             item.update({"level": int(new_level), "cycle": cycle, "last_time": now,
                          "last_source": post.get("source_name"), "last_post_url": post.get("url"),
                          "last_post_key": post.get("key"), "last_post_date": post.get("date"),
-                         "last_post_text": post.get("text", ""), "last_event_type": event_type,
-                         "last_notification_key": key})
-            state["last_uav_notification_key"] = key
-            state["last_uav_event_type"] = event_type
-            state["uav_cycle"] = max(int(state.get("uav_cycle", 0)), cycle)
-            add_history(event_type, f"{level_title(int(new_level))} — {territory}", post)
-            await send_push(application, build_uav_push(int(new_level), [territory], post),
-                            event_type, int(new_level), cycle, event_post, key_override=key)
-            await send_admin_post_draft(application, build_uav_admin_draft(int(new_level), [territory], post),
-                                        event_type, int(new_level), cycle, event_post, key_override=key)
-            changed = True
+                         "last_post_text": post.get("text", ""), "last_event_type": item_event_type})
+            cycles.append(cycle)
+            changed_locations.append(territory)
+            add_history(item_event_type, f"{level_title(int(new_level))} — {territory}", post)
 
     sync_uav_summary()
     # Legacy summary fields remain available for health endpoints and old clients.
@@ -977,9 +962,39 @@ async def apply_uav_event(application, new_level, locations, post):
     state["last_uav_post_date"] = post.get("date")
     state["last_uav_post_text"] = post.get("text", "")
     save_state()
-    if not changed:
+
+    if not changed_locations:
         await retry_pending_notifications(application)
-    return changed
+        return False
+
+    # Все территории из одного исходного сообщения объединяются в один push и один пост администратору.
+    combined_post = dict(post)
+    combined_post["key"] = f"{post.get('key', '')}|territories:{'|'.join(sorted(changed_locations))}"
+    combined_cycle = max(cycles, default=0)
+    if new_level <= 0:
+        event_type = "uav_cancel"
+        message = build_uav_cancel_push(post, changed_locations)
+        draft = build_uav_admin_draft(0, changed_locations, post)
+        message_level = 0
+    else:
+        event_type = event_type or "uav_active"
+        message = build_uav_push(int(new_level), changed_locations, post)
+        draft = build_uav_admin_draft(int(new_level), changed_locations, post)
+        message_level = int(new_level)
+
+    key = notification_key(event_type, message_level, combined_cycle, combined_post)
+    for territory in changed_locations:
+        if territory in territories:
+            territories[territory]["last_notification_key"] = key
+    state["last_uav_notification_key"] = key
+    state["last_uav_event_type"] = event_type
+    state["uav_cycle"] = max(int(state.get("uav_cycle", 0)), combined_cycle)
+    save_state()
+    await send_push(application, message, event_type, message_level, combined_cycle,
+                    combined_post, key_override=key)
+    await send_admin_post_draft(application, draft, event_type, message_level,
+                                combined_cycle, combined_post, key_override=key)
+    return True
 
 
 async def apply_rocket_event(application, active, post):
@@ -1137,8 +1152,17 @@ async def check_sources(application):
                 if new_level != old_level:
                     changed_territories.append((territory, new_level, item.get("post") or {}))
 
+            # Группируем изменившиеся территории из одной исходной публикации,
+            # чтобы при восстановлении состояния не рассылать отдельный push на каждый район.
+            grouped_changes = {}
             for territory, new_level, event_post in changed_territories:
-                await apply_uav_event(application, new_level, [territory], event_post)
+                post_key = str(event_post.get("key") or "")
+                group_key = (post_key, int(new_level))
+                if group_key not in grouped_changes:
+                    grouped_changes[group_key] = {"level": int(new_level), "post": event_post, "locations": []}
+                grouped_changes[group_key]["locations"].append(territory)
+            for group in grouped_changes.values():
+                await apply_uav_event(application, group["level"], group["locations"], group["post"])
             if not changed_territories:
                 await retry_pending_notifications(application)
             if latest_rocket:
