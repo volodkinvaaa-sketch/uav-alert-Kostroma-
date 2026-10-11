@@ -72,6 +72,7 @@ def format_time(value):
 
 
 def load_json(filename, default):
+    """Загружает путь, уже собранный через json_path(); битый JSON не роняет запуск."""
     try:
         with open(filename, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -102,7 +103,7 @@ SOURCE_STATE_FILE = json_path("source_state.json")
 
 DEFAULT_STATE = {
     "uav_level": 0, "uav_cycle": 0, "rocket_active": False, "rocket_cycle": 0,
-    "active_locations": [], "last_uav_time": None, "last_uav_source": None,
+    "active_locations": [], "uav_territories": {}, "last_uav_time": None, "last_uav_source": None,
     "last_uav_post": None, "last_uav_post_key": None, "last_uav_post_date": None,
     "last_uav_post_text": None,
     "last_uav_event_type": None, "last_uav_notification_key": None,
@@ -116,6 +117,8 @@ if not isinstance(state, dict):
     state = DEFAULT_STATE.copy()
 for k, v in DEFAULT_STATE.items():
     state.setdefault(k, v)
+if not isinstance(state.get("uav_territories"), dict):
+    state["uav_territories"] = {}
 history = load_json(HISTORY_FILE, [])
 if not isinstance(history, list):
     history = []
@@ -194,31 +197,120 @@ def normalize_text(value):
     value = (value or "").replace("\xa0", " ").replace("ё", "е").replace("Ё", "Е")
     return re.sub(r"\s+", " ", value).strip().lower()
 
-# Deliberately narrow: only explicit Kostroma / Kostroma Oblast mentions pass.
+# Территориальный фильтр Костромской области.
+# Формат: (регулярное выражение, подпись). Сначала более конкретные названия,
+# чтобы город и район/округ с похожим названием распознавались отдельно.
 KOSTROMA_RE = re.compile(r"\b(?:костромск\w*\s+област\w*|костром\w*)\b", re.I)
-LOCATION_PATTERNS = [
-    (r"\bкостромск\w*\s+област\w*\b", "Костромская область"),
-    (r"\bкостром\w*\b", "Кострома"),
-    (r"\bнерехт\w*\b", "Нерехта"), (r"\bбу(?:й|я|е|ю|ем)\b", "Буй"),
-    (r"\bволгореченск\w*\b", "Волгореченск"), (r"\bгалич\w*\b", "Галич"),
-    (r"\bшарь\w*\b", "Шарья"), (r"\bмантуров\w*\b", "Мантурово"),
-    (r"\bчухлом\w*\b", "Чухлома"), (r"\bмакарьев\w*\b", "Макарьев"),
-    (r"\bсолигалич\w*\b", "Солигалич"), (r"\bкологрив\w*\b", "Кологрив"),
-    (r"\bне[яе]\b", "Нея"), (r"\bкостромск\w*\s+район\w*\b", "Костромской район"),
-    (r"\bнерехтск\w*\s+район\w*\b", "Нерехтский район"),
-    (r"\bшарьинск\w*\s+район\w*\b", "Шарьинский район"),
+
+CITY_PATTERNS = [
+    (r"\bкостром(?:а|ы|е|у|ой|ою)\b", "Кострома"),
+    (r"\bнерехт\w*\b", "Нерехта"),
+    (r"\bбу(?:й|я|е|ю|ем)\b", "Буй"),
+    (r"\bволгореченск\w*\b", "Волгореченск"),
+    (r"\bгалич\w*\b", "Галич"),
+    (r"\bшарь\w*\b", "Шарья"),
+    (r"\bмантуров\w*\b", "Мантурово"),
+    (r"\bчухлом\w*\b", "Чухлома"),
+    (r"\bмакарьев\w*\b", "Макарьев"),
+    (r"\bсолигалич\w*\b", "Солигалич"),
+    (r"\bкологрив\w*\b", "Кологрив"),
+    (r"\bне[яе]\b", "Нея"),
+]
+
+# Районы и муниципальные округа области. Оба варианта названия поддерживаются:
+# «Нейский район», «в Нейском муниципальном округе», «Кадыйский МО» и т. п.
+AREA_STEMS = [
+    (r"антропов", "Антроповский"),
+    (r"буй", "Буйский"),
+    (r"вохом", "Вохомский"),
+    (r"варнав", "Варнавинский"),
+    (r"ветлуж", "Ветлужский"),
+    (r"галич", "Галичский"),
+    (r"кадый", "Кадыйский"),
+    (r"кологрив", "Кологривский"),
+    (r"костром", "Костромской"),
+    (r"красносель", "Красносельский"),
+    (r"макарьев", "Макарьевский"),
+    (r"межев", "Межевской"),
+    (r"мантуров", "Мантуровский"),
+    (r"ней", "Нейский"),
+    (r"нерехт", "Нерехтский"),
+    (r"октябрь", "Октябрьский"),
+    (r"остров", "Островский"),
+    (r"павин", "Павинский"),
+    (r"парфеньев", "Парфеньевский"),
+    (r"поназыр", "Поназыревский"),
+    (r"пыщуг", "Пыщугский"),
+    (r"солигалич", "Солигаличский"),
+    (r"сусанин", "Сусанинский"),
+    (r"чухлом", "Чухломский"),
+    (r"шарь", "Шарьинский"),
+    (r"судислав", "Судиславский"),
+]
+
+AREA_PATTERNS = []
+for stem, adjective in AREA_STEMS:
+    # Название с явным словом «район».
+    AREA_PATTERNS.append((
+        rf"\b{stem}\w*\s+район\w*",
+        f"Район: {adjective} район",
+    ))
+    # Муниципальные округа, включая краткую форму «Нейский округ».
+    AREA_PATTERNS.append((
+        rf"\b{stem}\w*\s+(?:муниципальн\w*\s+)?округ\w*",
+        f"Муниципальный округ: {adjective} муниципальный округ",
+    ))
+
+# Сокращённые формы «Нейский МО» и названия в родительном/предложном падеже.
+SHORT_MO_PATTERNS = [
+    (rf"\b{stem}\w*\s+(?:мо|м\.\s*о\.)\b", f"Муниципальный округ: {adj} муниципальный округ")
+    for stem, adj in AREA_STEMS
 ]
 
 
 def find_locations(text):
+    """Возвращает только распознанные территории, сохраняя тип каждой территории."""
     value = normalize_text(text)
     found = []
-    for pattern, label in LOCATION_PATTERNS:
-        if re.search(pattern, value) and label not in found:
-            found.append(label)
-    if "Костромская область" in found:
-        return ["Костромская область"]
+
+    # Сначала районы/округа: они важнее совпадения по названию города с тем же корнем.
+    for patterns in (AREA_PATTERNS, SHORT_MO_PATTERNS):
+        for pattern, label in patterns:
+            if re.search(pattern, value) and label not in found:
+                found.append(label)
+
+    # Город с тем же корнем, что и район, учитываем только если в тексте он явно назван
+    # как город/городской округ или встречается без слова «район/округ» рядом.
+    for pattern, city in CITY_PATTERNS:
+        matches = list(re.finditer(pattern, value))
+        for match in matches:
+            before = value[max(0, match.start() - 35):match.start()]
+            after = value[match.end():match.end() + 35]
+            nearby = before + " " + after
+            matched_word = match.group(0)
+            is_area_adjective = bool(re.search(
+                r"(?:ск|цк|нск|вск|евск|инск|овск)(?:ом|ого|ому|ий|ая|ое|ие|их|ими)?$",
+                matched_word,
+            ))
+            if is_area_adjective and re.search(r"(?:район\w*|муниципальн\w*\s+округ\w*|округ\w*)", nearby):
+                continue
+            label = f"Город: {city}"
+            if label not in found:
+                found.append(label)
+
+    # Если нет конкретной территории, но регион прямо указан, сохраняем общий статус.
+    if not found and re.search(r"\bкостромск\w*\s+област\w*\b", value):
+        found.append("Костромская область")
+    # Упоминание области не должно скрывать конкретный найденный город/район.
     return found
+
+
+def has_kostroma_territory(text):
+    """Регион проходит фильтр по прямому упоминанию области/Костромы или её территории."""
+    value = normalize_text(text)
+    if KOSTROMA_RE.search(value):
+        return True
+    return bool(find_locations(value))
 
 # ============================================================
 # EVENT DETECTION
@@ -411,10 +503,12 @@ def build_uav_push(level, locations, post):
             "Информация автоматически собрана из публичных сообщений. Она не заменяет официальные оповещения.")
 
 
-def build_uav_cancel_push(post):
+def build_uav_cancel_push(post, locations=None):
     category = html.escape(uav_category_label(post))
-    return (f"<b>🟢 Отбой по опасности: {category}</b>\n\nВ сообщении обнаружена информация об отбое. "
-            "Сверяйтесь с официальными оповещениями региона.\n\n" + source_line(post))
+    territory = ", ".join(locations or [])
+    territory_line = f"\nТерритория: {html.escape(territory)}\n" if territory else "\n"
+    return (f"<b>🟢 Отбой по опасности: {category}</b>" + territory_line +
+            "\nВ сообщении обнаружена информация об отбое. Сверяйтесь с официальными оповещениями региона.\n\n" + source_line(post))
 
 
 def build_uav_channel_post(level, locations, post):
@@ -453,9 +547,9 @@ def build_rocket_push(active, post):
 # ============================================================
 # PUSH DELIVERY (remember each successful recipient)
 # ============================================================
-async def send_push(application, message, event_type, level=0, cycle=0, post=None):
+async def send_push(application, message, event_type, level=0, cycle=0, post=None, key_override=None):
     post = post or {}
-    key = notification_key(event_type, level, cycle, post)
+    key = key_override or notification_key(event_type, level, cycle, post)
     record = notification_events.get(key, {})
     delivered_users = set()
     try:
@@ -466,9 +560,10 @@ async def send_push(application, message, event_type, level=0, cycle=0, post=Non
         logger.info("Уведомление %s уже доставлено.", event_type)
         return int(record.get("sent_count", 0))
     if not subscribers:
-        notification_events[key] = {"sent": False, "sent_count": 0, "delivered_users": [],
+        notification_events[key] = {"sent": True, "sent_count": 0, "delivered_users": [],
                                     "attempted_at": now_msk().isoformat(timespec="seconds"),
-                                    "event": event_type, "post": post.get("key"), "error": "Нет подписчиков"}
+                                    "event": event_type, "post": post.get("key"),
+                                    "error": "На момент события подписчиков не было; новые подписчики получают текущий статус при подписке."}
         save_notification_events()
         logger.warning("Push %s не отправлен: нет подписчиков.", event_type)
         return 0
@@ -487,7 +582,10 @@ async def send_push(application, message, event_type, level=0, cycle=0, post=Non
                 break
             except RetryAfter as exc:
                 if attempt == 0:
-                    await asyncio.sleep(float(getattr(exc, "retry_after", 2)))
+                    retry_delay = getattr(exc, "retry_after", 2)
+                    if hasattr(retry_delay, "total_seconds"):
+                        retry_delay = retry_delay.total_seconds()
+                    await asyncio.sleep(max(1.0, float(retry_delay)))
                     continue
                 errors.append(f"{user_id}: RetryAfter")
             except Forbidden:
@@ -532,12 +630,20 @@ def build_uav_admin_draft(level, locations, post):
     else:
         headline = uav_level_title_for_post(level, post)
         detail = f"Категория: {category}"
-    lines = [
-        "🛰 UAV ALERT",
-        f"📍 Регион: {territory}",
-        "",
-        headline,
-    ]
+    lines = ["🛰 UAV ALERT", "📍 Регион: Костромская область"]
+    city_items = [item.split(": ", 1)[1] for item in (locations or []) if item.startswith("Город: ")]
+    district_items = [item.split(": ", 1)[1] for item in (locations or []) if item.startswith("Район: ")]
+    municipal_items = [item.split(": ", 1)[1] for item in (locations or []) if item.startswith("Муниципальный округ: ")]
+    other_items = [item for item in (locations or []) if not item.startswith(("Город: ", "Район: ", "Муниципальный округ: ")) and item != "Костромская область"]
+    if city_items:
+        lines.append("🏙 Город: " + ", ".join(city_items))
+    if district_items:
+        lines.append("🗺 Район: " + ", ".join(district_items))
+    if municipal_items:
+        lines.append("🏛 Муниципальный округ: " + ", ".join(municipal_items))
+    if other_items:
+        lines.append("📍 Территория: " + ", ".join(other_items))
+    lines.extend(["", headline])
     if level > 0:
         lines.append(detail)
     else:
@@ -649,41 +755,78 @@ async def publish_to_channel(application, message, event_type, level=0, cycle=0,
 
 
 async def retry_last_uav_notification(application):
+    """Повторяет недоставленные уведомления и черновики отдельно по каждой территории."""
+    territories = state.get("uav_territories") or {}
+    if territories:
+        delivered = 0
+        for territory, item in list(territories.items()):
+            key = item.get("last_notification_key")
+            event_type = item.get("last_event_type")
+            if not key or not event_type:
+                continue
+            post = {
+                "key": item.get("last_post_key") or "",
+                "source_name": item.get("last_source") or "Публичный источник",
+                "url": item.get("last_post_url") or "",
+                "date": item.get("last_post_date"),
+                "text": item.get("last_post_text") or "",
+            }
+            level = int(item.get("level", 0))
+            cycle = int(item.get("cycle", 0))
+            locations = [territory]
+            message = build_uav_cancel_push(post, locations) if event_type == "uav_cancel" else build_uav_push(level, locations, post)
+            draft = build_uav_admin_draft(level, locations, post)
+            if not notification_events.get(key, {}).get("sent"):
+                delivered += await send_push(application, message, event_type, level, cycle, post, key_override=key)
+            if not admin_drafts.get(key, {}).get("sent"):
+                await send_admin_post_draft(application, draft, event_type, level, cycle, post, key_override=key)
+        return delivered
+
+    # Совместимость со старым state.json без карты территорий.
     event_type = state.get("last_uav_event_type")
     key = state.get("last_uav_notification_key")
     if not event_type or not key:
         return 0
-    previous = notification_events.get(key, {})
-    post = {
-        "key": state.get("last_uav_post_key") or "",
-        "source_name": state.get("last_uav_source"),
-        "url": state.get("last_uav_post"),
-        "date": state.get("last_uav_post_date"),
-        "text": state.get("last_uav_post_text") or "",
-    }
-    cycle = int(state.get("uav_cycle", 0))
-    if event_type == "uav_cancel":
-        message, level = build_uav_cancel_push(post), 0
-        draft = build_uav_admin_draft(0, [], post)
-    else:
-        level = int(state.get("uav_level", 0))
-        message = build_uav_push(level, state.get("active_locations") or [], post)
-        draft = build_uav_admin_draft(level, state.get("active_locations") or [], post)
-    if not previous.get("sent"):
-        await send_push(application, message, event_type, level, cycle, post)
+    post = {"key": state.get("last_uav_post_key") or "", "source_name": state.get("last_uav_source"),
+            "url": state.get("last_uav_post"), "date": state.get("last_uav_post_date"),
+            "text": state.get("last_uav_post_text") or ""}
+    level = int(state.get("uav_level", 0))
+    locations = state.get("active_locations") or ["Костромская область"]
+    message = build_uav_cancel_push(post, locations) if event_type == "uav_cancel" else build_uav_push(level, locations, post)
+    if not notification_events.get(key, {}).get("sent"):
+        await send_push(application, message, event_type, level, int(state.get("uav_cycle", 0)), post, key_override=key)
     if not admin_drafts.get(key, {}).get("sent"):
-        await send_admin_post_draft(application, draft, event_type, level, cycle, post, key_override=key)
+        await send_admin_post_draft(application, build_uav_admin_draft(level, locations, post), event_type,
+                                    level, int(state.get("uav_cycle", 0)), post, key_override=key)
     return int(notification_events.get(key, {}).get("sent_count", 0))
 
 
 async def send_current_status_to_user(application, user_id):
-    level = int(state.get("uav_level", 0))
-    if level > 0:
+    territories = state.get("uav_territories") or {}
+    active = [(name, item) for name, item in territories.items() if int(item.get("level", 0)) > 0]
+    if active:
+        for territory, item in sorted(active, key=lambda pair: pair[0]):
+            post = {"key": item.get("last_post_key") or "", "source_name": item.get("last_source") or "Автоматическая проверка",
+                    "url": item.get("last_post_url") or "", "date": item.get("last_post_date") or item.get("last_time"),
+                    "text": item.get("last_post_text") or ""}
+            try:
+                await application.bot.send_message(
+                    chat_id=user_id,
+                    text=build_uav_push(int(item.get("level", 0)), [territory], post),
+                    parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                )
+            except TelegramError:
+                logger.exception("Не удалось отправить текущий статус БПЛА пользователю %s", user_id)
+                break
+    elif int(state.get("uav_level", 0)) > 0:
+        # Backwards compatibility for older saved state.
         post = {"key": state.get("last_uav_post_key") or "", "source_name": state.get("last_uav_source") or "Автоматическая проверка",
-                "url": state.get("last_uav_post") or "", "date": state.get("last_uav_post_date") or state.get("last_uav_time")}
+                "url": state.get("last_uav_post") or "", "date": state.get("last_uav_post_date") or state.get("last_uav_time"),
+                "text": state.get("last_uav_post_text") or ""}
         try:
-            await application.bot.send_message(chat_id=user_id, text=build_uav_push(level, state.get("active_locations") or [], post),
-                                               parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            await application.bot.send_message(chat_id=user_id,
+                text=build_uav_push(int(state.get("uav_level", 0)), state.get("active_locations") or ["Костромская область"], post),
+                parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         except TelegramError:
             logger.exception("Не удалось отправить текущий статус БПЛА пользователю %s", user_id)
     if state.get("rocket_active"):
@@ -695,51 +838,114 @@ async def send_current_status_to_user(application, user_id):
         except TelegramError:
             logger.exception("Не удалось отправить текущий ракетный статус пользователю %s", user_id)
 
+
 # ============================================================
 # APPLY EVENTS
 # ============================================================
+def sync_uav_summary():
+    """Пересчитывает общий статус из независимых статусов городов/районов/округов."""
+    territories = state.get("uav_territories") or {}
+    active = [(name, item) for name, item in territories.items() if int(item.get("level", 0)) > 0]
+    state["uav_level"] = max((int(item.get("level", 0)) for _, item in active), default=0)
+    state["active_locations"] = [name for name, _ in sorted(active, key=lambda pair: pair[0])]
+    if active:
+        latest = max((item for _, item in active), key=lambda item: str(item.get("last_time") or ""))
+        state["last_uav_time"] = latest.get("last_time") or state.get("last_uav_time")
+
+
 async def apply_uav_event(application, new_level, locations, post):
-    old_level = int(state.get("uav_level", 0))
-    old_locations = list(state.get("active_locations") or [])
-    locations = locations or ["Костромская область"]
+    """Обновляет каждую названную территорию отдельно; отбой не сбрасывает соседние районы."""
+    if not isinstance(state.get("uav_territories"), dict):
+        state["uav_territories"] = {}
+    territories = state["uav_territories"]
+
+    # Миграция активного статуса из старой версии, где хранился один общий уровень.
+    if not territories and int(state.get("uav_level", 0)) > 0:
+        legacy_locations = state.get("active_locations") or ["Костромская область"]
+        for legacy_name in legacy_locations:
+            territories[legacy_name] = {
+                "level": int(state.get("uav_level", 0)), "cycle": int(state.get("uav_cycle", 0)),
+                "last_time": state.get("last_uav_time"), "last_source": state.get("last_uav_source"),
+                "last_post_url": state.get("last_uav_post"), "last_post_key": state.get("last_uav_post_key"),
+                "last_post_date": state.get("last_uav_post_date"), "last_post_text": state.get("last_uav_post_text") or "",
+                "last_event_type": state.get("last_uav_event_type"),
+                "last_notification_key": state.get("last_uav_notification_key"),
+            }
+
+    locations = list(dict.fromkeys(locations or ["Костромская область"]))
+    now = now_msk().isoformat(timespec="seconds")
+    changed = False
+
     if new_level <= 0:
-        if old_level <= 0:
-            logger.info("Отбой найден, но активного статуса БПЛА нет — пуш не отправляем.")
+        # Явный общий отбой по области очищает все активные территории; локальный — только названные.
+        if "Костромская область" in locations:
+            targets = [name for name, item in territories.items() if int(item.get("level", 0)) > 0]
+        else:
+            targets = [name for name in locations if name in territories and int(territories[name].get("level", 0)) > 0]
+        if not targets:
+            logger.info("Отбой найден, но для указанной территории активного статуса нет.")
             return False
-        state["uav_level"] = 0
-        state["active_locations"] = []
-        state["uav_cycle"] = int(state.get("uav_cycle", 0)) + 1
-        event_type, level = "uav_cancel", 0
+
+        for territory in targets:
+            item = territories.setdefault(territory, {})
+            cycle = int(item.get("cycle", 0)) + 1
+            item.update({"level": 0, "cycle": cycle, "last_time": now,
+                         "last_source": post.get("source_name"), "last_post_url": post.get("url"),
+                         "last_post_key": post.get("key"), "last_post_date": post.get("date"),
+                         "last_post_text": post.get("text", ""), "last_event_type": "uav_cancel"})
+            event_post = dict(post)
+            event_post["key"] = f"{post.get('key', '')}|territory:{territory}"
+            key = notification_key("uav_cancel", 0, cycle, event_post)
+            item["last_notification_key"] = key
+            state["last_uav_notification_key"] = key
+            state["last_uav_event_type"] = "uav_cancel"
+            state["uav_cycle"] = max(int(state.get("uav_cycle", 0)), cycle)
+            add_history("uav_cancel", f"Отбой по опасности БПЛА — {territory}", post)
+            await send_push(application, build_uav_cancel_push(post, [territory]), "uav_cancel", 0, cycle, event_post, key_override=key)
+            await send_admin_post_draft(application, build_uav_admin_draft(0, [territory], post),
+                                        "uav_cancel", 0, cycle, event_post, key_override=key)
+            changed = True
     else:
-        if old_level == new_level and set(old_locations) == set(locations):
-            logger.info("Статус не изменился; повторный пуш не отправляем.")
-            await retry_last_uav_notification(application)
-            return False
-        if old_level == 0:
-            state["uav_cycle"] = int(state.get("uav_cycle", 0)) + 1
-        state["uav_level"] = new_level
-        state["active_locations"] = locations
-        event_type, level = ("uav_active" if old_level == 0 else "uav_update"), new_level
-    cycle = int(state.get("uav_cycle", 0))
-    state["last_uav_time"] = now_msk().isoformat(timespec="seconds")
+        for territory in locations:
+            item = territories.setdefault(territory, {"level": 0, "cycle": 0})
+            old_level = int(item.get("level", 0))
+            if old_level == int(new_level):
+                logger.info("Статус %s по территории %s не изменился.", new_level, territory)
+                continue
+            cycle = int(item.get("cycle", 0))
+            if old_level == 0:
+                cycle += 1
+            event_type = "uav_active" if old_level == 0 else "uav_update"
+            event_post = dict(post)
+            event_post["key"] = f"{post.get('key', '')}|territory:{territory}"
+            key = notification_key(event_type, int(new_level), cycle, event_post)
+            item.update({"level": int(new_level), "cycle": cycle, "last_time": now,
+                         "last_source": post.get("source_name"), "last_post_url": post.get("url"),
+                         "last_post_key": post.get("key"), "last_post_date": post.get("date"),
+                         "last_post_text": post.get("text", ""), "last_event_type": event_type,
+                         "last_notification_key": key})
+            state["last_uav_notification_key"] = key
+            state["last_uav_event_type"] = event_type
+            state["uav_cycle"] = max(int(state.get("uav_cycle", 0)), cycle)
+            add_history(event_type, f"{level_title(int(new_level))} — {territory}", post)
+            await send_push(application, build_uav_push(int(new_level), [territory], post),
+                            event_type, int(new_level), cycle, event_post, key_override=key)
+            await send_admin_post_draft(application, build_uav_admin_draft(int(new_level), [territory], post),
+                                        event_type, int(new_level), cycle, event_post, key_override=key)
+            changed = True
+
+    sync_uav_summary()
+    # Legacy summary fields remain available for health endpoints and old clients.
+    state["last_uav_time"] = now
     state["last_uav_source"] = post.get("source_name")
     state["last_uav_post"] = post.get("url")
     state["last_uav_post_key"] = post.get("key")
     state["last_uav_post_date"] = post.get("date")
     state["last_uav_post_text"] = post.get("text", "")
-    state["last_uav_event_type"] = event_type
-    state["last_uav_notification_key"] = notification_key(event_type, level, cycle, post)
     save_state()
-    title = "Отбой по опасности БПЛА" if level == 0 else level_title(level)
-    add_history(event_type, title, post)
-    message = build_uav_cancel_push(post) if level == 0 else build_uav_push(level, locations, post)
-    await send_push(application, message, event_type, level, cycle, post)
-    draft = build_uav_admin_draft(level, locations, post)
-    await send_admin_post_draft(
-        application, draft, event_type, level, cycle, post,
-        key_override=state["last_uav_notification_key"],
-    )
-    return True
+    if not changed:
+        await retry_last_uav_notification(application)
+    return changed
 
 
 async def apply_rocket_event(application, active, post):
@@ -778,20 +984,26 @@ async def apply_rocket_event(application, active, post):
 # ============================================================
 def get_post_event(post, inherited_locations=None):
     text = post.get("text", "")
-    value = normalize_text(text)
-    # Strict regional filter: no explicit Kostroma / Kostroma Oblast mention => no event.
-    # District/city-only mentions inside Kostroma region can be added here if desired.
-    if not KOSTROMA_RE.search(value):
+    # Прямое упоминание области не обязательно, если сообщение явно называет
+    # известный город, район или муниципальный округ Костромской области.
+    if not has_kostroma_territory(text):
         return {"locations": [], "uav_event": "none", "uav_level": 0, "rocket_event": "none"}
-    locations = find_locations(text) or ["Костромская область"]
+
+    locations = find_locations(text)
+    if not locations:
+        locations = ["Костромская область"]
+
     uav_event, uav_level = "none", 0
     if contains_uav(text):
         if detect_uav_cancel(text):
             uav_event = "cancel"
+            if not locations and inherited_locations:
+                locations = list(inherited_locations)
         else:
             uav_level = detect_uav_level(text)
             if uav_level > 0:
                 uav_event = "active"
+
     rocket_event = "cancel" if detect_rocket_cancel(text) else ("active" if detect_rocket(text) else "none")
     return {"locations": locations, "uav_event": uav_event, "uav_level": uav_level, "rocket_event": rocket_event}
 
@@ -828,33 +1040,72 @@ async def check_sources(application):
         save_state()
         logger.info("Найдено публикаций в окне: %s; новых: %s", len(collected), sum(1 for p in collected if p.get("key") not in sent_posts))
 
-        # On first startup, scan recent posts to determine current state but send at most the latest
-        # valid regional event for each event family. Mark all seen posts afterwards.
+        # During the first scan, use recent posts to reconstruct current state; later process only unseen posts.
         first_scan = not bool(state.get("startup_completed"))
         candidates = collected if first_scan else [p for p in collected if p.get("key") not in sent_posts]
-        latest_uav = None
+
+        # Rebuild the effective UAV status per territory from chronological posts.
+        # This prevents one district's update from hiding another district's event.
+        territories = state.get("uav_territories") or {}
+        effective = {}
+        if territories:
+            for territory, item in territories.items():
+                effective[territory] = {
+                    "level": int(item.get("level", 0)),
+                    "post": {
+                        "key": item.get("last_post_key") or "",
+                        "source_name": item.get("last_source") or "Публичный источник",
+                        "url": item.get("last_post_url") or "",
+                        "date": item.get("last_post_date"),
+                        "text": item.get("last_post_text") or "",
+                    },
+                }
+        elif int(state.get("uav_level", 0)) > 0:
+            legacy_post = {"key": state.get("last_uav_post_key") or "",
+                           "source_name": state.get("last_uav_source") or "Публичный источник",
+                           "url": state.get("last_uav_post") or "", "date": state.get("last_uav_post_date"),
+                           "text": state.get("last_uav_post_text") or ""}
+            for territory in state.get("active_locations") or ["Костромская область"]:
+                effective[territory] = {"level": int(state.get("uav_level", 0)), "post": legacy_post}
+
+        before_levels = {territory: int(item.get("level", 0)) for territory, item in effective.items()}
         latest_rocket = None
         for post in candidates:
             event = get_post_event(post)
             if event["uav_event"] != "none":
-                latest_uav = (post, event)
-                logger.info("Региональное событие БПЛА: %s level=%s source=%s text=%s", event["uav_event"], event["uav_level"], post.get("source_name"), post.get("text", "")[:180])
+                logger.info("Региональное событие БПЛА: %s level=%s source=%s text=%s",
+                            event["uav_event"], event["uav_level"], post.get("source_name"), post.get("text", "")[:180])
+                if event["uav_event"] == "active":
+                    for territory in event["locations"] or ["Костромская область"]:
+                        effective[territory] = {"level": int(event["uav_level"]), "post": post}
+                elif event["uav_event"] == "cancel":
+                    if "Костромская область" in event["locations"]:
+                        for territory, item in list(effective.items()):
+                            if int(item.get("level", 0)) > 0:
+                                effective[territory] = {"level": 0, "post": post}
+                    else:
+                        for territory in event["locations"]:
+                            if territory in effective and int(effective[territory].get("level", 0)) > 0:
+                                effective[territory] = {"level": 0, "post": post}
             if event["rocket_event"] != "none":
                 latest_rocket = (post, event)
 
-        if latest_uav:
-            post, event = latest_uav
-            if event["uav_event"] == "cancel":
-                if int(state.get("uav_level", 0)) > 0:
-                    await apply_uav_event(application, 0, event["locations"], post)
-                else:
-                    logger.info("Региональный отбой найден, активного статуса нет; пуш не отправляем.")
-            else:
-                await apply_uav_event(application, int(event["uav_level"]), event["locations"], post)
-        elif state.get("last_uav_event_type") and state.get("last_uav_notification_key"):
-            # Повторяем неудачную доставку пуша или публикации в канале,
-            # включая событие отбоя, когда текущий уровень уже равен нулю.
+        changed_territories = []
+        all_territories = set(before_levels) | set(effective)
+        for territory in sorted(all_territories):
+            old_level = before_levels.get(territory, 0)
+            item = effective.get(territory, {"level": 0, "post": {}})
+            new_level = int(item.get("level", 0))
+            if new_level != old_level:
+                changed_territories.append((territory, new_level, item.get("post") or {}))
+
+        for territory, new_level, event_post in changed_territories:
+            await apply_uav_event(application, new_level, [territory], event_post)
+        if not changed_territories and any(get_post_event(post)["uav_event"] != "none" for post in candidates):
             await retry_last_uav_notification(application)
+        elif not candidates or not any(get_post_event(post)["uav_event"] != "none" for post in candidates):
+            if state.get("last_uav_event_type") and state.get("last_uav_notification_key"):
+                await retry_last_uav_notification(application)
 
         if latest_rocket:
             post, event = latest_rocket
@@ -904,10 +1155,14 @@ def main_keyboard():
 
 def format_status():
     level = int(state.get("uav_level", 0))
-    locations = state.get("active_locations") or ["Костромская область"]
+    locations = state.get("active_locations") or []
     rocket = "🟥 Активна" if state.get("rocket_active") else "🟢 Не объявлена"
+    if locations:
+        territory_line = "Активные территории: " + html.escape(", ".join(locations))
+    else:
+        territory_line = "Активных территорий в сохранённом статусе нет."
     return ("<b>UAV ALERT — текущий статус</b>\n\n" + html.escape(level_title(level)) +
-            f"\nТерритория: {html.escape(', '.join(locations))}\nПоследнее изменение: {format_time(state.get('last_uav_time'))}\n\n" +
+            f"\n{territory_line}\nПоследнее изменение: {format_time(state.get('last_uav_time'))}\n\n" +
             f"<b>Ракетная опасность:</b> {rocket}\nПоследняя проверка: {format_time(state.get('last_scan_time'))}\n" +
             f"Публикаций в окне: {int(state.get('last_scan_count', 0))}\n\n" +
             "<i>Автоматический мониторинг публичных сообщений; не заменяет официальные оповещения.</i>")
@@ -932,7 +1187,7 @@ def format_sources():
     lines = ["<b>📡 Источники мониторинга</b>", ""]
     for info in SOURCES.values():
         lines.append(f'<a href="{html.escape(info["url"], quote=True)}">{html.escape(info["name"])}</a>')
-    lines += ["", "Фильтр событий: только публикации с явным упоминанием Костромы или Костромской области.",
+    lines += ["", "Фильтр событий: Костромская область, её города, районы и муниципальные округа.",
               "Источники публичные и могут содержать неполную или неподтверждённую информацию."]
     return "\n".join(lines)
 
