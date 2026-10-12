@@ -34,12 +34,9 @@ def env_int(name, default, minimum=None):
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = env_int("ADMIN_ID", 1421675956, 1)
 PORT = env_int("PORT", 10000, 1)
-# Интервал сканирования по умолчанию — 3 секунды. Можно изменить через переменную окружения.
-CHECK_INTERVAL = env_int("CHECK_INTERVAL", 3, 3)
-# Анализируем публикации только за последние 5 часов.
+CHECK_INTERVAL = env_int("CHECK_INTERVAL", 30, 15)
 HISTORY_WINDOW_HOURS = env_int("HISTORY_WINDOW_HOURS", 5, 1)
-# Не повторяем неудачную доставку на каждом цикле: пауза снижает риск ограничений Telegram.
-RETRY_INTERVAL_SECONDS = env_int("RETRY_INTERVAL_SECONDS", 30, 10)
+UAV_REMINDER_HOURS = env_int("UAV_REMINDER_HOURS", 10, 1)
 REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 15, 5)
 SOURCE_LIMIT = env_int("SOURCE_LIMIT", 100, 30)
 DATA_DIR = os.getenv("DATA_DIR", ".")
@@ -214,9 +211,53 @@ def normalize_text(value):
 # Формат: (регулярное выражение, подпись). Сначала более конкретные названия,
 # чтобы город и район/округ с похожим названием распознавались отдельно.
 KOSTROMA_RE = re.compile(r"\b(?:костромск\w*\s+област\w*|костром\w*)\b", re.I)
+YAROSLAVL_RE = re.compile(r"\b(?:ярославск\w*\s+област\w*|ярославл\w*)\b", re.I)
+TRACKED_REGION_RE = re.compile(
+    r"\b(?:костромск\w*\s+област\w*|костром\w*|"
+    r"ярославск\w*\s+област\w*|ярославл\w*)\b", re.I
+)
+REGION_NAMES = {
+    "Костромская область": "Костромская область",
+    "Ярославская область": "Ярославская область",
+}
+
+
+def region_for_location(location):
+    """Определяет регион по метке региона или распознанной территории."""
+    value = normalize_text(str(location or ""))
+    if "ярослав" in value:
+        return "Ярославская область"
+    if "костром" in value or any(name in value for name in (
+        "нерехт", "буй", "волгореченск", "галич", "шарь", "мантуров",
+        "чухлом", "макарьев", "солигалич", "кологрив", "нейский", "нея",
+        "антропов", "вохом", "варнавин", "ветлуж", "кадый", "красносель",
+        "межев", "октябрьский район", "островский район", "павин", "парфеньев",
+        "поназыр", "пыщуг", "сусанин", "судислав"
+    )):
+        return "Костромская область"
+    return None
+
+
+def region_label_for_locations(locations, post=None):
+    """Возвращает регион для заголовка по меткам территории и исходному сообщению."""
+    for location in locations or []:
+        region = region_for_location(location)
+        if region:
+            return region
+    text = normalize_text((post or {}).get("text", ""))
+    if re.search(r"\bярославск\w*\s+област\w*\b", text):
+        return "Ярославская область"
+    if re.search(r"\bкостромск\w*\s+област\w*\b", text):
+        return "Костромская область"
+    return "Костромская область"
+
+
+def is_region_wide_location(location):
+    return str(location or "") in REGION_NAMES
 
 CITY_PATTERNS = [
     (r"\bкостром(?:а|ы|е|у|ой|ою)\b", "Кострома"),
+    (r"\bярославл(?:ь|я|е|ю|ем|ём)\b", "Ярославль"),
     (r"\bнерехт\w*\b", "Нерехта"),
     (r"\bбу(?:й|я|е|ю|ем)\b", "Буй"),
     (r"\bволгореченск\w*\b", "Волгореченск"),
@@ -315,14 +356,16 @@ def find_locations(text):
     # Если нет конкретной территории, но регион прямо указан, сохраняем общий статус.
     if not found and re.search(r"\bкостромск\w*\s+област\w*\b", value):
         found.append("Костромская область")
+    if not found and re.search(r"\bярославск\w*\s+област\w*\b", value):
+        found.append("Ярославская область")
     # Упоминание области не должно скрывать конкретный найденный город/район.
     return found
 
 
 def has_kostroma_territory(text):
-    """Регион проходит фильтр по прямому упоминанию области/Костромы или её территории."""
+    """Совместимый фильтр: пропускает события по Костромской и Ярославской областям."""
     value = normalize_text(text)
-    if KOSTROMA_RE.search(value):
+    if TRACKED_REGION_RE.search(value):
         return True
     return bool(find_locations(value))
 
@@ -352,19 +395,8 @@ CANCEL_RE = re.compile(
 PERSIST_RE = re.compile(r"\b(?:сохраня\w*|действу\w*|продолжа\w*|остает\w*|остаетс\w*)\b", re.I)
 
 
-CANCEL_NEGATION_RE = re.compile(
-    r"\b(?:не\s+(?:снят\w*|отмен\w*|прекращен\w*|объявлен\w*|подтвержден\w*)|"
-    r"отбоя\s+(?:нет|не\s+было|не\s+объявлен\w*)|"
-    r"опасност\w*\s+не\s+(?:снят\w*|отменен\w*|прекращен\w*)|"
-    r"угроз\w*\s+не\s+(?:снят\w*|отменен\w*|прекращен\w*))\b", re.I)
-
-
 def detect_cancel(text):
-    value = normalize_text(text)
-    # Не сбрасываем статус по сообщениям вроде «опасность не снята» или «отбоя нет».
-    if CANCEL_NEGATION_RE.search(value):
-        return False
-    return bool(CANCEL_RE.search(value))
+    return bool(CANCEL_RE.search(normalize_text(text)))
 
 
 def detect_rocket_cancel(text):
@@ -529,6 +561,43 @@ def build_uav_push(level, locations, post):
             "Информация автоматически собрана из публичных сообщений. Она не заменяет официальные оповещения.")
 
 
+def build_uav_reminder_push(level, locations, post):
+    """Информационное напоминание через 10 часов; не объявляет угрозу официально."""
+    territory = ", ".join(locations) if locations else "Костромская область"
+    return (
+        f"<b>⏳ Сохранение статуса по БПЛА: {html.escape(level_title(level))}</b>\n\n"
+        f"Территория: {html.escape(territory)}\n"
+        f"Напоминание через {UAV_REMINDER_HOURS} ч. после исходного сообщения.\n\n"
+        f"{source_line(post)}\n\n"
+        "В доступных отслеживаемых сообщениях отбой не обнаружен. Это не подтверждение текущей обстановки: сверяйтесь с официальными оповещениями региона."
+    )
+
+
+def build_uav_reminder_draft(level, locations, post):
+    region = region_label_for_locations(locations, post)
+    category = uav_category_label(post)
+    status_word = {1: "Внимание", 2: "Угроза", 3: "Опасность"}.get(int(level), "Статус")
+    lines = [
+        "🛰 UAV ALERT",
+        f"📍 Регион: {region}",
+        "",
+        f"{ {1: '🟡', 2: '🟠', 3: '🔴'}.get(int(level), '⏳') } {status_word} по БПЛА в {region.lower()} сохраняется",
+        f"Категория: {category}",
+        f"Время напоминания: {now_msk().strftime('%d.%m.%Y %H:%M МСК')}",
+        f"Исходное сообщение: {format_time(post.get('date'))}",
+        "",
+        f"Источник: {post.get('source_name') or 'публичный источник'}",
+    ]
+    if post.get("url"):
+        lines.append(f"Ссылка на источник: {post['url']}")
+    lines.extend([
+        "",
+        f"Через {UAV_REMINDER_HOURS} ч. после исходного сообщения в отслеживаемых открытых источниках отбой не обнаружен. Это не подтверждение текущей обстановки; сверяйтесь с официальными оповещениями региона.",
+        "Информация собрана из публичных сообщений и не заменяет официальные оповещения.",
+    ])
+    return "\n".join(lines)
+
+
 def build_uav_cancel_push(post, locations=None):
     category = html.escape(uav_category_label(post))
     territory = ", ".join(locations or [])
@@ -674,11 +743,12 @@ def build_uav_admin_draft(level, locations, post):
     else:
         headline = uav_level_title_for_post(level, post)
         detail = f"Категория: {category}"
-    lines = ["🛰 UAV ALERT", "📍 Регион: Костромская область"]
+    region_label = region_label_for_locations(locations, post)
+    lines = ["🛰 UAV ALERT", f"📍 Регион: {region_label}"]
     city_items = [item.split(": ", 1)[1] for item in (locations or []) if item.startswith("Город: ")]
     district_items = [item.split(": ", 1)[1] for item in (locations or []) if item.startswith("Район: ")]
     municipal_items = [item.split(": ", 1)[1] for item in (locations or []) if item.startswith("Муниципальный округ: ")]
-    other_items = [item for item in (locations or []) if not item.startswith(("Город: ", "Район: ", "Муниципальный округ: ")) and item != "Костромская область"]
+    other_items = [item for item in (locations or []) if not item.startswith(("Город: ", "Район: ", "Муниципальный округ: ")) and item not in ("Костромская область", "Ярославская область")]
     if city_items:
         lines.append("🏙 Город: " + ", ".join(city_items))
     if district_items:
@@ -721,10 +791,10 @@ async def send_admin_post_draft(application, message, event_type, level=0, cycle
     admin_drafts[key] = record
     save_admin_drafts()
     try:
-        # Администратору отправляем только сам текст поста, без служебной шапки.
         await application.bot.send_message(
             chat_id=ADMIN_ID,
-            text=message,
+            text=("📝 ГОТОВЫЙ ПОСТ ДЛЯ ТГК @RADAR_Kostroma\n"
+                  "Скопируй текст ниже и опубликуй после проверки:\n\n" + message),
             disable_web_page_preview=True,
         )
         record.update({"sent": True, "error": None,
@@ -778,19 +848,11 @@ async def publish_to_channel(application, message, event_type, level=0, cycle=0,
         logger.exception("Не удалось опубликовать %s в канале %s. Проверь права администратора бота.", event_type, CHANNEL_ID)
         return False
 
-def retry_is_due(record):
-    """Проверяет, прошло ли достаточно времени с последней попытки доставки."""
-    attempted = parse_datetime(record.get("attempted_at")) if isinstance(record, dict) else None
-    if attempted is None:
-        return True
-    return (now_msk() - attempted).total_seconds() >= RETRY_INTERVAL_SECONDS
-
-
 async def retry_pending_notifications(application):
-    """Повторяет все недоставленные push, черновики администратора и публикации канала с паузой."""
+    """Повторяет все недоставленные push, черновики администратора и публикации канала."""
     total_delivered = 0
     for key, record in list(notification_events.items()):
-        if not isinstance(record, dict) or record.get("sent") or not retry_is_due(record):
+        if not isinstance(record, dict) or record.get("sent"):
             continue
         message = record.get("message")
         event_type = record.get("event")
@@ -804,7 +866,7 @@ async def retry_pending_notifications(application):
         )
 
     for key, record in list(admin_drafts.items()):
-        if not isinstance(record, dict) or record.get("sent") or not retry_is_due(record):
+        if not isinstance(record, dict) or record.get("sent"):
             continue
         message = record.get("message")
         event_type = record.get("event")
@@ -817,7 +879,7 @@ async def retry_pending_notifications(application):
         )
 
     for key, record in list(channel_posts.items()):
-        if not isinstance(record, dict) or record.get("sent") or not retry_is_due(record):
+        if not isinstance(record, dict) or record.get("sent"):
             continue
         message = record.get("message")
         event_type = record.get("event")
@@ -888,7 +950,7 @@ def sync_uav_summary():
 
 
 async def apply_uav_event(application, new_level, locations, post):
-    """Обновляет статусы территорий и отправляет одно общее уведомление на событие."""
+    """Обновляет каждую названную территорию отдельно; отбой не сбрасывает соседние районы."""
     if not isinstance(state.get("uav_territories"), dict):
         state["uav_territories"] = {}
     territories = state["uav_territories"]
@@ -908,19 +970,21 @@ async def apply_uav_event(application, new_level, locations, post):
 
     locations = list(dict.fromkeys(locations or ["Костромская область"]))
     now = now_msk().isoformat(timespec="seconds")
-    changed_locations = []
-    cycles = []
-    event_type = "uav_cancel" if new_level <= 0 else None
+    changed = False
 
     if new_level <= 0:
-        # Общий отбой по области очищает все активные территории; локальный — только названные.
-        if "Костромская область" in locations:
-            targets = [name for name, item in territories.items() if int(item.get("level", 0)) > 0]
+        # Явный общий отбой по области очищает все активные территории; локальный — только названные.
+        named_regions = [name for name in locations if is_region_wide_location(name)]
+        if named_regions:
+            targets = [
+                name for name, item in territories.items()
+                if int(item.get("level", 0)) > 0
+                and any(region_for_location(name) == region for region in named_regions)
+            ]
         else:
             targets = [name for name in locations if name in territories and int(territories[name].get("level", 0)) > 0]
         if not targets:
             logger.info("Отбой найден, но для указанной территории активного статуса нет.")
-            await retry_pending_notifications(application)
             return False
 
         for territory in targets:
@@ -929,10 +993,20 @@ async def apply_uav_event(application, new_level, locations, post):
             item.update({"level": 0, "cycle": cycle, "last_time": now,
                          "last_source": post.get("source_name"), "last_post_url": post.get("url"),
                          "last_post_key": post.get("key"), "last_post_date": post.get("date"),
-                         "last_post_text": post.get("text", ""), "last_event_type": "uav_cancel"})
-            cycles.append(cycle)
-            changed_locations.append(territory)
+                         "last_post_text": post.get("text", ""), "last_event_type": "uav_cancel",
+                         "reminder_due_at": None, "reminder_sent_at": None, "reminder_key": None})
+            event_post = dict(post)
+            event_post["key"] = f"{post.get('key', '')}|territory:{territory}"
+            key = notification_key("uav_cancel", 0, cycle, event_post)
+            item["last_notification_key"] = key
+            state["last_uav_notification_key"] = key
+            state["last_uav_event_type"] = "uav_cancel"
+            state["uav_cycle"] = max(int(state.get("uav_cycle", 0)), cycle)
             add_history("uav_cancel", f"Отбой по опасности БПЛА — {territory}", post)
+            await send_push(application, build_uav_cancel_push(post, [territory]), "uav_cancel", 0, cycle, event_post, key_override=key)
+            await send_admin_post_draft(application, build_uav_admin_draft(0, [territory], post),
+                                        "uav_cancel", 0, cycle, event_post, key_override=key)
+            changed = True
     else:
         for territory in locations:
             item = territories.setdefault(territory, {"level": 0, "cycle": 0})
@@ -943,15 +1017,27 @@ async def apply_uav_event(application, new_level, locations, post):
             cycle = int(item.get("cycle", 0))
             if old_level == 0:
                 cycle += 1
-            item_event_type = "uav_active" if old_level == 0 else "uav_update"
-            event_type = item_event_type if event_type is None else event_type
+            event_type = "uav_active" if old_level == 0 else "uav_update"
+            event_post = dict(post)
+            event_post["key"] = f"{post.get('key', '')}|territory:{territory}"
+            key = notification_key(event_type, int(new_level), cycle, event_post)
+            announced_at = parse_datetime(post.get("date")) or now_msk()
+            reminder_due = (announced_at + timedelta(hours=UAV_REMINDER_HOURS)).isoformat(timespec="seconds")
             item.update({"level": int(new_level), "cycle": cycle, "last_time": now,
                          "last_source": post.get("source_name"), "last_post_url": post.get("url"),
                          "last_post_key": post.get("key"), "last_post_date": post.get("date"),
-                         "last_post_text": post.get("text", ""), "last_event_type": item_event_type})
-            cycles.append(cycle)
-            changed_locations.append(territory)
-            add_history(item_event_type, f"{level_title(int(new_level))} — {territory}", post)
+                         "last_post_text": post.get("text", ""), "last_event_type": event_type,
+                         "last_notification_key": key, "reminder_due_at": reminder_due,
+                         "reminder_sent_at": None, "reminder_key": None})
+            state["last_uav_notification_key"] = key
+            state["last_uav_event_type"] = event_type
+            state["uav_cycle"] = max(int(state.get("uav_cycle", 0)), cycle)
+            add_history(event_type, f"{level_title(int(new_level))} — {territory}", post)
+            await send_push(application, build_uav_push(int(new_level), [territory], post),
+                            event_type, int(new_level), cycle, event_post, key_override=key)
+            await send_admin_post_draft(application, build_uav_admin_draft(int(new_level), [territory], post),
+                                        event_type, int(new_level), cycle, event_post, key_override=key)
+            changed = True
 
     sync_uav_summary()
     # Legacy summary fields remain available for health endpoints and old clients.
@@ -962,39 +1048,60 @@ async def apply_uav_event(application, new_level, locations, post):
     state["last_uav_post_date"] = post.get("date")
     state["last_uav_post_text"] = post.get("text", "")
     save_state()
-
-    if not changed_locations:
+    if not changed:
         await retry_pending_notifications(application)
-        return False
+    return changed
 
-    # Все территории из одного исходного сообщения объединяются в один push и один пост администратору.
-    combined_post = dict(post)
-    combined_post["key"] = f"{post.get('key', '')}|territories:{'|'.join(sorted(changed_locations))}"
-    combined_cycle = max(cycles, default=0)
-    if new_level <= 0:
-        event_type = "uav_cancel"
-        message = build_uav_cancel_push(post, changed_locations)
-        draft = build_uav_admin_draft(0, changed_locations, post)
-        message_level = 0
-    else:
-        event_type = event_type or "uav_active"
-        message = build_uav_push(int(new_level), changed_locations, post)
-        draft = build_uav_admin_draft(int(new_level), changed_locations, post)
-        message_level = int(new_level)
 
-    key = notification_key(event_type, message_level, combined_cycle, combined_post)
-    for territory in changed_locations:
-        if territory in territories:
-            territories[territory]["last_notification_key"] = key
-    state["last_uav_notification_key"] = key
-    state["last_uav_event_type"] = event_type
-    state["uav_cycle"] = max(int(state.get("uav_cycle", 0)), combined_cycle)
-    save_state()
-    await send_push(application, message, event_type, message_level, combined_cycle,
-                    combined_post, key_override=key)
-    await send_admin_post_draft(application, draft, event_type, message_level,
-                                combined_cycle, combined_post, key_override=key)
-    return True
+async def process_due_uav_reminders(application):
+    """Отправляет сохранённое напоминание через N часов, только пока событие активно."""
+    territories = state.get("uav_territories") or {}
+    now = now_msk()
+    changed = False
+    for territory, item in list(territories.items()):
+        try:
+            level = int(item.get("level", 0))
+        except (TypeError, ValueError):
+            level = 0
+        if level not in (1, 2, 3):
+            continue
+        if item.get("reminder_sent_at"):
+            continue
+
+        due = parse_datetime(item.get("reminder_due_at"))
+        if due is None:
+            # Миграция ранее сохранённых активных событий: считаем 10 часов от их last_time.
+            started = parse_datetime(item.get("last_time"))
+            due = started + timedelta(hours=UAV_REMINDER_HOURS) if started else now + timedelta(hours=UAV_REMINDER_HOURS)
+            item["reminder_due_at"] = due.isoformat(timespec="seconds")
+            changed = True
+        if now < due:
+            continue
+
+        post = {
+            "key": item.get("last_post_key") or "",
+            "source_name": item.get("last_source") or "Публичный источник",
+            "url": item.get("last_post_url") or "",
+            "date": item.get("last_post_date") or item.get("last_time"),
+            "text": item.get("last_post_text") or "",
+        }
+        # В ключ включаем территорию, цикл и уровень: повторная отправка после рестарта не дублируется.
+        reminder_post = dict(post)
+        reminder_post["key"] = f"{post.get('key', '')}|reminder:{territory}:{item.get('cycle', 0)}:{level}"
+        key = item.get("reminder_key") or notification_key("uav_reminder", level, int(item.get("cycle", 0)), reminder_post)
+        item["reminder_key"] = key
+        draft = build_uav_reminder_draft(level, [territory], post)
+        # По запросу администратора напоминание приходит только ему как черновик;
+        # подписчикам повторный push через 10 часов не отправляется.
+        await send_admin_post_draft(application, draft, "uav_reminder", level, int(item.get("cycle", 0)), reminder_post, key_override=key)
+        draft_done = bool(admin_drafts.get(key, {}).get("sent"))
+        if draft_done:
+            item["reminder_sent_at"] = now_msk().isoformat(timespec="seconds")
+            changed = True
+        else:
+            logger.warning("Напоминание по территории %s пока не завершено; повторим при следующей проверке.", territory)
+    if changed:
+        save_state()
 
 
 async def apply_rocket_event(application, active, post):
@@ -1132,9 +1239,12 @@ async def check_sources(application):
                         for territory in event["locations"] or ["Костромская область"]:
                             effective[territory] = {"level": int(event["uav_level"]), "post": post}
                     elif event["uav_event"] == "cancel":
-                        if "Костромская область" in event["locations"]:
+                        named_regions = [name for name in event["locations"] if is_region_wide_location(name)]
+                        if named_regions:
                             for territory, item in list(effective.items()):
-                                if int(item.get("level", 0)) > 0:
+                                if int(item.get("level", 0)) > 0 and any(
+                                    region_for_location(territory) == region for region in named_regions
+                                ):
                                     effective[territory] = {"level": 0, "post": post}
                         else:
                             for territory in event["locations"]:
@@ -1152,17 +1262,8 @@ async def check_sources(application):
                 if new_level != old_level:
                     changed_territories.append((territory, new_level, item.get("post") or {}))
 
-            # Группируем изменившиеся территории из одной исходной публикации,
-            # чтобы при восстановлении состояния не рассылать отдельный push на каждый район.
-            grouped_changes = {}
             for territory, new_level, event_post in changed_territories:
-                post_key = str(event_post.get("key") or "")
-                group_key = (post_key, int(new_level))
-                if group_key not in grouped_changes:
-                    grouped_changes[group_key] = {"level": int(new_level), "post": event_post, "locations": []}
-                grouped_changes[group_key]["locations"].append(territory)
-            for group in grouped_changes.values():
-                await apply_uav_event(application, group["level"], group["locations"], group["post"])
+                await apply_uav_event(application, new_level, [territory], event_post)
             if not changed_territories:
                 await retry_pending_notifications(application)
             if latest_rocket:
@@ -1204,7 +1305,7 @@ async def check_sources(application):
                                     key_override=key)
 
         # Mark every collected post as seen, including irrelevant/out-of-region posts.
-        # This prevents repeatedly analysing the same unrelated posts on each scan.
+        # This prevents repeatedly analysing the same unrelated posts every 30 seconds.
         for post in collected:
             mark_post_processed(post)
         save_sent_posts()
@@ -1220,11 +1321,11 @@ async def check_sources(application):
         save_source_state()
         state["startup_completed"] = True
         save_state()
+        await process_due_uav_reminders(application)
 
 
 async def monitor_loop(application):
-    logger.info("Мониторинг запущен. Интервал сканирования %s сек.; окно анализа %s ч.; повтор доставки каждые %s сек.",
-                CHECK_INTERVAL, HISTORY_WINDOW_HOURS, RETRY_INTERVAL_SECONDS)
+    logger.info("Мониторинг запущен. Интервал %s сек.; окно %s ч.", CHECK_INTERVAL, HISTORY_WINDOW_HOURS)
     while True:
         try:
             await check_sources(application)
@@ -1280,7 +1381,7 @@ def format_sources():
     lines = ["<b>📡 Источники мониторинга</b>", ""]
     for info in SOURCES.values():
         lines.append(f'<a href="{html.escape(info["url"], quote=True)}">{html.escape(info["name"])}</a>')
-    lines += ["", "Фильтр событий: Костромская область, её города, районы и муниципальные округа.",
+    lines += ["", "Фильтр событий: Костромская и Ярославская области; для Костромской области также распознаются города, районы и муниципальные округа.",
               "Источники публичные и могут содержать неполную или неподтверждённую информацию."]
     return "\n".join(lines)
 
@@ -1288,7 +1389,7 @@ def format_sources():
 def format_stats():
     return ("<b>📊 Статистика UAV ALERT</b>\n\n" + f"Подписчиков: {len(subscribers)}\nЗаписей истории: {len(history)}\n" +
             f"Обработанных публикаций: {len(sent_posts)}\nСобытий уведомлений: {len(notification_events)}\n" +
-            f"Окно анализа: {HISTORY_WINDOW_HOURS} ч.\nИнтервал проверки: {CHECK_INTERVAL} сек.")
+            f"Окно анализа: {HISTORY_WINDOW_HOURS} ч.\nНапоминание по активному статусу БПЛА: через {UAV_REMINDER_HOURS} ч.\nИнтервал проверки: {CHECK_INTERVAL} сек.")
 
 # ============================================================
 # COMMANDS / CALLBACKS
@@ -1300,7 +1401,7 @@ def is_admin(update):
 
 async def start_command(update, context):
     if update.effective_message:
-        await update.effective_message.reply_text("🚨 <b>UAV ALERT</b>\nГражданский информационный сервис мониторинга публичных сообщений о БПЛА в Костроме и Костромской области.\n\nНажми «Подписаться», чтобы получать уведомления. Бот не заменяет официальные оповещения.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
+        await update.effective_message.reply_text("🚨 <b>UAV ALERT</b>\nГражданский информационный сервис мониторинга публичных сообщений о БПЛА в Костромской и Ярославской областях.\n\nНажми «Подписаться», чтобы получать уведомления. Бот не заменяет официальные оповещения.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
 
 
 async def subscribe_user(application, user_id):
@@ -1389,7 +1490,7 @@ async def callback_handler(update, context):
     elif data == "status": text = format_status()
     elif data == "history": text = format_history()
     elif data == "sources": text = format_sources()
-    elif data == "help": text = "<b>UAV ALERT</b>\n\nИспользуй кнопки или команды /status, /history, /sources, /subscribe и /unsubscribe.\nФильтр — Кострома и Костромская область. Бот не заменяет официальные оповещения."
+    elif data == "help": text = "<b>UAV ALERT</b>\n\nИспользуй кнопки или команды /status, /history, /sources, /subscribe и /unsubscribe.\nФильтр — Костромская и Ярославская области. Бот не заменяет официальные оповещения."
     else: text = "Неизвестная команда."
     try:
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
@@ -1405,7 +1506,8 @@ app = Flask(__name__)
 @app.get("/")
 def index():
     return jsonify({"service": "UAV ALERT", "status": "running", "monitor_interval_seconds": CHECK_INTERVAL,
-                    "history_window_hours": HISTORY_WINDOW_HOURS, "subscribers": len(subscribers),
+                    "history_window_hours": HISTORY_WINDOW_HOURS, "uav_reminder_hours": UAV_REMINDER_HOURS,
+                    "subscribers": len(subscribers),
                     "channel_id": CHANNEL_ID, "publication_mode": "admin_dm_draft", "last_scan_time": state.get("last_scan_time")}), 200
 
 @app.get("/status")
