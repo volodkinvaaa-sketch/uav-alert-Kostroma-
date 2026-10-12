@@ -514,6 +514,7 @@ def level_title(level):
 
 
 def source_line(post):
+    """Сохраняет совместимость со старыми форматами; в новых постах не используется."""
     if not post:
         return "Источник: автоматическая проверка UAV ALERT"
     name = html.escape(str(post.get("source_name", "Telegram")))
@@ -557,9 +558,11 @@ def uav_level_title_for_post(level, post):
 
 def build_uav_push(level, locations, post):
     territory = ", ".join(locations) if locations else "Кострома / Костромская область"
-    return (f"<b>{uav_level_title_for_post(level, post)}</b>\n\nТерритория: {html.escape(territory)}\n\n{source_line(post)}\n\n"
-            "Информация автоматически собрана из публичных сообщений. Она не заменяет официальные оповещения.")
-
+    return (
+        f"<b>{uav_level_title_for_post(level, post)}</b>\n\n"
+        f"Территория: {html.escape(territory)}\n\n"
+        "Информация автоматически собрана из публичных сообщений. Она не заменяет официальные оповещения."
+    )
 
 def build_uav_reminder_push(level, locations, post):
     """Информационное напоминание через 10 часов; не объявляет угрозу официально."""
@@ -568,10 +571,8 @@ def build_uav_reminder_push(level, locations, post):
         f"<b>⏳ Сохранение статуса по БПЛА: {html.escape(level_title(level))}</b>\n\n"
         f"Территория: {html.escape(territory)}\n"
         f"Напоминание через {UAV_REMINDER_HOURS} ч. после исходного сообщения.\n\n"
-        f"{source_line(post)}\n\n"
         "В доступных отслеживаемых сообщениях отбой не обнаружен. Это не подтверждение текущей обстановки: сверяйтесь с официальными оповещениями региона."
     )
-
 
 def build_uav_reminder_draft(level, locations, post):
     region = region_label_for_locations(locations, post)
@@ -584,30 +585,23 @@ def build_uav_reminder_draft(level, locations, post):
         f"{ {1: '🟡', 2: '🟠', 3: '🔴'}.get(int(level), '⏳') } {status_word} по БПЛА в {region.lower()} сохраняется",
         f"Категория: {category}",
         f"Время напоминания: {now_msk().strftime('%d.%m.%Y %H:%M МСК')}",
-        f"Исходное сообщение: {format_time(post.get('date'))}",
-        "",
-        f"Источник: {post.get('source_name') or 'публичный источник'}",
-    ]
-    if post.get("url"):
-        lines.append(f"Ссылка на источник: {post['url']}")
-    lines.extend([
         "",
         f"Через {UAV_REMINDER_HOURS} ч. после исходного сообщения в отслеживаемых открытых источниках отбой не обнаружен. Это не подтверждение текущей обстановки; сверяйтесь с официальными оповещениями региона.",
         "Информация собрана из публичных сообщений и не заменяет официальные оповещения.",
-    ])
+    ]
     return "\n".join(lines)
-
 
 def build_uav_cancel_push(post, locations=None):
     category = html.escape(uav_category_label(post))
     territory = ", ".join(locations or [])
     territory_line = f"\nТерритория: {html.escape(territory)}\n" if territory else "\n"
-    return (f"<b>🟢 Отбой по опасности: {category}</b>" + territory_line +
-            "\nВ сообщении обнаружена информация об отбое. Сверяйтесь с официальными оповещениями региона.\n\n" + source_line(post))
-
+    return (
+        f"<b>🟢 Отбой по опасности: {category}</b>" + territory_line +
+        "\nВ сообщении обнаружена информация об отбое. Сверяйтесь с официальными оповещениями региона."
+    )
 
 def build_uav_channel_post(level, locations, post):
-    """Готовый HTML-пост для канала; время публикации источника и ссылка сохраняются."""
+    """Готовый HTML-пост для канала без строк с названием и ссылкой на источник."""
     territory = ", ".join(locations) if locations else "Костромская область"
     category = html.escape(uav_category_label(post))
     return (
@@ -616,32 +610,24 @@ def build_uav_channel_post(level, locations, post):
         f"<b>{uav_level_title_for_post(level, post)}</b>\n"
         f"Категория: {category}\n"
         f"Время обнаружения: {now_msk().strftime('%d.%m.%Y %H:%M МСК')}\n\n"
-        f"{source_line(post)}\n\n"
-        "<i>Информация собрана из публичного сообщения и не заменяет официальные оповещения.</i>"
+        "<i>Информация собрана из публичных сообщений и не заменяет официальные оповещения.</i>"
     )
 
-
 def build_uav_cancel_channel_post(post):
-    territory = "Костромская область"
     category = html.escape(uav_category_label(post))
     return (
         "🛰 <b>UAV ALERT</b>\n"
-        f"📍 Регион: {territory}\n\n"
+        "📍 Регион: Костромская область\n\n"
         f"🟢 <b>Отбой по опасности: {category}</b>\n"
-        f"Время обнаружения сообщения: {now_msk().strftime('%d.%m.%Y %H:%M МСК')}\n\n"
-        f"{source_line(post)}\n\n"
+        f"Время сообщения: {now_msk().strftime('%d.%m.%Y %H:%M МСК')}\n\n"
         "<i>Сверяйтесь с официальными оповещениями региона.</i>"
     )
-
 
 def build_rocket_push(active, post):
     title = "🟥 Ракетная опасность" if active else "🟢 Отбой ракетной опасности"
     note = "Следуйте официальным инструкциям экстренных служб." if active else "Сверяйтесь с официальными оповещениями региона."
-    return f"<b>{title}</b>\n\n{note}\n\n{source_line(post)}"
+    return f"<b>{title}</b>\n\n{note}"
 
-# ============================================================
-# PUSH DELIVERY (remember each successful recipient)
-# ============================================================
 async def send_push(application, message, event_type, level=0, cycle=0, post=None, key_override=None):
     """Отправляет push и сохраняет точный текст для повторной доставки после ошибки/перезапуска."""
     post = post or {}
@@ -730,13 +716,10 @@ async def send_push(application, message, event_type, level=0, cycle=0, post=Non
     return len(delivered_users.intersection(subscribers))
 
 def build_uav_admin_draft(level, locations, post):
-    """Формирует простой текст поста, который удобно скопировать в @RADAR_Kostroma."""
+    """Формирует черновик для @RADAR_Kostroma без заголовка-подсказки и строк источника."""
     post = post or {}
-    territory = ", ".join(locations) if locations else "Костромская область"
     category = uav_category_label(post)
-    detected_at = now_msk().strftime("%d.%m.%Y %H:%M МСК")
-    source_name = str(post.get("source_name") or "публичный источник")
-    source_url = str(post.get("url") or "")
+    detected_at = format_time(post.get("date")) or now_msk().strftime("%d.%m.%Y %H:%M МСК")
     if level <= 0:
         headline = f"🟢 Отбой по опасности: {category}"
         detail = "По опубликованному сообщению обнаружена информация об отбое. Сверяйтесь с официальными оповещениями региона."
@@ -757,24 +740,9 @@ def build_uav_admin_draft(level, locations, post):
         lines.append("🏛 Муниципальный округ: " + ", ".join(municipal_items))
     if other_items:
         lines.append("📍 Территория: " + ", ".join(other_items))
-    lines.extend(["", headline])
-    if level > 0:
-        lines.append(detail)
-    else:
-        lines.append(detail)
-    lines.extend([
-        f"Время обнаружения: {detected_at}",
-        "",
-        f"Источник: {source_name}",
-    ])
-    if source_url:
-        lines.append(f"Ссылка на источник: {source_url}")
-    lines.extend([
-        "",
-        "Информация собрана из публичного сообщения и не заменяет официальные оповещения.",
-    ])
+    lines.extend(["", headline, detail, f"Время обнаружения: {detected_at}", "",
+                  "Информация собрана из публичных сообщений и не заменяет официальные оповещения."])
     return "\n".join(lines)
-
 
 async def send_admin_post_draft(application, message, event_type, level=0, cycle=0, post=None, key_override=None):
     """Присылает администратору черновик; сохраняет текст для безопасного повтора."""
@@ -793,8 +761,7 @@ async def send_admin_post_draft(application, message, event_type, level=0, cycle
     try:
         await application.bot.send_message(
             chat_id=ADMIN_ID,
-            text=("📝 ГОТОВЫЙ ПОСТ ДЛЯ ТГК @RADAR_Kostroma\n"
-                  "Скопируй текст ниже и опубликуй после проверки:\n\n" + message),
+            text=message,
             disable_web_page_preview=True,
         )
         record.update({"sent": True, "error": None,
