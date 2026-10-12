@@ -188,6 +188,25 @@ def save_notification_events():
             notification_events.pop(old_key, None)
     save_json(NOTIFICATION_EVENTS_FILE, notification_events)
 
+# На старте удаляем сохранённые территории Ярославской области из прежних версий.
+# Остальные данные, подписчики, история и настройки сохраняются.
+try:
+    territories = state.get("uav_territories", {})
+    if isinstance(territories, dict):
+        for territory_key in list(territories):
+            if "ярослав" in str(territory_key).lower():
+                territories.pop(territory_key, None)
+        state["uav_territories"] = territories
+    active_locations = state.get("active_locations", [])
+    if isinstance(active_locations, list):
+        state["active_locations"] = [
+            item for item in active_locations
+            if "ярослав" not in str(item).lower()
+        ]
+    save_state()
+except Exception:
+    logger.exception("Не удалось очистить старые региональные записи")
+
 logger.info("Загружено подписчиков: %s", len(subscribers))
 
 # ============================================================
@@ -211,22 +230,17 @@ def normalize_text(value):
 # Формат: (регулярное выражение, подпись). Сначала более конкретные названия,
 # чтобы город и район/округ с похожим названием распознавались отдельно.
 KOSTROMA_RE = re.compile(r"\b(?:костромск\w*\s+област\w*|костром\w*)\b", re.I)
-YAROSLAVL_RE = re.compile(r"\b(?:ярославск\w*\s+област\w*|ярославл\w*)\b", re.I)
 TRACKED_REGION_RE = re.compile(
-    r"\b(?:костромск\w*\s+област\w*|костром\w*|"
-    r"ярославск\w*\s+област\w*|ярославл\w*)\b", re.I
+    r"\b(?:костромск\w*\s+област\w*|костром\w*)\b", re.I
 )
 REGION_NAMES = {
     "Костромская область": "Костромская область",
-    "Ярославская область": "Ярославская область",
 }
 
 
 def region_for_location(location):
     """Определяет регион по метке региона или распознанной территории."""
     value = normalize_text(str(location or ""))
-    if "ярослав" in value:
-        return "Ярославская область"
     if "костром" in value or any(name in value for name in (
         "нерехт", "буй", "волгореченск", "галич", "шарь", "мантуров",
         "чухлом", "макарьев", "солигалич", "кологрив", "нейский", "нея",
@@ -245,8 +259,6 @@ def region_label_for_locations(locations, post=None):
         if region:
             return region
     text = normalize_text((post or {}).get("text", ""))
-    if re.search(r"\bярославск\w*\s+област\w*\b", text):
-        return "Ярославская область"
     if re.search(r"\bкостромск\w*\s+област\w*\b", text):
         return "Костромская область"
     return "Костромская область"
@@ -257,7 +269,6 @@ def is_region_wide_location(location):
 
 CITY_PATTERNS = [
     (r"\bкостром(?:а|ы|е|у|ой|ою)\b", "Кострома"),
-    (r"\bярославл(?:ь|я|е|ю|ем|ём)\b", "Ярославль"),
     (r"\bнерехт\w*\b", "Нерехта"),
     (r"\bбу(?:й|я|е|ю|ем)\b", "Буй"),
     (r"\bволгореченск\w*\b", "Волгореченск"),
@@ -356,14 +367,12 @@ def find_locations(text):
     # Если нет конкретной территории, но регион прямо указан, сохраняем общий статус.
     if not found and re.search(r"\bкостромск\w*\s+област\w*\b", value):
         found.append("Костромская область")
-    if not found and re.search(r"\bярославск\w*\s+област\w*\b", value):
-        found.append("Ярославская область")
     # Упоминание области не должно скрывать конкретный найденный город/район.
     return found
 
 
 def has_kostroma_territory(text):
-    """Совместимый фильтр: пропускает события по Костромской и Ярославской областям."""
+    """Совместимый фильтр: пропускает события только по Костромской области."""
     value = normalize_text(text)
     if TRACKED_REGION_RE.search(value):
         return True
