@@ -146,7 +146,8 @@ DEFAULT_STATE = {
     "last_rocket_time": None, "last_rocket_source": None, "last_rocket_post": None,
     "last_rocket_post_key": None, "last_rocket_post_date": None,
     "last_rocket_event_type": None, "last_rocket_notification_key": None,
-    "startup_completed": False, "last_scan_time": None, "last_scan_count": 0,
+    "startup_completed": False, "status_recovery_checked": False,
+    "last_scan_time": None, "last_scan_count": 0,
 }
 state = load_json(STATE_FILE, DEFAULT_STATE.copy())
 if not isinstance(state, dict):
@@ -1484,8 +1485,32 @@ async def check_sources(application):
         save_state()
         logger.info("Найдено публикаций в окне: %s; новых: %s", len(collected), sum(1 for p in collected if p.get("key") not in sent_posts))
 
-        # During the first scan, use recent posts to reconstruct current state; later process only unseen posts.
-        first_scan = not bool(state.get("startup_completed"))
+        # During the first scan, reconstruct current state from recent posts.
+        # Recovery safeguard: if the bot says startup is complete but all UAV state
+        # metadata is empty, replay the recent window once. This covers partial state
+        # loss where sent_posts survived but state.json was reset or incompletely saved.
+        territories_now = state.get("uav_territories") or {}
+        has_active_territory = any(
+            int(item.get("level", 0)) > 0
+            for item in territories_now.values()
+            if isinstance(item, dict)
+        )
+        uav_state_is_empty = (
+            int(state.get("uav_level", 0)) == 0
+            and not (state.get("active_locations") or [])
+            and not state.get("last_uav_time")
+            and not state.get("last_uav_post_key")
+            and not has_active_territory
+        )
+        recover_missing_status = (
+            not bool(state.get("status_recovery_checked"))
+            and uav_state_is_empty
+        )
+        first_scan = not bool(state.get("startup_completed")) or recover_missing_status
+        if recover_missing_status and state.get("startup_completed"):
+            logger.warning(
+                "Состояние БПЛА пустое при завершённом запуске; один раз восстанавливаем статус по окну публикаций."
+            )
         candidates = collected if first_scan else [p for p in collected if p.get("key") not in sent_posts]
 
         if first_scan:
@@ -1626,6 +1651,7 @@ async def check_sources(application):
                                     "last_scan_time": now_msk().isoformat(timespec="seconds")}
         save_source_state()
         state["startup_completed"] = True
+        state["status_recovery_checked"] = True
         save_state()
         await process_expired_uav_statuses(application)
         await process_due_uav_reminders(application)
@@ -1731,6 +1757,11 @@ def format_status():
     elif stale:
         status_line = "⏳ Актуальность не подтверждена"
         territory_line = "Последние известные статусы (уже не считаются актуальными): " + html.escape(", ".join(name for name, _ in sorted(stale)))
+    elif not state.get("last_uav_time"):
+        # Не показываем зелёный статус, если в сохранённых данных вообще нет
+        # времени последнего события: отсутствие данных не означает отсутствие угрозы.
+        status_line = "⏳ Статус не подтверждён"
+        territory_line = "Не удалось восстановить последнее событие БПЛА из сохранённых данных. Проверяйте официальные оповещения."
     else:
         status_line = html.escape(level_title(0))
         territory_line = "Активных территорий в сохранённом статусе нет."
