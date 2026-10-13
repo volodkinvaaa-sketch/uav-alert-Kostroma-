@@ -732,12 +732,16 @@ async def send_push(application, message, event_type, level=0, cycle=0, post=Non
     save_notification_events()
 
     if not subscribers:
-        record.update({"sent": False, "sent_count": len(delivered_users), "failed_count": 0,
-                       "error": "Нет подписчиков; событие сохранено для повторной проверки."})
+        # Не ставим событие в очередь на будущее: новый подписчик получит актуальный
+        # статус при подписке, а не устаревшее уведомление из прошлого.
+        record.update({"sent": True, "sent_count": 0, "failed_count": 0,
+                       "delivered_users": [],
+                       "error": "Пропущено: на момент события не было подписчиков.",
+                       "completed_at": now_msk().isoformat(timespec="seconds")})
         notification_events[key] = record
         save_notification_events()
-        logger.warning("Push %s пока не отправлен: нет подписчиков.", event_type)
-        return len(delivered_users)
+        logger.info("Push %s пропущен: на момент события не было подписчиков.", event_type)
+        return 0
 
     dead_users = []
     errors = []
@@ -899,6 +903,17 @@ async def retry_pending_notifications(application):
     total_delivered = 0
     for key, record in list(notification_events.items()):
         if not isinstance(record, dict) or record.get("sent"):
+            continue
+        # Закрываем старые записи от предыдущей версии, которые были созданы,
+        # когда подписчиков не было: не рассылаем новому подписчику старое событие.
+        if (not record.get("delivered_users")
+                and "нет подписчиков" in str(record.get("error", "")).lower()):
+            record["sent"] = True
+            record["failed_count"] = 0
+            record["error"] = "Пропущено: на момент события не было подписчиков."
+            record["completed_at"] = now_msk().isoformat(timespec="seconds")
+            notification_events[key] = record
+            save_notification_events()
             continue
         message = record.get("message")
         event_type = record.get("event")
@@ -1786,12 +1801,47 @@ async def stats_command(update, context):
 
 
 async def test_command(update, context):
-    if not update.effective_message:
+    """Проверяет реальную отправку сообщения через Bot API, не рассылая тест подписчикам."""
+    message = update.effective_message
+    if not message:
         return
     if not is_admin(update):
-        await update.effective_message.reply_text("Команда доступна только администратору.")
+        await message.reply_text("Команда доступна только администратору.")
         return
-    await update.effective_message.reply_text("✅ Тестовая проверка Telegram-бота прошла успешно.", reply_markup=main_keyboard())
+
+    pending_pushes = sum(
+        1 for item in notification_events.values()
+        if isinstance(item, dict) and not item.get("sent") and item.get("message") and item.get("event")
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "🧪 UAV ALERT — тест доставки\n\n"
+                "Это тестовое техническое сообщение. Оно не означает наличие опасности.\n"
+                f"Подписчиков сейчас: {len(subscribers)}\n"
+                f"Уведомлений в очереди повтора: {pending_pushes}\n"
+                f"Время: {now_msk().strftime('%d.%m.%Y %H:%M МСК')}"
+            ),
+            disable_web_page_preview=True,
+        )
+        await message.reply_text(
+            "✅ Тестовое сообщение отправлено администратору через Telegram Bot API.\n\n"
+            f"Подписчиков: {len(subscribers)}\n"
+            f"Ожидают повторной доставки: {pending_pushes}\n\n"
+            "Важно: тест проверяет отправку бота в этот чат, но не отправляет тест всем подписчикам.",
+            reply_markup=main_keyboard(),
+        )
+    except TelegramError as exc:
+        logger.exception("Тестовая отправка Telegram не удалась.")
+        HEALTH["last_error"] = f"Тест отправки: {type(exc).__name__}: {exc}"[:500]
+        HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
+        await message.reply_text(
+            "❌ Тестовая отправка не удалась. Проверь Logs в Render.\n\n"
+            f"Ошибка: {html.escape(str(exc)[:300])}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard(),
+        )
 
 
 async def admin_command(update, context):
@@ -1889,6 +1939,14 @@ def health_status():
         "uav_level": state.get("uav_level", 0),
         "rocket_active": state.get("rocket_active", False),
         "last_scan_count": state.get("last_scan_count", 0),
+        "subscribers": len(subscribers),
+        "push_events_total": len(notification_events),
+        "push_events_pending": sum(1 for item in notification_events.values()
+                                    if isinstance(item, dict) and not item.get("sent")
+                                    and item.get("message") and item.get("event")),
+        "push_last_attempt_at": max((str(item.get("attempted_at", ""))
+                                      for item in notification_events.values()
+                                      if isinstance(item, dict) and item.get("attempted_at")), default=None),
     }), 200
 
 
