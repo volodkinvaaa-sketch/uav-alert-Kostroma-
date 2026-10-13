@@ -423,6 +423,35 @@ ROCKET_CONTEXT_RE = re.compile(
 def contains_uav(text): return bool(UAV_CONTEXT_RE.search(normalize_text(text)))
 def contains_rocket(text): return bool(ROCKET_CONTEXT_RE.search(normalize_text(text)))
 
+# Эти два определения обязательны: get_post_event() вызывает их при каждой
+# обработке публикации. Без них цикл мониторинга завершался с NameError.
+UAV_OBSERVATION_RE = re.compile(
+    r"\b(?:фиксаци\w*|зафиксирован\w*|обнаружен\w*|замечен\w*|"
+    r"наблюда\w*|видел\w*|заметил\w*|прол[её]т\w*|"
+    r"появлен\w*|визуальн\w*\s+контакт\w*|в\s+небе)\b", re.I)
+
+UNCONFIRMED_RE = re.compile(
+    r"(?:\bне\s+подтвержд\w*\b|\bнеподтвержд[её]нн\w*\b|"
+    r"\bофициальн\w*\s+подтвержден\w*\s+нет\b|"
+    r"\bофициальн\w*\s+подтвержд[её]ни\w*\s+нет\b|"
+    r"\bинформац\w*\s+требует\s+подтвержден\w*\b|"
+    r"\bданн\w*\s+не\s+подтвержден\w*\b|"
+    r"\bсообщени\w*\s+не\s+подтвержден\w*\b|"
+    r"\bпока\s+не\s+подтвержден\w*\b|"
+    r"\bпроверя\w*\s+(?:информаци\w*|сообщени\w*)\b|"
+    r"\bданн\w*\s+уточня\w*\b)", re.I)
+
+
+def detect_uav_observation(text):
+    """Определяет сообщение о фиксации воздушной цели; не меняет статус опасности."""
+    value = normalize_text(text)
+    return contains_uav(value) and bool(UAV_OBSERVATION_RE.search(value))
+
+
+def is_unconfirmed_message(text):
+    """True только при явной пометке о неподтверждённости информации."""
+    return bool(UNCONFIRMED_RE.search(normalize_text(text)))
+
 CANCEL_RE = re.compile(
     r"\b(?:отбой|отмен\w*|снят\w*|снята|снято|прекращен\w*|"
     r"опасност\w*\s+больше\s+нет|угроз\w*\s+больше\s+нет|"
