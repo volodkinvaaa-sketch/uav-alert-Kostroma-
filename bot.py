@@ -403,6 +403,34 @@ CANCEL_RE = re.compile(
     r"больше\s+не\s+актуальн\w*)\b", re.I)
 PERSIST_RE = re.compile(r"\b(?:сохраня\w*|действу\w*|продолжа\w*|остает\w*|остаетс\w*)\b", re.I)
 
+# Отдельно распознаём сообщения о наблюдении/фиксации. Сама по себе фиксация
+# не означает, что официально объявлена опасность, поэтому этот фильтр не меняет статус.
+UAV_OBSERVATION_RE = re.compile(
+    r"\b(?:фиксаци\w*|зафиксирован\w*|обнаружен\w*|замечен\w*|"
+    r"наблюда\w*|видел\w*|заметил\w*|пролет\w*|пролетел\w*|"
+    r"пролетает|появлен\w*|визуальн\w*\s+контакт\w*)\b", re.I)
+
+# Только явные формулировки о неподтверждённости. Не используем общие слова
+# вроде «сообщают» или «предварительно», чтобы не отбрасывать все новости подряд.
+UNCONFIRMED_RE = re.compile(
+    r"(?:\bне\s+подтвержд\w*\b|\bне\s+подтверждён\w*\b|"
+    r"\bне\s+имеет\s+подтвержден\w*\b|\bне\s+имеет\s+подтверждён\w*\b|"
+    r"\bнеподтвержд[её]нн\w*\b|\bофициальн\w*\s+подтвержден\w*\s+нет\b|"
+    r"\bофициальн\w*\s+подтвержд[её]ни\w*\s+нет\b|"
+    r"\bпроверя\w*\s+(?:информаци\w*|сообщени\w*)\b|"
+    r"\bданн\w*\s+уточня\w*\b)", re.I)
+
+
+def detect_uav_observation(text):
+    """True для сообщений о предполагаемой/сообщаемой фиксации воздушной цели."""
+    value = normalize_text(text)
+    return contains_uav(value) and bool(UAV_OBSERVATION_RE.search(value))
+
+
+def is_unconfirmed_message(text):
+    """True только для явно обозначенных как неподтверждённые сообщений."""
+    return bool(UNCONFIRMED_RE.search(normalize_text(text)))
+
 
 def detect_cancel(text):
     return bool(CANCEL_RE.search(normalize_text(text)))
@@ -740,7 +768,7 @@ def build_uav_admin_draft(level, locations, post):
     city_items = [item.split(": ", 1)[1] for item in (locations or []) if item.startswith("Город: ")]
     district_items = [item.split(": ", 1)[1] for item in (locations or []) if item.startswith("Район: ")]
     municipal_items = [item.split(": ", 1)[1] for item in (locations or []) if item.startswith("Муниципальный округ: ")]
-    other_items = [item for item in (locations or []) if not item.startswith(("Город: ", "Район: ", "Муниципальный округ: ")) and item not in ("Костромская область", "Ярославская область")]
+    other_items = [item for item in (locations or []) if not item.startswith(("Город: ", "Район: ", "Муниципальный округ: ")) and item not in ("Костромская область")]
     if city_items:
         lines.append("🏙 Город: " + ", ".join(city_items))
     if district_items:
@@ -875,7 +903,8 @@ async def retry_last_uav_notification(application):
 
 async def send_current_status_to_user(application, user_id):
     territories = state.get("uav_territories") or {}
-    active = [(name, item) for name, item in territories.items() if int(item.get("level", 0)) > 0]
+    active = [(name, item) for name, item in territories.items()
+              if int(item.get("level", 0)) > 0 and not item.get("validity_expired", False)]
     if active:
         for territory, item in sorted(active, key=lambda pair: pair[0]):
             post = {"key": item.get("last_post_key") or "", "source_name": item.get("last_source") or "Автоматическая проверка",
@@ -917,7 +946,10 @@ async def send_current_status_to_user(application, user_id):
 def sync_uav_summary():
     """Пересчитывает общий статус из независимых статусов городов/районов/округов."""
     territories = state.get("uav_territories") or {}
-    active = [(name, item) for name, item in territories.items() if int(item.get("level", 0)) > 0]
+    active = [
+        (name, item) for name, item in territories.items()
+        if int(item.get("level", 0)) > 0 and not item.get("validity_expired", False)
+    ]
     state["uav_level"] = max((int(item.get("level", 0)) for _, item in active), default=0)
     state["active_locations"] = [name for name, _ in sorted(active, key=lambda pair: pair[0])]
     if active:
@@ -942,6 +974,8 @@ async def apply_uav_event(application, new_level, locations, post):
                 "last_post_date": state.get("last_uav_post_date"), "last_post_text": state.get("last_uav_post_text") or "",
                 "last_event_type": state.get("last_uav_event_type"),
                 "last_notification_key": state.get("last_uav_notification_key"),
+                "validity_due_at": None, "validity_expired": False,
+                "validity_expired_at": None, "validity_notice_sent_at": None,
             }
 
     locations = list(dict.fromkeys(locations or ["Костромская область"]))
@@ -970,7 +1004,9 @@ async def apply_uav_event(application, new_level, locations, post):
                          "last_source": post.get("source_name"), "last_post_url": post.get("url"),
                          "last_post_key": post.get("key"), "last_post_date": post.get("date"),
                          "last_post_text": post.get("text", ""), "last_event_type": "uav_cancel",
-                         "reminder_due_at": None, "reminder_sent_at": None, "reminder_key": None})
+                         "reminder_due_at": None, "reminder_sent_at": None, "reminder_key": None,
+                         "validity_due_at": None, "validity_expired": False,
+                         "validity_expired_at": None, "validity_notice_sent_at": None})
             event_post = dict(post)
             event_post["key"] = f"{post.get('key', '')}|territory:{territory}"
             key = notification_key("uav_cancel", 0, cycle, event_post)
@@ -987,8 +1023,20 @@ async def apply_uav_event(application, new_level, locations, post):
         for territory in locations:
             item = territories.setdefault(territory, {"level": 0, "cycle": 0})
             old_level = int(item.get("level", 0))
+            announced_at = parse_datetime(post.get("date")) or now_msk()
+            validity_due = (announced_at + timedelta(hours=HISTORY_WINDOW_HOURS)).isoformat(timespec="seconds")
+            reminder_due = (announced_at + timedelta(hours=UAV_REMINDER_HOURS)).isoformat(timespec="seconds")
             if old_level == int(new_level):
-                logger.info("Статус %s по территории %s не изменился.", new_level, territory)
+                # Новая публикация с тем же уровнем обновляет срок актуальности,
+                # но не создаёт повторный push подписчикам.
+                item.update({"last_time": now, "last_source": post.get("source_name"),
+                             "last_post_url": post.get("url"), "last_post_key": post.get("key"),
+                             "last_post_date": post.get("date"), "last_post_text": post.get("text", ""),
+                             "validity_due_at": validity_due, "validity_expired": False,
+                             "validity_expired_at": None, "validity_notice_sent_at": None,
+                             "reminder_due_at": reminder_due, "reminder_sent_at": None, "reminder_key": None})
+                logger.info("Статус %s по территории %s подтверждён новой публикацией; срок актуальности обновлён.", new_level, territory)
+                changed = True
                 continue
             cycle = int(item.get("cycle", 0))
             if old_level == 0:
@@ -997,14 +1045,14 @@ async def apply_uav_event(application, new_level, locations, post):
             event_post = dict(post)
             event_post["key"] = f"{post.get('key', '')}|territory:{territory}"
             key = notification_key(event_type, int(new_level), cycle, event_post)
-            announced_at = parse_datetime(post.get("date")) or now_msk()
-            reminder_due = (announced_at + timedelta(hours=UAV_REMINDER_HOURS)).isoformat(timespec="seconds")
             item.update({"level": int(new_level), "cycle": cycle, "last_time": now,
                          "last_source": post.get("source_name"), "last_post_url": post.get("url"),
                          "last_post_key": post.get("key"), "last_post_date": post.get("date"),
                          "last_post_text": post.get("text", ""), "last_event_type": event_type,
                          "last_notification_key": key, "reminder_due_at": reminder_due,
-                         "reminder_sent_at": None, "reminder_key": None})
+                         "reminder_sent_at": None, "reminder_key": None,
+                         "validity_due_at": validity_due, "validity_expired": False,
+                         "validity_expired_at": None, "validity_notice_sent_at": None})
             state["last_uav_notification_key"] = key
             state["last_uav_event_type"] = event_type
             state["uav_cycle"] = max(int(state.get("uav_cycle", 0)), cycle)
@@ -1029,6 +1077,74 @@ async def apply_uav_event(application, new_level, locations, post):
     return changed
 
 
+async def process_expired_uav_statuses(application):
+    """По истечении окна актуальности скрывает статус как подтверждённый и сообщает только админу."""
+    territories = state.get("uav_territories") or {}
+    now = now_msk()
+    changed = False
+
+    for territory, item in list(territories.items()):
+        try:
+            level = int(item.get("level", 0))
+        except (TypeError, ValueError):
+            level = 0
+        if level not in (1, 2, 3):
+            continue
+
+        due = parse_datetime(item.get("validity_due_at"))
+        if due is None:
+            # Миграция старых записей: считаем срок от времени исходной публикации,
+            # а если его нет — от последнего сохранённого времени события.
+            source_time = parse_datetime(item.get("last_post_date")) or parse_datetime(item.get("last_time"))
+            due = source_time + timedelta(hours=HISTORY_WINDOW_HOURS) if source_time else now
+            item["validity_due_at"] = due.isoformat(timespec="seconds")
+            changed = True
+
+        if now < due:
+            continue
+
+        if not item.get("validity_expired"):
+            item["validity_expired"] = True
+            item["validity_expired_at"] = now.isoformat(timespec="seconds")
+            item["validity_notice_sent_at"] = None
+            add_history("uav_stale", f"Актуальность не подтверждена — {territory}", {
+                "source_name": item.get("last_source"), "url": item.get("last_post_url"),
+                "date": item.get("last_post_date") or item.get("last_time")})
+            logger.info("Истёк срок актуальности статуса БПЛА по территории %s; статус скрыт из активных.", territory)
+            changed = True
+
+        # Уведомление отправляется только администратору; ключ стабилен после рестарта.
+        if not item.get("validity_notice_sent_at"):
+            post = {
+                "key": item.get("last_post_key") or "",
+                "source_name": item.get("last_source") or "Публичный источник",
+                "url": item.get("last_post_url") or "",
+                "date": item.get("last_post_date") or item.get("last_time"),
+                "text": item.get("last_post_text") or "",
+            }
+            due_key = item.get("validity_due_at") or due.isoformat(timespec="seconds")
+            key_post = dict(post)
+            key_post["key"] = f"{post.get('key', '')}|validity-expired:{territory}:{item.get('cycle', 0)}:{due_key}"
+            key = notification_key("uav_validity_expired", level, int(item.get("cycle", 0)), key_post)
+            message = (
+                "⏳ UAV ALERT — актуальность не подтверждена\n\n"
+                f"Территория: {str(territory)}\n"
+                f"Последний известный статус: {level_title(level)}\n"
+                f"Время исходной публикации: {format_time(post.get('date'))}\n"
+                f"Окно актуальности ({HISTORY_WINDOW_HOURS} ч.) истекло без обнаруженного отбоя.\n\n"
+                "Бот снял отметку актуальности, но это не означает, что опасность официально отменена. Проверьте свежие публикации и официальные оповещения."
+            )
+            sent = await send_admin_post_draft(application, message, "uav_validity_expired", level,
+                                               int(item.get("cycle", 0)), key_post, key_override=key)
+            if sent:
+                item["validity_notice_sent_at"] = now_msk().isoformat(timespec="seconds")
+                changed = True
+
+    sync_uav_summary()
+    if changed:
+        save_state()
+
+
 async def process_due_uav_reminders(application):
     """Отправляет сохранённое напоминание через N часов, только пока событие активно."""
     territories = state.get("uav_territories") or {}
@@ -1039,7 +1155,7 @@ async def process_due_uav_reminders(application):
             level = int(item.get("level", 0))
         except (TypeError, ValueError):
             level = 0
-        if level not in (1, 2, 3):
+        if level not in (1, 2, 3) or item.get("validity_expired", False):
             continue
         if item.get("reminder_sent_at"):
             continue
@@ -1116,10 +1232,16 @@ async def apply_rocket_event(application, active, post):
 # ============================================================
 def get_post_event(post, inherited_locations=None):
     text = post.get("text", "")
+    # Флаги фиксации и неподтверждённости доступны отдельно от статуса опасности.
+    observation = detect_uav_observation(text)
+    unconfirmed = is_unconfirmed_message(text)
+
     # Прямое упоминание области не обязательно, если сообщение явно называет
     # известный город, район или муниципальный округ Костромской области.
     if not has_kostroma_territory(text):
-        return {"locations": [], "uav_event": "none", "uav_level": 0, "rocket_event": "none"}
+        return {"locations": [], "uav_event": "none", "uav_level": 0,
+                "rocket_event": "none", "uav_observation": observation,
+                "unconfirmed": unconfirmed}
 
     locations = find_locations(text)
     if not locations:
@@ -1131,13 +1253,20 @@ def get_post_event(post, inherited_locations=None):
             uav_event = "cancel"
             if not locations and inherited_locations:
                 locations = list(inherited_locations)
-        else:
+        elif not unconfirmed:
             uav_level = detect_uav_level(text)
             if uav_level > 0:
                 uav_event = "active"
 
-    rocket_event = "cancel" if detect_rocket_cancel(text) else ("active" if detect_rocket(text) else "none")
-    return {"locations": locations, "uav_event": uav_event, "uav_level": uav_level, "rocket_event": rocket_event}
+    # Явно неподтверждённые сообщения не меняют активный статус ни по БПЛА, ни по ракетам.
+    if unconfirmed:
+        rocket_event = "none"
+    else:
+        rocket_event = "cancel" if detect_rocket_cancel(text) else ("active" if detect_rocket(text) else "none")
+
+    return {"locations": locations, "uav_event": uav_event, "uav_level": uav_level,
+            "rocket_event": rocket_event, "uav_observation": observation,
+            "unconfirmed": unconfirmed}
 
 # ============================================================
 # MONITORING — PROCESS ONLY NEW POSTS; NO REPEATED SPAM
@@ -1208,6 +1337,10 @@ async def check_sources(application):
             latest_rocket = None
             for post in candidates:
                 event = get_post_event(post)
+                if event.get("uav_observation") or event.get("unconfirmed"):
+                    logger.info("Фильтр публикации: observation=%s unconfirmed=%s source=%s text=%s",
+                                event.get("uav_observation"), event.get("unconfirmed"),
+                                post.get("source_name"), post.get("text", "")[:180])
                 if event["uav_event"] != "none":
                     logger.info("Региональное событие БПЛА: %s level=%s source=%s text=%s",
                                 event["uav_event"], event["uav_level"], post.get("source_name"), post.get("text", "")[:180])
@@ -1238,8 +1371,18 @@ async def check_sources(application):
                 if new_level != old_level:
                     changed_territories.append((territory, new_level, item.get("post") or {}))
 
+            changed_names = {territory for territory, _, _ in changed_territories}
             for territory, new_level, event_post in changed_territories:
                 await apply_uav_event(application, new_level, [territory], event_post)
+            # Если при первом сканировании найдено свежее сообщение того же уровня,
+            # обновляем срок актуальности без повторной рассылки статуса.
+            for territory, item in effective.items():
+                if territory in changed_names or int(item.get("level", 0)) not in (1, 2, 3):
+                    continue
+                event_post = item.get("post") or {}
+                saved_item = (state.get("uav_territories") or {}).get(territory, {})
+                if event_post.get("key") and event_post.get("key") != saved_item.get("last_post_key"):
+                    await apply_uav_event(application, int(item["level"]), [territory], event_post)
             if not changed_territories:
                 await retry_pending_notifications(application)
             if latest_rocket:
@@ -1253,6 +1396,10 @@ async def check_sources(application):
             saw_rocket_event = False
             for post in candidates:
                 event = get_post_event(post)
+                if event.get("uav_observation") or event.get("unconfirmed"):
+                    logger.info("Фильтр публикации: observation=%s unconfirmed=%s source=%s text=%s",
+                                event.get("uav_observation"), event.get("unconfirmed"),
+                                post.get("source_name"), post.get("text", "")[:180])
                 if event["uav_event"] != "none":
                     saw_uav_event = True
                     logger.info("Региональное событие БПЛА: %s level=%s source=%s text=%s",
@@ -1297,6 +1444,7 @@ async def check_sources(application):
         save_source_state()
         state["startup_completed"] = True
         save_state()
+        await process_expired_uav_statuses(application)
         await process_due_uav_reminders(application)
 
 
@@ -1326,12 +1474,22 @@ def main_keyboard():
 def format_status():
     level = int(state.get("uav_level", 0))
     locations = state.get("active_locations") or []
+    territories = state.get("uav_territories") or {}
+    stale = [(name, item) for name, item in territories.items()
+             if int(item.get("level", 0)) in (1, 2, 3) and item.get("validity_expired", False)]
     rocket = "🟥 Активна" if state.get("rocket_active") else "🟢 Не объявлена"
     if locations:
         territory_line = "Активные территории: " + html.escape(", ".join(locations))
+        status_line = html.escape(level_title(level))
+    elif stale:
+        status_line = "⏳ Актуальность не подтверждена"
+        territory_line = "Последние известные статусы (уже не считаются актуальными): " + html.escape(", ".join(name for name, _ in sorted(stale)))
     else:
+        status_line = html.escape(level_title(0))
         territory_line = "Активных территорий в сохранённом статусе нет."
-    return ("<b>UAV ALERT — текущий статус</b>\n\n" + html.escape(level_title(level)) +
+    if locations and stale:
+        territory_line += "\nАктуальность не подтверждена для: " + html.escape(", ".join(name for name, _ in sorted(stale)))
+    return ("<b>UAV ALERT — текущий статус</b>\n\n" + status_line +
             f"\n{territory_line}\nПоследнее изменение: {format_time(state.get('last_uav_time'))}\n\n" +
             f"<b>Ракетная опасность:</b> {rocket}\nПоследняя проверка: {format_time(state.get('last_scan_time'))}\n" +
             f"Публикаций в окне: {int(state.get('last_scan_count', 0))}\n\n" +
@@ -1357,7 +1515,7 @@ def format_sources():
     lines = ["<b>📡 Источники мониторинга</b>", ""]
     for info in SOURCES.values():
         lines.append(f'<a href="{html.escape(info["url"], quote=True)}">{html.escape(info["name"])}</a>')
-    lines += ["", "Фильтр событий: Костромская и Ярославская области; для Костромской области также распознаются города, районы и муниципальные округа.",
+    lines += ["", "Фильтр событий: Костромская область; распознаются города, районы и муниципальные округа.",
               "Источники публичные и могут содержать неполную или неподтверждённую информацию."]
     return "\n".join(lines)
 
@@ -1377,7 +1535,7 @@ def is_admin(update):
 
 async def start_command(update, context):
     if update.effective_message:
-        await update.effective_message.reply_text("🚨 <b>UAV ALERT</b>\nГражданский информационный сервис мониторинга публичных сообщений о БПЛА в Костромской и Ярославской областях.\n\nНажми «Подписаться», чтобы получать уведомления. Бот не заменяет официальные оповещения.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
+        await update.effective_message.reply_text("🚨 <b>UAV ALERT</b>\nГражданский информационный сервис мониторинга публичных сообщений о БПЛА в Костромской области.\n\nНажми «Подписаться», чтобы получать уведомления. Бот не заменяет официальные оповещения.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
 
 
 async def subscribe_user(application, user_id):
@@ -1466,7 +1624,7 @@ async def callback_handler(update, context):
     elif data == "status": text = format_status()
     elif data == "history": text = format_history()
     elif data == "sources": text = format_sources()
-    elif data == "help": text = "<b>UAV ALERT</b>\n\nИспользуй кнопки или команды /status, /history, /sources, /subscribe и /unsubscribe.\nФильтр — Костромская и Ярославская области. Бот не заменяет официальные оповещения."
+    elif data == "help": text = "<b>UAV ALERT</b>\n\nИспользуй кнопки или команды /status, /history, /sources, /subscribe и /unsubscribe.\nФильтр — Костромская область. Бот не заменяет официальные оповещения."
     else: text = "Неизвестная команда."
     try:
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
