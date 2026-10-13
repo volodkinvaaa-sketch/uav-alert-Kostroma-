@@ -143,9 +143,6 @@ DEFAULT_STATE = {
     "last_uav_post": None, "last_uav_post_key": None, "last_uav_post_date": None,
     "last_uav_post_text": None,
     "last_uav_event_type": None, "last_uav_notification_key": None,
-    "last_uav_observation_time": None, "last_uav_observation_source": None,
-    "last_uav_observation_post": None, "last_uav_observation_post_key": None,
-    "last_uav_observation_text": None, "last_uav_observation_unconfirmed": False,
     "last_rocket_time": None, "last_rocket_source": None, "last_rocket_post": None,
     "last_rocket_post_key": None, "last_rocket_post_date": None,
     "last_rocket_event_type": None, "last_rocket_notification_key": None,
@@ -675,47 +672,6 @@ def build_uav_push(level, locations, post):
         f"Территория: {html.escape(territory)}\n\n"
         "Информация автоматически собрана из публичных сообщений. Она не заменяет официальные оповещения."
     )
-
-def build_uav_observation_push(locations, post, unconfirmed=False):
-    """Информирует о сообщении о фиксации, не меняя уровень опасности."""
-    territory = ", ".join(locations) if locations else "Костромская область"
-    source_name = html.escape(str(post.get("source_name") or "публичный источник"))
-    url = str(post.get("url") or "")
-    source = (f'<a href="{html.escape(url, quote=True)}">{source_name}</a>' if url else source_name)
-    published = format_time(post.get("date"))
-    qualification = (
-        "Сообщение помечено как требующее подтверждения."
-        if unconfirmed else
-        "Это сообщение из публичного источника, а не официальное подтверждение опасности."
-    )
-    return (
-        "<b>📡 Сообщение о возможной фиксации воздушной цели</b>\n\n"
-        f"Территория: {html.escape(territory)}\n"
-        f"Время публикации: {html.escape(published)}\n"
-        f"Источник: {source}\n\n"
-        f"{qualification} Проверяйте официальные оповещения."
-    )
-
-
-def record_uav_observation(post, event):
-    """Сохраняет региональную фиксацию отдельно от статуса объявленной опасности."""
-    if not event.get("region_match") or not event.get("uav_observation"):
-        return False
-    post_key = post.get("key") or ""
-    if post_key and post_key == state.get("last_uav_observation_post_key"):
-        return False
-    state["last_uav_observation_time"] = post.get("date") or now_msk().isoformat(timespec="seconds")
-    state["last_uav_observation_source"] = post.get("source_name")
-    state["last_uav_observation_post"] = post.get("url")
-    state["last_uav_observation_post_key"] = post_key
-    state["last_uav_observation_text"] = post.get("text", "")
-    state["last_uav_observation_unconfirmed"] = bool(event.get("unconfirmed"))
-    save_state()
-    add_history("uav_observation", "Сообщение о возможной фиксации — " + ", ".join(event.get("locations") or ["Костромская область"]), post)
-    logger.info("Региональная фиксация сохранена отдельно от уровня опасности: region_match=True source=%s text=%s",
-                post.get("source_name"), post.get("text", "")[:180])
-    return True
-
 
 def build_uav_reminder_push(level, locations, post):
     """Информационное напоминание через 10 часов; не объявляет угрозу официально."""
@@ -1605,8 +1561,6 @@ async def check_sources(application):
             latest_uav_event = None
             for post in candidates:
                 event = get_post_event(post)
-                if event.get("region_match") and event.get("uav_observation"):
-                    record_uav_observation(post, event)
                 if event["uav_event"] != "none":
                     latest_uav_event = (post, event)
                 if event.get("uav_observation") or event.get("unconfirmed"):
@@ -1676,14 +1630,6 @@ async def check_sources(application):
             saw_rocket_event = False
             for post in candidates:
                 event = get_post_event(post)
-                if event.get("region_match") and event.get("uav_observation") and event.get("uav_event") == "none":
-                    if record_uav_observation(post, event):
-                        await send_push(
-                            application,
-                            build_uav_observation_push(event.get("locations"), post, event.get("unconfirmed", False)),
-                            "uav_observation", 0, 0, post,
-                            key_override=notification_key("uav_observation", 0, 0, post),
-                        )
                 if event.get("uav_observation") or event.get("unconfirmed"):
                     logger.info("Фильтр публикации: region_match=%s observation=%s unconfirmed=%s source=%s text=%s",
                                 event.get("region_match", False), event.get("uav_observation"),
@@ -1843,33 +1789,17 @@ def format_status():
         status_line = "⏳ Актуальность не подтверждена"
         territory_line = "Последние известные статусы (уже не считаются актуальными): " + html.escape(", ".join(name for name, _ in sorted(stale)))
     elif not state.get("last_uav_time"):
-        # Отсутствие события в сохранённых данных не означает отсутствия угрозы.
-        # Не выдаём обычную фиксацию из публичного источника за объявление опасности.
+        # Не показываем зелёный статус, если в сохранённых данных вообще нет
+        # времени последнего события: отсутствие данных не означает отсутствие угрозы.
         status_line = "⏳ Статус не подтверждён"
-        territory_line = (
-            "В доступных сохранённых данных не найдено явного сообщения об объявлении уровня опасности или об отбое по БПЛА. "
-            "Сообщение о фиксации отображается отдельно и само по себе не устанавливает уровень опасности. "
-            "Проверяйте официальные оповещения."
-        )
+        territory_line = "Не удалось восстановить последнее событие БПЛА из сохранённых данных. Проверяйте официальные оповещения."
     else:
         status_line = html.escape(level_title(0))
         territory_line = "Активных территорий в сохранённом статусе нет."
     if locations and stale:
         territory_line += "\nАктуальность не подтверждена для: " + html.escape(", ".join(name for name, _ in sorted(stale)))
-    observation_time = state.get("last_uav_observation_time")
-    observation_text = state.get("last_uav_observation_text") or ""
-    if observation_time:
-        observation_source = html.escape(str(state.get("last_uav_observation_source") or "публичный источник"))
-        observation_label = "Сообщение требует подтверждения" if state.get("last_uav_observation_unconfirmed") else "Сообщение из публичного источника"
-        territory_line += (
-            "\n\n<b>Последняя фиксация в публикациях:</b> " + html.escape(format_time(observation_time)) +
-            "\n" + observation_label + "; источник: " + observation_source
-        )
-        if observation_text:
-            territory_line += "\nТекст: " + html.escape(str(observation_text)[:220])
-    last_change = format_time(state.get("last_uav_time")) if state.get("last_uav_time") else "нет подтверждённых данных"
     return ("<b>UAV ALERT — текущий статус</b>\n\n" + status_line +
-            f"\n{territory_line}\nПоследнее подтверждённое изменение статуса: {last_change}\n\n" +
+            f"\n{territory_line}\nПоследнее изменение: {format_time(state.get('last_uav_time'))}\n\n" +
             f"<b>Ракетная опасность:</b> {rocket}\nПоследняя проверка: {format_time(state.get('last_scan_time'))}\n" +
             f"Публикаций в окне: {int(state.get('last_scan_count', 0))}\n\n" +
             "<i>Автоматический мониторинг публичных сообщений; не заменяет официальные оповещения.</i>")
