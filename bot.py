@@ -1696,9 +1696,31 @@ async def check_sources(application):
             or has_active_territory_after_scan
         )
         state["status_recovery_checked"] = bool(state_has_uav_event)
+
+        # Диагностика без вывода токенов, персональных данных или полного текста постов.
+        # Помогает отличить пустое состояние от ошибки чтения/сохранения состояния.
+        logger.info(
+            "Диагностика восстановления: uav_level=%s; active_locations_count=%s; "
+            "last_uav_time_present=%s; last_uav_post_key_present=%s; "
+            "active_territories=%s; state_has_uav_event=%s; posts_in_window=%s; candidates=%s",
+            state.get("uav_level", 0),
+            len(state.get("active_locations") or []),
+            bool(state.get("last_uav_time")),
+            bool(state.get("last_uav_post_key")),
+            sum(
+                1 for item in (state.get("uav_territories") or {}).values()
+                if isinstance(item, dict) and int(item.get("level", 0)) > 0
+            ),
+            state_has_uav_event,
+            len(collected),
+            len(candidates),
+        )
+
         if not state_has_uav_event:
             logger.warning(
-                "Восстановление статуса БПЛА не завершено: в окне нет распознанного регионального события; повторим проверку."
+                "Восстановление статуса БПЛА не завершено: "
+                "в сохранённом состоянии нет распознанного регионального события; "
+                "повторим проверку. Отсутствие события не означает, что опасность отменена."
             )
         save_state()
         await process_expired_uav_statuses(application)
