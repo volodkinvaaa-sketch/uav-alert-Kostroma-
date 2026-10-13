@@ -52,12 +52,30 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
 logger = logging.getLogger("uav_alert")
 monitor_task = None
 monitor_lock = None
+PROCESS_STARTED_AT = None  # Заполняется после определения now_msk().
+HEALTH = {
+    "process_started_at": None,
+    "last_monitor_cycle_at": None,
+    "last_successful_scan_at": None,
+    "consecutive_all_source_failures": 0,
+    "total_source_failures": 0,
+    "total_source_successes": 0,
+    "last_error": None,
+    "last_error_at": None,
+    "source_health": {},
+    "admin_alerts": {},
+}
+ADMIN_ALERT_COOLDOWN_SECONDS = env_int("ADMIN_ALERT_COOLDOWN_SECONDS", 900, 60)
 
 # ============================================================
 # FILES / JSON
 # ============================================================
 def now_msk():
     return datetime.now(MSK)
+
+
+PROCESS_STARTED_AT = now_msk().isoformat(timespec="seconds")
+HEALTH["process_started_at"] = PROCESS_STARTED_AT
 
 
 def json_path(filename):
@@ -1284,6 +1302,43 @@ def get_post_event(post, inherited_locations=None):
             "rocket_event": rocket_event, "uav_observation": observation,
             "unconfirmed": unconfirmed}
 
+async def notify_admin_problem(application, key, message, cooldown_seconds=ADMIN_ALERT_COOLDOWN_SECONDS):
+    """Отправляет администратору диагностическое сообщение с защитой от спама."""
+    now = datetime.now(timezone.utc).timestamp()
+    previous = HEALTH["admin_alerts"].get(key, 0)
+    if now - previous < cooldown_seconds:
+        return False
+    HEALTH["admin_alerts"][key] = now
+    try:
+        await application.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"🛠 UAV ALERT — диагностика\n\n{message}\n\nВремя: {format_time(now_msk().isoformat())}",
+            disable_web_page_preview=True,
+        )
+        logger.info("Диагностическое уведомление администратору отправлено: %s", key)
+        return True
+    except Exception:
+        logger.exception("Не удалось отправить диагностику администратору.")
+        return False
+
+
+async def telegram_error_handler(update, context):
+    """Ловит необработанные ошибки обработчиков Telegram и сохраняет их для /status."""
+    error = context.error
+    HEALTH["last_error"] = f"Telegram handler: {type(error).__name__}: {error}"[:500]
+    HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
+    logger.error("Необработанная ошибка Telegram-обработчика", exc_info=(type(error), error, error.__traceback__))
+    try:
+        await notify_admin_problem(
+            context.application,
+            "telegram_handler_error",
+            "Ошибка обработчика Telegram. Бот продолжает работу, но проверь логи Render.\n"
+            + html.escape(HEALTH["last_error"]),
+        )
+    except Exception:
+        logger.exception("Ошибка при обработке диагностического уведомления Telegram.")
+
+
 # ============================================================
 # MONITORING — PROCESS ONLY NEW POSTS; NO REPEATED SPAM
 # ============================================================
@@ -1295,10 +1350,21 @@ async def check_sources(application):
         logger.warning("Предыдущая проверка ещё выполняется.")
         return
     async with monitor_lock:
+        HEALTH["last_monitor_cycle_at"] = now_msk().isoformat(timespec="seconds")
         collected = []
+        successful_sources = 0
+        failed_sources = []
         for source_key, source_info in SOURCES.items():
             try:
                 posts = await asyncio.to_thread(fetch_source, source_key, source_info)
+                successful_sources += 1
+                HEALTH["total_source_successes"] += 1
+                HEALTH["source_health"][source_key] = {
+                    "status": "ok",
+                    "last_success_at": now_msk().isoformat(timespec="seconds"),
+                    "last_error": None,
+                    "posts_returned": len(posts),
+                }
                 for post in posts:
                     published = parse_datetime(post.get("date"))
                     if published is None:
@@ -1306,10 +1372,47 @@ async def check_sources(application):
                     age = now_msk() - published
                     if timedelta(0) <= age <= timedelta(hours=HISTORY_WINDOW_HOURS):
                         collected.append(post)
-            except requests.RequestException:
+            except requests.RequestException as exc:
+                failed_sources.append(source_key)
+                HEALTH["total_source_failures"] += 1
+                HEALTH["source_health"][source_key] = {
+                    "status": "error", "last_error_at": now_msk().isoformat(timespec="seconds"),
+                    "last_error": f"{type(exc).__name__}: {exc}"[:300],
+                }
+                HEALTH["last_error"] = f"Источник {source_key}: {type(exc).__name__}: {exc}"[:500]
+                HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
                 logger.exception("Ошибка запроса к источнику %s", source_key)
-            except Exception:
+            except Exception as exc:
+                failed_sources.append(source_key)
+                HEALTH["total_source_failures"] += 1
+                HEALTH["source_health"][source_key] = {
+                    "status": "error", "last_error_at": now_msk().isoformat(timespec="seconds"),
+                    "last_error": f"{type(exc).__name__}: {exc}"[:300],
+                }
+                HEALTH["last_error"] = f"Обработка источника {source_key}: {type(exc).__name__}: {exc}"[:500]
+                HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
                 logger.exception("Ошибка обработки источника %s", source_key)
+        if successful_sources:
+            HEALTH["last_successful_scan_at"] = now_msk().isoformat(timespec="seconds")
+            HEALTH["consecutive_all_source_failures"] = 0
+            if failed_sources:
+                logger.warning("Часть источников недоступна: %s; успешно: %s/%s", ", ".join(failed_sources), successful_sources, len(SOURCES))
+                await notify_admin_problem(
+                    application, "partial_source_failures",
+                    f"Часть источников мониторинга недоступна.\nУспешно: {successful_sources}/{len(SOURCES)}\nОшибки: {', '.join(failed_sources)}",
+                )
+            elif HEALTH["admin_alerts"].get("all_sources_failed_active"):
+                HEALTH["admin_alerts"].pop("all_sources_failed_active", None)
+                await notify_admin_problem(application, "sources_recovered", "Мониторинг восстановлен: снова удаётся получать данные хотя бы из одного источника.", cooldown_seconds=60)
+        else:
+            HEALTH["consecutive_all_source_failures"] += 1
+            logger.error("Все источники недоступны: цикл подряд №%s", HEALTH["consecutive_all_source_failures"])
+            if HEALTH["consecutive_all_source_failures"] >= 3:
+                HEALTH["admin_alerts"]["all_sources_failed_active"] = True
+                await notify_admin_problem(
+                    application, "all_sources_failed",
+                    f"Не удалось получить данные ни из одного источника {HEALTH['consecutive_all_source_failures']} проверки подряд.\nПроверь доступность Telegram-публичных страниц и логи Render.",
+                )
         unique = {p.get("key"): p for p in collected if p.get("key")}
         collected = sorted(unique.values(), key=lambda p: (parse_datetime(p.get("date")) or datetime.min.replace(tzinfo=MSK), int(p.get("post_id", 0)), p.get("source", "")))
         state["last_scan_time"] = now_msk().isoformat(timespec="seconds")
@@ -1615,7 +1718,12 @@ async def admin_command(update, context):
         return
     await update.effective_message.reply_text("<b>Админ-панель UAV ALERT</b>\n\n" +
         f"Подписчиков: {len(subscribers)}\nСтатус БПЛА: {html.escape(level_title(int(state.get('uav_level', 0))))}\n" +
-        f"Ракетная опасность: {'активна' if state.get('rocket_active') else 'не объявлена'}\nПоследняя проверка: {format_time(state.get('last_scan_time'))}",
+        f"Ракетная опасность: {'активна' if state.get('rocket_active') else 'не объявлена'}\nПоследняя проверка: {format_time(state.get('last_scan_time'))}\n" +
+        f"Последний успешный опрос источников: {format_time(HEALTH.get('last_successful_scan_at'))}\n" +
+        f"Источников с ошибкой: {sum(1 for item in HEALTH.get('source_health', {}).values() if item.get('status') == 'error')}\n" +
+        f"Ошибок источников всего: {HEALTH.get('total_source_failures', 0)}\n" +
+        f"Мониторинг: {'работает' if monitor_task and not monitor_task.done() else 'не запущен'}\n" +
+        f"Последняя ошибка: {html.escape(str(HEALTH.get('last_error') or 'нет данных'))}",
         parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
 
 
@@ -1657,14 +1765,41 @@ app = Flask(__name__)
 def index():
     return jsonify({"service": "UAV ALERT", "status": "running", "monitor_interval_seconds": CHECK_INTERVAL,
                     "history_window_hours": HISTORY_WINDOW_HOURS, "uav_reminder_hours": UAV_REMINDER_HOURS,
-                    "subscribers": len(subscribers),
-                    "channel_id": CHANNEL_ID, "publication_mode": "admin_dm_draft", "last_scan_time": state.get("last_scan_time")}), 200
+                    "subscribers": len(subscribers), "channel_id": CHANNEL_ID,
+                    "publication_mode": "admin_dm_draft", "last_scan_time": state.get("last_scan_time"),
+                    "last_successful_scan_at": HEALTH.get("last_successful_scan_at"),
+                    "consecutive_all_source_failures": HEALTH.get("consecutive_all_source_failures", 0)}), 200
 
 @app.get("/status")
 def health_status():
-    return jsonify({"status": "ok", "uav_level": state.get("uav_level", 0),
-                    "rocket_active": state.get("rocket_active", False), "last_scan_time": state.get("last_scan_time"),
-                    "last_scan_count": state.get("last_scan_count", 0)}), 200
+    last_success = parse_datetime(HEALTH.get("last_successful_scan_at"))
+    seconds_since_success = int((now_msk() - last_success).total_seconds()) if last_success else None
+    stale_after = max(CHECK_INTERVAL * 4, REQUEST_TIMEOUT * max(1, len(SOURCES)) + CHECK_INTERVAL)
+    scan_stale = seconds_since_success is None or seconds_since_success > stale_after
+    monitor_running = bool(monitor_task and not monitor_task.done())
+    all_sources_down = HEALTH.get("consecutive_all_source_failures", 0) >= 3
+    healthy = monitor_running and not scan_stale and not all_sources_down
+    return jsonify({
+        "status": "ok" if healthy else "degraded",
+        "service": "UAV ALERT",
+        "process_started_at": HEALTH.get("process_started_at"),
+        "monitor_running": monitor_running,
+        "monitor_interval_seconds": CHECK_INTERVAL,
+        "last_monitor_cycle_at": HEALTH.get("last_monitor_cycle_at"),
+        "last_scan_time": state.get("last_scan_time"),
+        "last_successful_scan_at": HEALTH.get("last_successful_scan_at"),
+        "seconds_since_successful_scan": seconds_since_success,
+        "stale_after_seconds": stale_after,
+        "consecutive_all_source_failures": HEALTH.get("consecutive_all_source_failures", 0),
+        "source_failures_total": HEALTH.get("total_source_failures", 0),
+        "source_successes_total": HEALTH.get("total_source_successes", 0),
+        "source_health": HEALTH.get("source_health", {}),
+        "last_error": HEALTH.get("last_error"),
+        "last_error_at": HEALTH.get("last_error_at"),
+        "uav_level": state.get("uav_level", 0),
+        "rocket_active": state.get("rocket_active", False),
+        "last_scan_count": state.get("last_scan_count", 0),
+    }), 200
 
 
 def run_flask():
@@ -1718,6 +1853,7 @@ def main():
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
+    application.add_error_handler(telegram_error_handler)
     logger.info("Запускаем Telegram polling.")
     application.run_polling(drop_pending_updates=False, allowed_updates=Update.ALL_TYPES)
 
