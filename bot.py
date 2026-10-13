@@ -1517,14 +1517,15 @@ async def check_sources(application):
             and not state.get("last_uav_post_key")
             and not has_active_territory
         )
-        recover_missing_status = (
-            not bool(state.get("status_recovery_checked"))
-            and uav_state_is_empty
-        )
+        # Повторяем восстановление каждый цикл, пока в сохранённом состоянии
+        # действительно нет ни одного последнего события БПЛА. Старый флаг
+        # status_recovery_checked не должен блокировать восстановление после
+        # сброса/повреждения state.json.
+        recover_missing_status = uav_state_is_empty
         first_scan = not bool(state.get("startup_completed")) or recover_missing_status
         if recover_missing_status and state.get("startup_completed"):
             logger.warning(
-                "Состояние БПЛА пустое при завершённом запуске; один раз восстанавливаем статус по окну публикаций."
+                "Состояние БПЛА пустое при завершённом запуске; повторяем восстановление по окну публикаций."
             )
         candidates = collected if first_scan else [p for p in collected if p.get("key") not in sent_posts]
 
@@ -1677,12 +1678,28 @@ async def check_sources(application):
                                     "last_scan_time": now_msk().isoformat(timespec="seconds")}
         save_source_state()
         state["startup_completed"] = True
-        # При полном сбое источников оставляем восстановление незавершённым:
-        # watchdog/следующий цикл повторит попытку после восстановления доступа.
-        # При хотя бы одном успешном источнике фиксируем завершение проверки,
-        # даже если в доступном окне не было подтверждённого события по региону.
-        if successful_sources > 0:
-            state["status_recovery_checked"] = True
+        # Восстановление считается завершённым только когда состояние содержит
+        # сохранённое событие БПЛА. Сам по себе успешный ответ источника не
+        # подтверждает статус региона. Если события не найдено, оставляем флаг
+        # выключенным и повторяем анализ свежего окна в следующем цикле.
+        territories_after_scan = state.get("uav_territories") or {}
+        has_active_territory_after_scan = any(
+            int(item.get("level", 0)) > 0
+            for item in territories_after_scan.values()
+            if isinstance(item, dict)
+        )
+        state_has_uav_event = (
+            int(state.get("uav_level", 0)) != 0
+            or bool(state.get("active_locations"))
+            or bool(state.get("last_uav_time"))
+            or bool(state.get("last_uav_post_key"))
+            or has_active_territory_after_scan
+        )
+        state["status_recovery_checked"] = bool(state_has_uav_event)
+        if not state_has_uav_event:
+            logger.warning(
+                "Восстановление статуса БПЛА не завершено: в окне нет распознанного регионального события; повторим проверку."
+            )
         save_state()
         await process_expired_uav_statuses(application)
         await process_due_uav_reminders(application)
