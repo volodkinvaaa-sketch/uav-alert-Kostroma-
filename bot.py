@@ -1081,7 +1081,22 @@ async def apply_uav_event(application, new_level, locations, post):
         else:
             targets = [name for name in locations if name in territories and int(territories[name].get("level", 0)) > 0]
         if not targets:
-            logger.info("Отбой найден, но для указанной территории активного статуса нет.")
+            # Даже если бот не видел исходное активное событие (например, после
+            # сброса state.json), распознанный региональный отбой — это событие,
+            # которое нужно сохранить. При этом не рассылаем ложный push об отбое,
+            # поскольку сохранённого активного статуса для отмены не было.
+            state["last_uav_time"] = now
+            state["last_uav_source"] = post.get("source_name")
+            state["last_uav_post"] = post.get("url")
+            state["last_uav_post_key"] = post.get("key")
+            state["last_uav_post_date"] = post.get("date")
+            state["last_uav_post_text"] = post.get("text", "")
+            state["last_uav_event_type"] = "uav_cancel"
+            logger.info(
+                "Отбой по территории распознан и сохранён без push: активного статуса для отмены не было. Территории: %s",
+                ", ".join(locations),
+            )
+            save_state()
             return False
 
         for territory in targets:
@@ -1328,7 +1343,7 @@ def get_post_event(post, inherited_locations=None):
     if not has_kostroma_territory(text):
         return {"locations": [], "uav_event": "none", "uav_level": 0,
                 "rocket_event": "none", "uav_observation": observation,
-                "unconfirmed": unconfirmed}
+                "unconfirmed": unconfirmed, "region_match": False}
 
     locations = find_locations(text)
     if not locations:
@@ -1353,7 +1368,7 @@ def get_post_event(post, inherited_locations=None):
 
     return {"locations": locations, "uav_event": uav_event, "uav_level": uav_level,
             "rocket_event": rocket_event, "uav_observation": observation,
-            "unconfirmed": unconfirmed}
+            "unconfirmed": unconfirmed, "region_match": True}
 
 async def notify_admin_problem(application, key, message, cooldown_seconds=ADMIN_ALERT_COOLDOWN_SECONDS):
     """Отправляет администратору диагностическое сообщение с защитой от спама."""
@@ -1543,12 +1558,15 @@ async def check_sources(application):
 
             before_levels = {territory: int(item.get("level", 0)) for territory, item in effective.items()}
             latest_rocket = None
+            latest_uav_event = None
             for post in candidates:
                 event = get_post_event(post)
+                if event["uav_event"] != "none":
+                    latest_uav_event = (post, event)
                 if event.get("uav_observation") or event.get("unconfirmed"):
-                    logger.info("Фильтр публикации: observation=%s unconfirmed=%s source=%s text=%s",
-                                event.get("uav_observation"), event.get("unconfirmed"),
-                                post.get("source_name"), post.get("text", "")[:180])
+                    logger.info("Фильтр публикации: region_match=%s observation=%s unconfirmed=%s source=%s text=%s",
+                                event.get("region_match", False), event.get("uav_observation"),
+                                event.get("unconfirmed"), post.get("source_name"), post.get("text", "")[:180])
                 if event["uav_event"] != "none":
                     logger.info("Региональное событие БПЛА: %s level=%s source=%s text=%s",
                                 event["uav_event"], event["uav_level"], post.get("source_name"), post.get("text", "")[:180])
@@ -1591,6 +1609,14 @@ async def check_sources(application):
                 saved_item = (state.get("uav_territories") or {}).get(territory, {})
                 if event_post.get("key") and event_post.get("key") != saved_item.get("last_post_key"):
                     await apply_uav_event(application, int(item["level"]), [territory], event_post)
+            # Если в окне есть явный отбой, но он не изменил ни одной сохранённой
+            # территории, всё равно сохраняем факт последнего события. Это не
+            # создаёт push без ранее активного статуса, но убирает ложное
+            # «Статус не подтверждён» после найденного регионального отбоя.
+            if (not changed_territories and latest_uav_event
+                    and latest_uav_event[1].get("uav_event") == "cancel"):
+                cancel_post, cancel_event = latest_uav_event
+                await apply_uav_event(application, 0, cancel_event.get("locations"), cancel_post)
             if not changed_territories:
                 await retry_pending_notifications(application)
             if latest_rocket:
@@ -1605,9 +1631,9 @@ async def check_sources(application):
             for post in candidates:
                 event = get_post_event(post)
                 if event.get("uav_observation") or event.get("unconfirmed"):
-                    logger.info("Фильтр публикации: observation=%s unconfirmed=%s source=%s text=%s",
-                                event.get("uav_observation"), event.get("unconfirmed"),
-                                post.get("source_name"), post.get("text", "")[:180])
+                    logger.info("Фильтр публикации: region_match=%s observation=%s unconfirmed=%s source=%s text=%s",
+                                event.get("region_match", False), event.get("uav_observation"),
+                                event.get("unconfirmed"), post.get("source_name"), post.get("text", "")[:180])
                 if event["uav_event"] != "none":
                     saw_uav_event = True
                     logger.info("Региональное событие БПЛА: %s level=%s source=%s text=%s",
@@ -1651,7 +1677,12 @@ async def check_sources(application):
                                     "last_scan_time": now_msk().isoformat(timespec="seconds")}
         save_source_state()
         state["startup_completed"] = True
-        state["status_recovery_checked"] = True
+        # При полном сбое источников оставляем восстановление незавершённым:
+        # watchdog/следующий цикл повторит попытку после восстановления доступа.
+        # При хотя бы одном успешном источнике фиксируем завершение проверки,
+        # даже если в доступном окне не было подтверждённого события по региону.
+        if successful_sources > 0:
+            state["status_recovery_checked"] = True
         save_state()
         await process_expired_uav_statuses(application)
         await process_due_uav_reminders(application)
