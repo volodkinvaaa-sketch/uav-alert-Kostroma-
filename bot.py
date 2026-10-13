@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 import threading
+import time
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -51,11 +52,18 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("uav_alert")
 monitor_task = None
+monitor_watchdog_task = None
 monitor_lock = None
 PROCESS_STARTED_AT = None  # Заполняется после определения now_msk().
 HEALTH = {
     "process_started_at": None,
     "last_monitor_cycle_at": None,
+    "last_monitor_cycle_finished_at": None,
+    "monitor_cycle_started_monotonic": None,
+    "monitor_cycle_duration_seconds": None,
+    "last_watchdog_check_at": None,
+    "monitor_restarts": 0,
+    "last_monitor_restart_at": None,
     "last_successful_scan_at": None,
     "consecutive_all_source_failures": 0,
     "total_source_failures": 0,
@@ -1327,13 +1335,24 @@ async def telegram_error_handler(update, context):
     error = context.error
     HEALTH["last_error"] = f"Telegram handler: {type(error).__name__}: {error}"[:500]
     HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
+    error_text = str(error)
+    is_polling_conflict = "Conflict" in type(error).__name__ or "terminated by other getUpdates request" in error_text
     logger.error("Необработанная ошибка Telegram-обработчика", exc_info=(type(error), error, error.__traceback__))
     try:
+        if is_polling_conflict:
+            diagnostic = (
+                "Telegram сообщил о конфликте getUpdates: вероятно, запущено больше одного экземпляра бота "
+                "с одним токеном или одновременно включён webhook. Оставь только один работающий экземпляр "
+                "и проверь настройки запуска Render.\n\nОшибка: " + html.escape(HEALTH["last_error"])
+            )
+            alert_key = "telegram_getupdates_conflict"
+        else:
+            diagnostic = "Ошибка обработчика Telegram. Проверь логи Render.\n\n" + html.escape(HEALTH["last_error"])
+            alert_key = "telegram_handler_error"
         await notify_admin_problem(
             context.application,
-            "telegram_handler_error",
-            "Ошибка обработчика Telegram. Бот продолжает работу, но проверь логи Render.\n"
-            + html.escape(HEALTH["last_error"]),
+            alert_key,
+            diagnostic,
         )
     except Exception:
         logger.exception("Ошибка при обработке диагностического уведомления Telegram.")
@@ -1351,6 +1370,7 @@ async def check_sources(application):
         return
     async with monitor_lock:
         HEALTH["last_monitor_cycle_at"] = now_msk().isoformat(timespec="seconds")
+        HEALTH["monitor_cycle_started_monotonic"] = time.monotonic()
         collected = []
         successful_sources = 0
         failed_sources = []
@@ -1565,6 +1585,10 @@ async def check_sources(application):
         save_state()
         await process_expired_uav_statuses(application)
         await process_due_uav_reminders(application)
+        HEALTH["last_monitor_cycle_finished_at"] = now_msk().isoformat(timespec="seconds")
+        started = HEALTH.get("monitor_cycle_started_monotonic")
+        HEALTH["monitor_cycle_duration_seconds"] = round(time.monotonic() - started, 2) if started else None
+        HEALTH["monitor_cycle_started_monotonic"] = None
 
 
 async def monitor_loop(application):
@@ -1575,9 +1599,69 @@ async def monitor_loop(application):
         except asyncio.CancelledError:
             logger.info("Мониторинг остановлен.")
             raise
-        except Exception:
+        except Exception as exc:
+            HEALTH["last_error"] = f"Цикл мониторинга: {type(exc).__name__}: {exc}"[:500]
+            HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
+            HEALTH["last_monitor_cycle_finished_at"] = now_msk().isoformat(timespec="seconds")
+            HEALTH["monitor_cycle_started_monotonic"] = None
             logger.exception("Ошибка цикла мониторинга.")
+            try:
+                await notify_admin_problem(
+                    application, "monitor_cycle_error",
+                    "Ошибка цикла мониторинга. Следующая попытка будет выполнена автоматически.\n"
+                    + html.escape(HEALTH["last_error"]),
+                )
+            except Exception:
+                logger.exception("Не удалось отправить диагностику ошибки цикла.")
         await asyncio.sleep(CHECK_INTERVAL)
+
+
+async def monitor_watchdog_loop(application):
+    """Следит, чтобы задача мониторинга не завершилась и не зависла незаметно."""
+    global monitor_task
+    logger.info("Watchdog мониторинга запущен.")
+    while True:
+        try:
+            HEALTH["last_watchdog_check_at"] = now_msk().isoformat(timespec="seconds")
+            if monitor_task is None or monitor_task.done():
+                old_task = monitor_task
+                if old_task is not None and old_task.done() and not old_task.cancelled():
+                    try:
+                        exception = old_task.exception()
+                    except Exception as exc:
+                        exception = exc
+                    if exception:
+                        HEALTH["last_error"] = f"Задача мониторинга завершилась: {type(exception).__name__}: {exception}"[:500]
+                        HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
+                monitor_task = asyncio.create_task(monitor_loop(application), name="uav-alert-monitor-restarted")
+                HEALTH["monitor_restarts"] = int(HEALTH.get("monitor_restarts", 0)) + 1
+                HEALTH["last_monitor_restart_at"] = now_msk().isoformat(timespec="seconds")
+                logger.error("Watchdog перезапустил задачу мониторинга (всего перезапусков: %s).", HEALTH["monitor_restarts"])
+                await notify_admin_problem(
+                    application, "monitor_worker_restarted",
+                    "Задача мониторинга была остановлена и автоматически запущена повторно.\n"
+                    + html.escape(str(HEALTH.get("last_error") or "Причина неизвестна.")),
+                )
+            started = HEALTH.get("monitor_cycle_started_monotonic")
+            if started is not None:
+                elapsed = time.monotonic() - float(started)
+                slow_limit = max(REQUEST_TIMEOUT * max(1, len(SOURCES)) + CHECK_INTERVAL, 120)
+                if elapsed > slow_limit:
+                    await notify_admin_problem(
+                        application, "monitor_cycle_slow",
+                        f"Проверка источников выполняется дольше обычного: {int(elapsed)} сек.\n"
+                        f"Порог диагностики: {slow_limit} сек. Новые параллельные проверки не запускаются, "
+                        "чтобы не создавать дубликаты запросов.",
+                    )
+            await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            logger.info("Watchdog мониторинга остановлен.")
+            raise
+        except Exception as exc:
+            HEALTH["last_error"] = f"Watchdog: {type(exc).__name__}: {exc}"[:500]
+            HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
+            logger.exception("Ошибка watchdog мониторинга.")
+            await asyncio.sleep(15)
 
 # ============================================================
 # KEYBOARD / STATUS / HISTORY
@@ -1771,6 +1855,7 @@ def index():
                     "consecutive_all_source_failures": HEALTH.get("consecutive_all_source_failures", 0)}), 200
 
 @app.get("/status")
+@app.get("/health")
 def health_status():
     last_success = parse_datetime(HEALTH.get("last_successful_scan_at"))
     seconds_since_success = int((now_msk() - last_success).total_seconds()) if last_success else None
@@ -1786,6 +1871,11 @@ def health_status():
         "monitor_running": monitor_running,
         "monitor_interval_seconds": CHECK_INTERVAL,
         "last_monitor_cycle_at": HEALTH.get("last_monitor_cycle_at"),
+        "last_monitor_cycle_finished_at": HEALTH.get("last_monitor_cycle_finished_at"),
+        "monitor_cycle_duration_seconds": HEALTH.get("monitor_cycle_duration_seconds"),
+        "last_watchdog_check_at": HEALTH.get("last_watchdog_check_at"),
+        "monitor_restarts": HEALTH.get("monitor_restarts", 0),
+        "last_monitor_restart_at": HEALTH.get("last_monitor_restart_at"),
         "last_scan_time": state.get("last_scan_time"),
         "last_successful_scan_at": HEALTH.get("last_successful_scan_at"),
         "seconds_since_successful_scan": seconds_since_success,
@@ -1809,7 +1899,7 @@ def run_flask():
 # APPLICATION LIFECYCLE / MAIN
 # ============================================================
 async def post_init(application):
-    global monitor_task
+    global monitor_task, monitor_watchdog_task
     commands = [BotCommand("start", "Главное меню"), BotCommand("subscribe", "Подписаться"),
                 BotCommand("unsubscribe", "Отписаться"), BotCommand("status", "Текущий статус"),
                 BotCommand("history", "История событий"), BotCommand("sources", "Источники"),
@@ -1820,21 +1910,24 @@ async def post_init(application):
     except TelegramError:
         logger.exception("Не удалось установить команды Telegram.")
     monitor_task = asyncio.create_task(monitor_loop(application), name="uav-alert-monitor")
-    logger.info("UAV ALERT готов к работе.")
+    monitor_watchdog_task = asyncio.create_task(monitor_watchdog_loop(application), name="uav-alert-watchdog")
+    logger.info("UAV ALERT готов к работе. Запущены мониторинг и watchdog.")
 
 
 async def post_shutdown(application):
-    global monitor_task
+    global monitor_task, monitor_watchdog_task
     logger.info("UAV ALERT завершает работу.")
-    if monitor_task and not monitor_task.done():
-        monitor_task.cancel()
-        try:
-            await monitor_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("Ошибка при остановке мониторинга.")
+    for task in (monitor_watchdog_task, monitor_task):
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Ошибка при остановке фоновой задачи %s.", task.get_name())
     monitor_task = None
+    monitor_watchdog_task = None
 
 
 def main():
