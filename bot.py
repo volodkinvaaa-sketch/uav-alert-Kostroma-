@@ -401,66 +401,67 @@ CANCEL_RE = re.compile(
     r"\b(?:отбой|отмен\w*|снят\w*|снята|снято|прекращен\w*|"
     r"опасност\w*\s+больше\s+нет|угроз\w*\s+больше\s+нет|"
     r"больше\s+не\s+актуальн\w*)\b", re.I)
-PERSIST_RE = re.compile(r"\b(?:сохраня\w*|действу\w*|продолжа\w*|остает\w*|остаетс\w*)\b", re.I)
+PERSIST_RE = re.compile(
+    r"\b(?:сохраня\w*|действу\w*|продолжа\w*|остает\w*|остаетс\w*|"
+    r"не\s+снят\w*|не\s+отменен\w*|не\s+отменён\w*)\b", re.I)
 
-# Отдельно распознаём сообщения о наблюдении/фиксации. Сама по себе фиксация
-# не означает, что официально объявлена опасность, поэтому этот фильтр не меняет статус.
-UAV_OBSERVATION_RE = re.compile(
-    r"\b(?:фиксаци\w*|зафиксирован\w*|обнаружен\w*|замечен\w*|"
-    r"наблюда\w*|видел\w*|заметил\w*|пролет\w*|пролетел\w*|"
-    r"пролетает|появлен\w*|визуальн\w*\s+контакт\w*)\b", re.I)
-
-# Только явные формулировки о неподтверждённости. Не используем общие слова
-# вроде «сообщают» или «предварительно», чтобы не отбрасывать все новости подряд.
-UNCONFIRMED_RE = re.compile(
-    r"(?:\bне\s+подтвержд\w*\b|\bне\s+подтверждён\w*\b|"
-    r"\bне\s+имеет\s+подтвержден\w*\b|\bне\s+имеет\s+подтверждён\w*\b|"
-    r"\bнеподтвержд[её]нн\w*\b|\bофициальн\w*\s+подтвержден\w*\s+нет\b|"
-    r"\bофициальн\w*\s+подтвержд[её]ни\w*\s+нет\b|"
-    r"\bпроверя\w*\s+(?:информаци\w*|сообщени\w*)\b|"
-    r"\bданн\w*\s+уточня\w*\b)", re.I)
-
-
-def detect_uav_observation(text):
-    """True для сообщений о предполагаемой/сообщаемой фиксации воздушной цели."""
-    value = normalize_text(text)
-    return contains_uav(value) and bool(UAV_OBSERVATION_RE.search(value))
-
-
-def is_unconfirmed_message(text):
-    """True только для явно обозначенных как неподтверждённые сообщений."""
-    return bool(UNCONFIRMED_RE.search(normalize_text(text)))
+UAV_CANCEL_CONTEXT_RE = re.compile(
+    r"\b(?:бпла\b|беспилот\w*|дрон\w*|мвш\b|мрш\b|малоразмерн\w*\s+"
+    r"(?:разведывательн\w*\s+)?воздушн\w*\s+шар\w*|воздушн\w*\s+цел\w*)", re.I)
+ROCKET_CANCEL_CONTEXT_RE = re.compile(
+    r"\b(?:ракетн\w*\s+(?:опасност\w*|тревог\w*)|ракет\w*\s+опасност\w*|"
+    r"угроз\w*\s+ракетн\w*)", re.I)
 
 
 def detect_cancel(text):
+    """Общий признак отмены; сам по себе не определяет, какой статус отменён."""
     return bool(CANCEL_RE.search(normalize_text(text)))
+
+
+def _event_clauses(text):
+    """Разделяет сообщение на смысловые части, чтобы не смешивать разные угрозы."""
+    value = normalize_text(text)
+    return [part.strip() for part in re.split(r"[.!?;\n,]+", value) if part.strip()]
+
+
+def _has_target_cancel(text, target_re):
+    """Проверяет отмену именно целевого события внутри одной части сообщения."""
+    for clause in _event_clauses(text):
+        if not CANCEL_RE.search(clause) or not target_re.search(clause):
+            continue
+        # Отрицание отмены или указание, что статус сохраняется, не является отбоем.
+        direct_cancel = re.search(
+            r"(?:\b(?:отбой|отмен\w*|снят\w*|прекращен\w*)\b.{0,70}"
+            r"(?:бпла\b|беспилот\w*|дрон\w*|мвш\b|мрш\b|ракет\w*|опасност\w*|угроз\w*)|"
+            r"(?:бпла\b|беспилот\w*|дрон\w*|мвш\b|мрш\b|ракет\w*|опасност\w*|угроз\w*)"
+            r".{0,70}\b(?:отбой|отмен\w*|снят\w*|прекращен\w*)\b)", clause)
+        if re.search(r"\bне\s+(?:объявля\w*|было|подтвержд\w*|снят\w*|отмен\w*|прекращен\w*)\b", clause):
+            continue
+        if PERSIST_RE.search(clause) and not direct_cancel:
+            continue
+        if direct_cancel or not PERSIST_RE.search(clause):
+            return True
+    return False
 
 
 def detect_rocket_cancel(text):
     value = normalize_text(text)
-    return detect_cancel(value) and bool(re.search(r"\bракет\w*\b", value))
+    if not contains_rocket(value):
+        return False
+    return _has_target_cancel(value, ROCKET_CANCEL_CONTEXT_RE)
 
 
 def detect_uav_cancel(text):
     value = normalize_text(text)
-    if not detect_cancel(value) or not contains_uav(value):
+    if not contains_uav(value):
         return False
-    # A general cancellation word is not enough if the same text says the threat continues.
-    if PERSIST_RE.search(value) and not re.search(r"\b(?:отбой|отмен\w*|снят\w*|прекращен\w*)\b", value):
-        return False
-    if detect_rocket_cancel(value) and not re.search(r"\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш)\b.{0,100}\b(?:отбой|отмен\w*|снят\w*)\b", value):
-        return False
-    return True
-
+    return _has_target_cancel(value, UAV_CANCEL_CONTEXT_RE)
 
 def detect_uav_level(text):
     value = normalize_text(text)
     if detect_uav_cancel(value):
         return 0
     if not contains_uav(value):
-        return 0
-    # Do not interpret an old event mentioned in a cancellation / retrospective report as active.
-    if detect_cancel(value):
         return 0
     # Require an explicit status phrase near the UAV context, not just unrelated words elsewhere.
     patterns = [
@@ -471,15 +472,30 @@ def detect_uav_level(text):
         (1, r"\b(?:внимание|желт\w*\s+уровен\w*)\b.{0,100}\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b"),
         (1, r"\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b.{0,100}\bвнимание\b"),
     ]
-    for level, pattern in patterns:
-        if re.search(pattern, value):
-            return level
-    return 0
+    # Match status and target only inside the same clause. This prevents
+    # "отбой ракетной опасности, угроза БПЛА сохраняется" from becoming
+    # a red UAV danger merely because the word "опасность" is in the first clause.
+    detected_levels = []
+    for clause in _event_clauses(value):
+        if _has_target_cancel(clause, UAV_CANCEL_CONTEXT_RE):
+            continue
+        for level, pattern in patterns:
+            if re.search(pattern, clause):
+                detected_levels.append(level)
+                break
+    return max(detected_levels, default=0)
 
 
 def detect_rocket(text):
     value = normalize_text(text)
-    return contains_rocket(value) and not detect_rocket_cancel(value)
+    if not contains_rocket(value) or detect_rocket_cancel(value):
+        return False
+    # A rocket cancellation elsewhere in the message must not cancel a separately stated
+    # active rocket status; a cancellation of UAV danger is unrelated to rockets.
+    for clause in _event_clauses(value):
+        if ROCKET_CANCEL_CONTEXT_RE.search(clause) and PERSIST_RE.search(clause):
+            return True
+    return bool(ROCKET_CONTEXT_RE.search(value))
 
 # ============================================================
 # FETCH POSTS
