@@ -612,16 +612,32 @@ def detect_uav_level(text):
     return max(detected_levels, default=0)
 
 
+ROCKET_NEGATION_RE = re.compile(
+    r"(?:\b(?:не\s+(?:объявлен\w*|введен\w*|действу\w*|подтвержден\w*)|"
+    r"отсутству\w*|нет|не\s+действу\w*|не\s+активн\w*)\b|"
+    r"\b(?:пока\s+)?ракетн\w*\s+(?:опасност\w*|тревог\w*)\s+нет\b)", re.I)
+
+
 def detect_rocket(text):
+    """Определяет именно активную ракетную опасность, не принимая отрицания за объявление."""
     value = normalize_text(text)
-    if not contains_rocket(value) or detect_rocket_cancel(value):
+    if not contains_rocket(value):
         return False
-    # A rocket cancellation elsewhere in the message must not cancel a separately stated
-    # active rocket status; a cancellation of UAV danger is unrelated to rockets.
     for clause in _event_clauses(value):
-        if ROCKET_CANCEL_CONTEXT_RE.search(clause) and PERSIST_RE.search(clause):
-            return True
-    return bool(ROCKET_CONTEXT_RE.search(value))
+        if not ROCKET_CONTEXT_RE.search(clause):
+            continue
+        # «Отбой ...» не является активной опасностью, кроме случая, когда в той же
+        # части явно сказано, что опасность сохраняется.
+        if _has_target_cancel(clause, ROCKET_CANCEL_CONTEXT_RE):
+            if PERSIST_RE.search(clause):
+                return True
+            continue
+        if ROCKET_NEGATION_RE.search(clause):
+            continue
+        # Контекст ракетной опасности в отдельной фразе обычно является заголовком
+        # сообщения об объявлении/действии опасности. Отрицания выше отсекаются.
+        return True
+    return False
 
 # ============================================================
 # FETCH POSTS
@@ -1574,6 +1590,33 @@ def cancel_is_specific_to_kostroma(text):
     return True
 
 
+def rocket_event_is_specific_to_kostroma(text):
+    """Для ракетного события не переносит общий список регионов на Костромскую область."""
+    value = normalize_text(text)
+    region_mentions = list(re.finditer(r"\b[а-яё-]+\s+област[ьи]\b", value, re.I))
+    if len(region_mentions) <= 1:
+        return True
+
+    # Явная территориальная привязка рядом с формулировкой ракетного события.
+    rocket_mentions = list(ROCKET_CONTEXT_RE.finditer(value))
+    for event_match in rocket_mentions:
+        left = max(0, event_match.start() - 120)
+        right = min(len(value), event_match.end() + 160)
+        nearby = value[left:right]
+        if re.search(r"\b(?:в|по|для)\s+костромск\w*\s+област\w*\b", nearby):
+            return True
+        # В конструкции «Костромская область — объявлена ракетная опасность»
+        # регион должен быть ближайшим к формулировке события, а не просто где-то в списке.
+        prior_regions = [m for m in region_mentions if m.start() < event_match.start()]
+        if prior_regions and "костром" in prior_regions[-1].group(0):
+            return True
+        # При порядке слов «ракетная опасность ... в Костромской области» проверяем и хвост.
+        after = value[event_match.end():event_match.end() + 160]
+        if re.search(r"\bкостромск\w*\s+област\w*\b", after):
+            return True
+    return False
+
+
 def get_post_event(post, inherited_locations=None):
     text = post.get("text", "")
     # Флаги фиксации и неподтверждённости доступны отдельно от статуса опасности.
@@ -1621,11 +1664,20 @@ def get_post_event(post, inherited_locations=None):
             if uav_level > 0 and not unconfirmed:
                 uav_event = "active"
 
-    # Явно неподтверждённые сообщения не меняют активный статус ни по БПЛА, ни по ракетам.
+    # Ракетный статус меняется только по явно территориальному сообщению.
+    # При нескольких перечисленных областях общая фраза «ракетная опасность/отбой»
+    # не применяется к Костромской области без близкой и однозначной привязки.
     if unconfirmed:
         rocket_event = "none"
+    elif not rocket_event_is_specific_to_kostroma(text):
+        rocket_event = "none"
+        logger.info("Неоднозначное ракетное событие без привязки к Костромской области пропущено: %s", text[:220])
+    elif detect_rocket(text):
+        rocket_event = "active"
+    elif detect_rocket_cancel(text):
+        rocket_event = "cancel"
     else:
-        rocket_event = "cancel" if detect_rocket_cancel(text) else ("active" if detect_rocket(text) else "none")
+        rocket_event = "none"
 
     uav_fixation = (uav_event == "none" and detect_uav_fixation(text))
     return {"locations": locations, "uav_event": uav_event, "uav_level": uav_level,
