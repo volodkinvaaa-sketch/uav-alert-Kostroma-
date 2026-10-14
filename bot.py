@@ -36,7 +36,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = env_int("ADMIN_ID", 1421675956, 1)
 PORT = env_int("PORT", 10000, 1)
 CHECK_INTERVAL = env_int("CHECK_INTERVAL", 30, 15)
-HISTORY_WINDOW_HOURS = env_int("HISTORY_WINDOW_HOURS", 5, 1)
+HISTORY_WINDOW_HOURS = 5  # Жёсткое окно актуальности публикаций и статусов: 5 часов.
 UAV_REMINDER_HOURS = env_int("UAV_REMINDER_HOURS", 10, 1)
 REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 15, 5)
 SOURCE_LIMIT = env_int("SOURCE_LIMIT", 100, 30)
@@ -481,7 +481,9 @@ def detect_uav_fixation(text):
 
 CANCEL_RE = re.compile(
     r"\b(?:отбой|отмен\w*|снят\w*|снята|снято|прекращен\w*|"
+    r"аннулирован\w*|сигнал\s+(?:отмен[её]н\w*|снят\w*)|"
     r"опасност\w*\s+больше\s+нет|угроз\w*\s+больше\s+нет|"
+    r"опасност\w*\s+миновал\w*|угроз\w*\s+миновал\w*|"
     r"больше\s+не\s+актуальн\w*)\b", re.I)
 PERSIST_RE = re.compile(
     r"\b(?:сохраня\w*|действу\w*|продолжа\w*|остает\w*|остаетс\w*|"
@@ -546,14 +548,21 @@ def detect_uav_level(text):
     if not contains_uav(value):
         return 0
     # Require an explicit status phrase near the UAV context, not just unrelated words elsewhere.
-    patterns = [
-        (3, r"\b(?:опасност\w*|объявлен\w*\s+опасност\w*|красн\w*\s+уровен\w*|тревог\w*)\b.{0,100}\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b"),
-        (3, r"\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b.{0,100}\b(?:опасност\w*|тревог\w*)\b"),
-        (2, r"\b(?:угроз\w*|оранжев\w*\s+уровен\w*)\b.{0,100}\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b"),
-        (2, r"\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b.{0,100}\bугроз\w*\b"),
-        (1, r"\b(?:внимани\w*|желт\w*\s+уровен\w*)\b.{0,100}\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b"),
-        (1, r"\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b.{0,100}\bвнимани\w*\b"),
+    # Поддерживаем оба порядка слов: «опасность по БПЛА» и «БПЛА — опасность».
+    # Допускаем расширенные формулировки «угроза атаки беспилотников» и
+    # «внимание, беспилотная опасность», но статус ищем только внутри одной фразы.
+    target = r"(?:бпла\b|беспилот\w*|дрон\w*|мвш\b|мрш\b|мрлс\b|мрл\b)"
+    status_patterns = [
+        (3, r"(?:опасност\w*|объявлен\w*\s+опасност\w*|красн\w*\s+уровен\w*|тревог\w*)"),
+        (2, r"(?:угроз\w*|оранжев\w*\s+уровен\w*)"),
+        (1, r"(?:внимани\w*|желт\w*\s+уровен\w*)"),
     ]
+    patterns = []
+    for level, status in status_patterns:
+        patterns.extend([
+            (level, rf"\b{status}\b.{{0,140}}\b{target}\b"),
+            (level, rf"\b{target}\b.{{0,140}}\b{status}\b"),
+        ])
     # Match status and target only inside the same clause. This prevents
     # "отбой ракетной опасности, угроза БПЛА сохраняется" from becoming
     # a red UAV danger merely because the word "опасность" is in the first clause.
@@ -1545,8 +1554,16 @@ async def check_sources(application):
                     if published is None:
                         continue
                     age = now_msk() - published
-                    if timedelta(0) <= age <= timedelta(hours=HISTORY_WINDOW_HOURS):
+                    # Только публикации не старше 5 часов участвуют в восстановлении
+                    # статуса и обработке событий. Будущие/ошибочно датированные посты
+                    # пропускаются, чтобы они не продлевали актуальность статуса.
+                    if timedelta(0) <= age <= timedelta(hours=5):
                         collected.append(post)
+                    else:
+                        logger.debug(
+                            "Публикация вне окна актуальности 5 ч. пропущена: source=%s date=%s age=%s",
+                            source_key, post.get("date"), age,
+                        )
             except requests.RequestException as exc:
                 failed_sources.append(source_key)
                 HEALTH["total_source_failures"] += 1
