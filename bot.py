@@ -146,7 +146,8 @@ DEFAULT_STATE = {
     "last_rocket_time": None, "last_rocket_source": None, "last_rocket_post": None,
     "last_rocket_post_key": None, "last_rocket_post_date": None,
     "last_rocket_event_type": None, "last_rocket_notification_key": None,
-    "startup_completed": False, "last_scan_time": None, "last_scan_count": 0,
+    "startup_completed": False, "status_recovery_checked": False,
+    "last_scan_time": None, "last_scan_count": 0,
 }
 state = load_json(STATE_FILE, DEFAULT_STATE.copy())
 if not isinstance(state, dict):
@@ -341,14 +342,16 @@ AREA_STEMS = [
 
 AREA_PATTERNS = []
 for stem, adjective in AREA_STEMS:
-    # Название с явным словом «район».
+    # Районы и муниципальные районы: «Нерехтский район»,
+    # «Костромской муниципальный район».
     AREA_PATTERNS.append((
-        rf"\b{stem}\w*\s+район\w*",
+        rf"\b{stem}\w*\s+(?:муниципальн\w*\s+)?район\w*",
         f"Район: {adjective} район",
     ))
-    # Муниципальные округа, включая краткую форму «Нейский округ».
+    # Муниципальные и городские округа: «Нейский муниципальный округ»,
+    # «Шарьинский городской округ», а также краткая форма «Нейский округ».
     AREA_PATTERNS.append((
-        rf"\b{stem}\w*\s+(?:муниципальн\w*\s+)?округ\w*",
+        rf"\b{stem}\w*\s+(?:(?:муниципальн\w*|городск\w*)\s+)?округ\w*",
         f"Муниципальный округ: {adjective} муниципальный округ",
     ))
 
@@ -423,6 +426,59 @@ ROCKET_CONTEXT_RE = re.compile(
 def contains_uav(text): return bool(UAV_CONTEXT_RE.search(normalize_text(text)))
 def contains_rocket(text): return bool(ROCKET_CONTEXT_RE.search(normalize_text(text)))
 
+# Эти два определения обязательны: get_post_event() вызывает их при каждой
+# обработке публикации. Без них цикл мониторинга завершался с NameError.
+UAV_OBSERVATION_RE = re.compile(
+    r"\b(?:фиксаци\w*|зафиксирован\w*|обнаружен\w*|замечен\w*|"
+    r"наблюда\w*|видел\w*|заметил\w*|прол[её]т\w*|"
+    r"появлен\w*|визуальн\w*\s+контакт\w*|в\s+небе)\b", re.I)
+
+UNCONFIRMED_RE = re.compile(
+    r"(?:\bне\s+подтвержд\w*\b|\bнеподтвержд[её]нн\w*\b|"
+    r"\bофициальн\w*\s+подтвержден\w*\s+нет\b|"
+    r"\bофициальн\w*\s+подтвержд[её]ни\w*\s+нет\b|"
+    r"\bинформац\w*\s+требует\s+подтвержден\w*\b|"
+    r"\bданн\w*\s+не\s+подтвержден\w*\b|"
+    r"\bсообщени\w*\s+не\s+подтвержден\w*\b|"
+    r"\bпока\s+не\s+подтвержден\w*\b|"
+    r"\bпроверя\w*\s+(?:информаци\w*|сообщени\w*)\b|"
+    r"\bданн\w*\s+уточня\w*\b)", re.I)
+
+
+def detect_uav_observation(text):
+    """Определяет сообщение о фиксации воздушной цели; не меняет статус опасности."""
+    value = normalize_text(text)
+    return contains_uav(value) and bool(UAV_OBSERVATION_RE.search(value))
+
+
+def is_unconfirmed_message(text):
+    """True только при явной пометке о неподтверждённости информации."""
+    return bool(UNCONFIRMED_RE.search(normalize_text(text)))
+
+
+FIXATION_NEGATION_RE = re.compile(
+    r"(?:\bне\s+(?:был\w*\s+)?(?:зафиксирован\w*|обнаруж\w*|"
+    r"замечен\w*|наблюда\w*)|"
+    r"\bфиксаци\w*.{0,80}\bне\s+(?:было|подтвержден\w*|подтвердил\w*)|"
+    r"\bне\s+подтвержден\w*.{0,80}\bфиксаци\w*|"
+    r"\b(?:информаци\w*|сообщени\w*|сведени\w*).{0,100}"
+    r"\bне\s+(?:подтвержден\w*|подтвердил\w*|было)\b|"
+    r"\bложн\w*\s+(?:сообщени\w*|информаци\w*)\b)", re.I)
+
+
+def detect_uav_fixation(text):
+    """Определяет сообщение о фиксации отдельно от статуса опасности."""
+    value = normalize_text(text)
+    if not contains_uav(value):
+        return False
+    # Отбой и формулировки отрицания никогда не становятся сообщением о фиксации.
+    if detect_uav_cancel(value) or detect_cancel(value) or FIXATION_NEGATION_RE.search(value):
+        return False
+    # Сообщения со статусом опасности идут по обычной логике статусов.
+    if detect_uav_level(value) > 0:
+        return False
+    return detect_uav_observation(value)
+
 CANCEL_RE = re.compile(
     r"\b(?:отбой|отмен\w*|снят\w*|снята|снято|прекращен\w*|"
     r"опасност\w*\s+больше\s+нет|угроз\w*\s+больше\s+нет|"
@@ -495,8 +551,8 @@ def detect_uav_level(text):
         (3, r"\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b.{0,100}\b(?:опасност\w*|тревог\w*)\b"),
         (2, r"\b(?:угроз\w*|оранжев\w*\s+уровен\w*)\b.{0,100}\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b"),
         (2, r"\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b.{0,100}\bугроз\w*\b"),
-        (1, r"\b(?:внимание|желт\w*\s+уровен\w*)\b.{0,100}\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b"),
-        (1, r"\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b.{0,100}\bвнимание\b"),
+        (1, r"\b(?:внимани\w*|желт\w*\s+уровен\w*)\b.{0,100}\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b"),
+        (1, r"\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b.{0,100}\bвнимани\w*\b"),
     ]
     # Match status and target only inside the same clause. This prevents
     # "отбой ракетной опасности, угроза БПЛА сохраняется" from becoming
@@ -625,6 +681,73 @@ def uav_category_label(post):
     return "БПЛА"
 
 
+def build_uav_fixation_push(locations, post):
+    """Нейтральное уведомление о публичном сообщении; статус опасности не меняет."""
+    territory = ", ".join(locations) if locations else "Костромская область"
+    category = html.escape(uav_category_label(post))
+    published = html.escape(format_time(post.get("date")) or "время неизвестно")
+    source_name = html.escape(str(post.get("source_name") or "Публичный источник"))
+    source_url = str(post.get("url") or "")
+    source_line = f"Источник: {source_name}"
+    if source_url.startswith("https://t.me/"):
+        source_line = f'Источник: <a href="{html.escape(source_url, quote=True)}">{source_name}</a>'
+    return (
+        "<b>ℹ️ Сообщение о фиксации воздушной цели</b>\n\n"
+        f"Территория: {html.escape(territory)}\n"
+        f"Категория: {category}\n"
+        f"Время публикации: {published}\n"
+        f"{source_line}\n\n"
+        "В публичном сообщении обнаружена информация о фиксации. "
+        "Независимое подтверждение отсутствует. Информация не заменяет официальные оповещения."
+    )
+
+
+def build_uav_fixation_draft(locations, post):
+    """Черновик администратору о фиксации, без объявления тревоги."""
+    territory = region_label_for_locations(locations, post)
+    category = uav_category_label(post)
+    published = format_time(post.get("date")) or "время неизвестно"
+    source_url = str(post.get("url") or "")
+    lines = [
+        "🛰 UAV ALERT",
+        "ℹ️ Сообщение о фиксации воздушной цели",
+        f"📍 Территория: {territory}",
+        f"Категория: {category}",
+        f"Время публикации: {published}",
+    ]
+    if source_url.startswith("https://t.me/"):
+        lines.append(f"Проверить публикацию: {source_url}")
+    lines.extend([
+        "",
+        "В публичном сообщении обнаружена информация о фиксации.",
+        "Независимое подтверждение отсутствует.",
+        "Информация собрана из публичных сообщений и не заменяет официальные оповещения.",
+    ])
+    return "\n".join(lines)
+
+
+async def apply_uav_fixation_event(application, locations, post):
+    """Рассылает фиксацию независимо от статуса и не меняет состояние опасности."""
+    key = notification_key("uav_fixation", 0, 0, post)
+    push_record = notification_events.get(key, {})
+    draft_record = admin_drafts.get(key, {})
+
+    # История добавляется только один раз, даже если повторяется доставка.
+    if not push_record and not draft_record:
+        add_history("uav_fixation", "Сообщение о фиксации воздушной цели", post)
+
+    if not push_record.get("sent"):
+        await send_push(
+            application, build_uav_fixation_push(locations, post),
+            "uav_fixation", 0, 0, post, key_override=key,
+        )
+    if not draft_record.get("sent"):
+        await send_admin_post_draft(
+            application, build_uav_fixation_draft(locations, post),
+            "uav_fixation", 0, 0, post, key_override=key,
+        )
+
+
 def uav_level_title_for_post(level, post):
     category = uav_category_label(post)
     titles = {
@@ -732,12 +855,16 @@ async def send_push(application, message, event_type, level=0, cycle=0, post=Non
     save_notification_events()
 
     if not subscribers:
-        record.update({"sent": False, "sent_count": len(delivered_users), "failed_count": 0,
-                       "error": "Нет подписчиков; событие сохранено для повторной проверки."})
+        # Не ставим событие в очередь на будущее: новый подписчик получит актуальный
+        # статус при подписке, а не устаревшее уведомление из прошлого.
+        record.update({"sent": True, "sent_count": 0, "failed_count": 0,
+                       "delivered_users": [],
+                       "error": "Пропущено: на момент события не было подписчиков.",
+                       "completed_at": now_msk().isoformat(timespec="seconds")})
         notification_events[key] = record
         save_notification_events()
-        logger.warning("Push %s пока не отправлен: нет подписчиков.", event_type)
-        return len(delivered_users)
+        logger.info("Push %s пропущен: на момент события не было подписчиков.", event_type)
+        return 0
 
     dead_users = []
     errors = []
@@ -900,6 +1027,17 @@ async def retry_pending_notifications(application):
     for key, record in list(notification_events.items()):
         if not isinstance(record, dict) or record.get("sent"):
             continue
+        # Закрываем старые записи от предыдущей версии, которые были созданы,
+        # когда подписчиков не было: не рассылаем новому подписчику старое событие.
+        if (not record.get("delivered_users")
+                and "нет подписчиков" in str(record.get("error", "")).lower()):
+            record["sent"] = True
+            record["failed_count"] = 0
+            record["error"] = "Пропущено: на момент события не было подписчиков."
+            record["completed_at"] = now_msk().isoformat(timespec="seconds")
+            notification_events[key] = record
+            save_notification_events()
+            continue
         message = record.get("message")
         event_type = record.get("event")
         if not message or not event_type:
@@ -1036,7 +1174,22 @@ async def apply_uav_event(application, new_level, locations, post):
         else:
             targets = [name for name in locations if name in territories and int(territories[name].get("level", 0)) > 0]
         if not targets:
-            logger.info("Отбой найден, но для указанной территории активного статуса нет.")
+            # Даже если бот не видел исходное активное событие (например, после
+            # сброса state.json), распознанный региональный отбой — это событие,
+            # которое нужно сохранить. При этом не рассылаем ложный push об отбое,
+            # поскольку сохранённого активного статуса для отмены не было.
+            state["last_uav_time"] = now
+            state["last_uav_source"] = post.get("source_name")
+            state["last_uav_post"] = post.get("url")
+            state["last_uav_post_key"] = post.get("key")
+            state["last_uav_post_date"] = post.get("date")
+            state["last_uav_post_text"] = post.get("text", "")
+            state["last_uav_event_type"] = "uav_cancel"
+            logger.info(
+                "Отбой по территории распознан и сохранён без push: активного статуса для отмены не было. Территории: %s",
+                ", ".join(locations),
+            )
+            save_state()
             return False
 
         for territory in targets:
@@ -1283,7 +1436,7 @@ def get_post_event(post, inherited_locations=None):
     if not has_kostroma_territory(text):
         return {"locations": [], "uav_event": "none", "uav_level": 0,
                 "rocket_event": "none", "uav_observation": observation,
-                "unconfirmed": unconfirmed}
+                "uav_fixation": False, "unconfirmed": unconfirmed, "region_match": False}
 
     locations = find_locations(text)
     if not locations:
@@ -1306,9 +1459,11 @@ def get_post_event(post, inherited_locations=None):
     else:
         rocket_event = "cancel" if detect_rocket_cancel(text) else ("active" if detect_rocket(text) else "none")
 
+    uav_fixation = (uav_event == "none" and detect_uav_fixation(text))
     return {"locations": locations, "uav_event": uav_event, "uav_level": uav_level,
             "rocket_event": rocket_event, "uav_observation": observation,
-            "unconfirmed": unconfirmed}
+            "uav_fixation": uav_fixation,
+            "unconfirmed": unconfirmed, "region_match": True}
 
 async def notify_admin_problem(application, key, message, cooldown_seconds=ADMIN_ALERT_COOLDOWN_SECONDS):
     """Отправляет администратору диагностическое сообщение с защитой от спама."""
@@ -1440,8 +1595,33 @@ async def check_sources(application):
         save_state()
         logger.info("Найдено публикаций в окне: %s; новых: %s", len(collected), sum(1 for p in collected if p.get("key") not in sent_posts))
 
-        # During the first scan, use recent posts to reconstruct current state; later process only unseen posts.
-        first_scan = not bool(state.get("startup_completed"))
+        # During the first scan, reconstruct current state from recent posts.
+        # Recovery safeguard: if the bot says startup is complete but all UAV state
+        # metadata is empty, replay the recent window once. This covers partial state
+        # loss where sent_posts survived but state.json was reset or incompletely saved.
+        territories_now = state.get("uav_territories") or {}
+        has_active_territory = any(
+            int(item.get("level", 0)) > 0
+            for item in territories_now.values()
+            if isinstance(item, dict)
+        )
+        uav_state_is_empty = (
+            int(state.get("uav_level", 0)) == 0
+            and not (state.get("active_locations") or [])
+            and not state.get("last_uav_time")
+            and not state.get("last_uav_post_key")
+            and not has_active_territory
+        )
+        # Повторяем восстановление каждый цикл, пока в сохранённом состоянии
+        # действительно нет ни одного последнего события БПЛА. Старый флаг
+        # status_recovery_checked не должен блокировать восстановление после
+        # сброса/повреждения state.json.
+        recover_missing_status = uav_state_is_empty
+        first_scan = not bool(state.get("startup_completed")) or recover_missing_status
+        if recover_missing_status and state.get("startup_completed"):
+            logger.warning(
+                "Состояние БПЛА пустое при завершённом запуске; повторяем восстановление по окну публикаций."
+            )
         candidates = collected if first_scan else [p for p in collected if p.get("key") not in sent_posts]
 
         if first_scan:
@@ -1474,12 +1654,15 @@ async def check_sources(application):
 
             before_levels = {territory: int(item.get("level", 0)) for territory, item in effective.items()}
             latest_rocket = None
+            latest_uav_event = None
             for post in candidates:
                 event = get_post_event(post)
+                if event["uav_event"] != "none":
+                    latest_uav_event = (post, event)
                 if event.get("uav_observation") or event.get("unconfirmed"):
-                    logger.info("Фильтр публикации: observation=%s unconfirmed=%s source=%s text=%s",
-                                event.get("uav_observation"), event.get("unconfirmed"),
-                                post.get("source_name"), post.get("text", "")[:180])
+                    logger.info("Фильтр публикации: region_match=%s observation=%s unconfirmed=%s source=%s text=%s",
+                                event.get("region_match", False), event.get("uav_observation"),
+                                event.get("unconfirmed"), post.get("source_name"), post.get("text", "")[:180])
                 if event["uav_event"] != "none":
                     logger.info("Региональное событие БПЛА: %s level=%s source=%s text=%s",
                                 event["uav_event"], event["uav_level"], post.get("source_name"), post.get("text", "")[:180])
@@ -1522,6 +1705,14 @@ async def check_sources(application):
                 saved_item = (state.get("uav_territories") or {}).get(territory, {})
                 if event_post.get("key") and event_post.get("key") != saved_item.get("last_post_key"):
                     await apply_uav_event(application, int(item["level"]), [territory], event_post)
+            # Если в окне есть явный отбой, но он не изменил ни одной сохранённой
+            # территории, всё равно сохраняем факт последнего события. Это не
+            # создаёт push без ранее активного статуса, но убирает ложное
+            # «Статус не подтверждён» после найденного регионального отбоя.
+            if (not changed_territories and latest_uav_event
+                    and latest_uav_event[1].get("uav_event") == "cancel"):
+                cancel_post, cancel_event = latest_uav_event
+                await apply_uav_event(application, 0, cancel_event.get("locations"), cancel_post)
             if not changed_territories:
                 await retry_pending_notifications(application)
             if latest_rocket:
@@ -1535,10 +1726,12 @@ async def check_sources(application):
             saw_rocket_event = False
             for post in candidates:
                 event = get_post_event(post)
+                if event.get("uav_fixation"):
+                    await apply_uav_fixation_event(application, event["locations"], post)
                 if event.get("uav_observation") or event.get("unconfirmed"):
-                    logger.info("Фильтр публикации: observation=%s unconfirmed=%s source=%s text=%s",
-                                event.get("uav_observation"), event.get("unconfirmed"),
-                                post.get("source_name"), post.get("text", "")[:180])
+                    logger.info("Фильтр публикации: region_match=%s observation=%s unconfirmed=%s source=%s text=%s",
+                                event.get("region_match", False), event.get("uav_observation"),
+                                event.get("unconfirmed"), post.get("source_name"), post.get("text", "")[:180])
                 if event["uav_event"] != "none":
                     saw_uav_event = True
                     logger.info("Региональное событие БПЛА: %s level=%s source=%s text=%s",
@@ -1582,6 +1775,50 @@ async def check_sources(application):
                                     "last_scan_time": now_msk().isoformat(timespec="seconds")}
         save_source_state()
         state["startup_completed"] = True
+        # Восстановление считается завершённым только когда состояние содержит
+        # сохранённое событие БПЛА. Сам по себе успешный ответ источника не
+        # подтверждает статус региона. Если события не найдено, оставляем флаг
+        # выключенным и повторяем анализ свежего окна в следующем цикле.
+        territories_after_scan = state.get("uav_territories") or {}
+        has_active_territory_after_scan = any(
+            int(item.get("level", 0)) > 0
+            for item in territories_after_scan.values()
+            if isinstance(item, dict)
+        )
+        state_has_uav_event = (
+            int(state.get("uav_level", 0)) != 0
+            or bool(state.get("active_locations"))
+            or bool(state.get("last_uav_time"))
+            or bool(state.get("last_uav_post_key"))
+            or has_active_territory_after_scan
+        )
+        state["status_recovery_checked"] = bool(state_has_uav_event)
+
+        # Диагностика без вывода токенов, персональных данных или полного текста постов.
+        # Помогает отличить пустое состояние от ошибки чтения/сохранения состояния.
+        logger.info(
+            "Диагностика восстановления: uav_level=%s; active_locations_count=%s; "
+            "last_uav_time_present=%s; last_uav_post_key_present=%s; "
+            "active_territories=%s; state_has_uav_event=%s; posts_in_window=%s; candidates=%s",
+            state.get("uav_level", 0),
+            len(state.get("active_locations") or []),
+            bool(state.get("last_uav_time")),
+            bool(state.get("last_uav_post_key")),
+            sum(
+                1 for item in (state.get("uav_territories") or {}).values()
+                if isinstance(item, dict) and int(item.get("level", 0)) > 0
+            ),
+            state_has_uav_event,
+            len(collected),
+            len(candidates),
+        )
+
+        if not state_has_uav_event:
+            logger.warning(
+                "Восстановление статуса БПЛА не завершено: "
+                "в сохранённом состоянии нет распознанного регионального события; "
+                "повторим проверку. Отсутствие события не означает, что опасность отменена."
+            )
         save_state()
         await process_expired_uav_statuses(application)
         await process_due_uav_reminders(application)
@@ -1687,6 +1924,11 @@ def format_status():
     elif stale:
         status_line = "⏳ Актуальность не подтверждена"
         territory_line = "Последние известные статусы (уже не считаются актуальными): " + html.escape(", ".join(name for name, _ in sorted(stale)))
+    elif not state.get("last_uav_time"):
+        # Не показываем зелёный статус, если в сохранённых данных вообще нет
+        # времени последнего события: отсутствие данных не означает отсутствие угрозы.
+        status_line = "⏳ Статус не подтверждён"
+        territory_line = "Не удалось восстановить последнее событие БПЛА из сохранённых данных. Проверяйте официальные оповещения."
     else:
         status_line = html.escape(level_title(0))
         territory_line = "Активных территорий в сохранённом статусе нет."
@@ -1786,12 +2028,47 @@ async def stats_command(update, context):
 
 
 async def test_command(update, context):
-    if not update.effective_message:
+    """Проверяет реальную отправку сообщения через Bot API, не рассылая тест подписчикам."""
+    message = update.effective_message
+    if not message:
         return
     if not is_admin(update):
-        await update.effective_message.reply_text("Команда доступна только администратору.")
+        await message.reply_text("Команда доступна только администратору.")
         return
-    await update.effective_message.reply_text("✅ Тестовая проверка Telegram-бота прошла успешно.", reply_markup=main_keyboard())
+
+    pending_pushes = sum(
+        1 for item in notification_events.values()
+        if isinstance(item, dict) and not item.get("sent") and item.get("message") and item.get("event")
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "🧪 UAV ALERT — тест доставки\n\n"
+                "Это тестовое техническое сообщение. Оно не означает наличие опасности.\n"
+                f"Подписчиков сейчас: {len(subscribers)}\n"
+                f"Уведомлений в очереди повтора: {pending_pushes}\n"
+                f"Время: {now_msk().strftime('%d.%m.%Y %H:%M МСК')}"
+            ),
+            disable_web_page_preview=True,
+        )
+        await message.reply_text(
+            "✅ Тестовое сообщение отправлено администратору через Telegram Bot API.\n\n"
+            f"Подписчиков: {len(subscribers)}\n"
+            f"Ожидают повторной доставки: {pending_pushes}\n\n"
+            "Важно: тест проверяет отправку бота в этот чат, но не отправляет тест всем подписчикам.",
+            reply_markup=main_keyboard(),
+        )
+    except TelegramError as exc:
+        logger.exception("Тестовая отправка Telegram не удалась.")
+        HEALTH["last_error"] = f"Тест отправки: {type(exc).__name__}: {exc}"[:500]
+        HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
+        await message.reply_text(
+            "❌ Тестовая отправка не удалась. Проверь Logs в Render.\n\n"
+            f"Ошибка: {html.escape(str(exc)[:300])}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard(),
+        )
 
 
 async def admin_command(update, context):
@@ -1889,6 +2166,14 @@ def health_status():
         "uav_level": state.get("uav_level", 0),
         "rocket_active": state.get("rocket_active", False),
         "last_scan_count": state.get("last_scan_count", 0),
+        "subscribers": len(subscribers),
+        "push_events_total": len(notification_events),
+        "push_events_pending": sum(1 for item in notification_events.values()
+                                    if isinstance(item, dict) and not item.get("sent")
+                                    and item.get("message") and item.get("event")),
+        "push_last_attempt_at": max((str(item.get("attempted_at", ""))
+                                      for item in notification_events.values()
+                                      if isinstance(item, dict) and item.get("attempted_at")), default=None),
     }), 200
 
 
