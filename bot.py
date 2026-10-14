@@ -834,12 +834,29 @@ def uav_level_title_for_post(level, post):
     return titles.get(level, f"🟢 Статус по {category}")
 
 
+def display_territory_name(location):
+    """Убирает внутренние типовые префиксы из названий территорий для поста."""
+    value = str(location or "").strip()
+    for prefix in ("Город: ", "Район: ", "Муниципальный округ: "):
+        if value.startswith(prefix):
+            return value[len(prefix):]
+    return value
+
+
 def build_uav_push(level, locations, post):
-    territory = ", ".join(locations) if locations else "Кострома / Костромская область"
+    locations = list(dict.fromkeys(locations or ["Костромская область"]))
+    territory = ", ".join(display_territory_name(x) for x in locations)
+    if len(locations) >= 3:
+        territory_line = f"📍 Территории: {html.escape(territory)}"
+    else:
+        territory_line = f"📍 Территория: {html.escape(territory or 'Костромская область')}"
     return (
-        f"<b>{uav_level_title_for_post(level, post)}</b>\n\n"
-        f"Территория: {html.escape(territory)}\n\n"
-        "Информация автоматически собрана из публичных сообщений. Она не заменяет официальные оповещения."
+        f"<b>🛰 UAV ALERT</b>\n"
+        f"{territory_line}\n\n"
+        f"<b>{uav_level_title_for_post(level, post)}</b>\n"
+        f"Категория: {html.escape(uav_category_label(post))}\n"
+        f"Время обработки: {now_msk().strftime('%d.%m.%Y %H:%M МСК')}\n\n"
+        "Информация собрана из публичного сообщения и не заменяет официальные оповещения."
     )
 
 def build_uav_reminder_push(level, locations, post):
@@ -1037,22 +1054,39 @@ async def send_push(application, message, event_type, level=0, cycle=0, post=Non
     return delivered_this_run
 
 def build_uav_admin_draft(level, locations, post):
-    """Формирует черновик для @RADAR_Kostroma без заголовка-подсказки и строк источника."""
+    """Формирует готовое объявление; несколько территорий выводятся одной строкой."""
     post = post or {}
+    locations = list(dict.fromkeys(locations or ["Костромская область"]))
     category = uav_category_label(post)
-    detected_at = format_time(post.get("date")) or now_msk().strftime("%d.%m.%Y %H:%M МСК")
+    processed_at = now_msk().strftime("%d.%m.%Y %H:%M МСК")
     if level <= 0:
         headline = f"🟢 Отбой по опасности: {category}"
         detail = "По опубликованному сообщению обнаружена информация об отбое. Сверяйтесь с официальными оповещениями региона."
     else:
         headline = uav_level_title_for_post(level, post)
         detail = f"Категория: {category}"
+
+    if len(locations) >= 3 and level > 0:
+        territory_names = ", ".join(display_territory_name(item) for item in locations)
+        lines = [
+            "🛰 UAV ALERT",
+            f"📍 Территории: {territory_names}",
+            "",
+            headline,
+            detail,
+            f"Время обработки: {processed_at}",
+            "",
+            "Информация собрана из публичного сообщения и не заменяет официальные оповещения.",
+        ]
+        return "\n".join(lines)
+
+    detected_at = format_time(post.get("date")) or processed_at
     region_label = region_label_for_locations(locations, post)
     lines = ["🛰 UAV ALERT", f"📍 Регион: {region_label}"]
-    city_items = [item.split(": ", 1)[1] for item in (locations or []) if item.startswith("Город: ")]
-    district_items = [item.split(": ", 1)[1] for item in (locations or []) if item.startswith("Район: ")]
-    municipal_items = [item.split(": ", 1)[1] for item in (locations or []) if item.startswith("Муниципальный округ: ")]
-    other_items = [item for item in (locations or []) if not item.startswith(("Город: ", "Район: ", "Муниципальный округ: ")) and item not in ("Костромская область")]
+    city_items = [display_territory_name(item) for item in locations if item.startswith("Город: ")]
+    district_items = [display_territory_name(item) for item in locations if item.startswith("Район: ")]
+    municipal_items = [display_territory_name(item) for item in locations if item.startswith("Муниципальный округ: ")]
+    other_items = [item for item in locations if not item.startswith(("Город: ", "Район: ", "Муниципальный округ: ")) and item != "Костромская область"]
     if city_items:
         lines.append("🏙 Город: " + ", ".join(city_items))
     if district_items:
@@ -1274,6 +1308,9 @@ async def apply_uav_event(application, new_level, locations, post):
             }
 
     locations = list(dict.fromkeys(locations or ["Костромская область"]))
+    grouped_announcement = new_level > 0 and len(locations) >= 3
+    group_notification_needed = False
+    group_event_types = []
     now = now_msk().isoformat(timespec="seconds")
     changed = False
 
@@ -1382,11 +1419,30 @@ async def apply_uav_event(application, new_level, locations, post):
             state["last_uav_event_type"] = event_type
             state["uav_cycle"] = max(int(state.get("uav_cycle", 0)), cycle)
             add_history(event_type, f"{level_title(int(new_level))} — {territory}", post)
-            await send_push(application, build_uav_push(int(new_level), [territory], post),
-                            event_type, int(new_level), cycle, event_post, key_override=key)
-            await send_admin_post_draft(application, build_uav_admin_draft(int(new_level), [territory], post),
-                                        event_type, int(new_level), cycle, event_post, key_override=key)
+            if grouped_announcement:
+                group_notification_needed = True
+                group_event_types.append(event_type)
+            else:
+                await send_push(application, build_uav_push(int(new_level), [territory], post),
+                                event_type, int(new_level), cycle, event_post, key_override=key)
+                await send_admin_post_draft(application, build_uav_admin_draft(int(new_level), [territory], post),
+                                            event_type, int(new_level), cycle, event_post, key_override=key)
             changed = True
+
+        if grouped_announcement and group_notification_needed:
+            # Один общий push и один готовый пост вместо серии одинаковых сообщений по каждому району.
+            group_type = "uav_active" if "uav_active" in group_event_types else "uav_update"
+            group_cycle = max([int((territories.get(name) or {}).get("cycle", 0)) for name in locations] or [0])
+            group_post = dict(post)
+            group_post["key"] = f"{post.get('key', '')}|territories:{'|'.join(sorted(locations))}"
+            group_key = notification_key(group_type, int(new_level), group_cycle, group_post)
+            await send_push(application, build_uav_push(int(new_level), locations, post),
+                            group_type, int(new_level), group_cycle, group_post, key_override=group_key)
+            grouped_draft = build_uav_admin_draft(int(new_level), locations, post)
+            await send_admin_post_draft(application, grouped_draft, group_type, int(new_level), group_cycle,
+                                        group_post, key_override=group_key)
+            await publish_to_channel(application, grouped_draft, group_type, int(new_level), group_cycle,
+                                     group_post, key_override=group_key)
 
     sync_uav_summary()
     # Legacy summary fields remain available for health endpoints and old clients.
