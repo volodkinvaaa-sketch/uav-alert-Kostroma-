@@ -747,24 +747,38 @@ def build_uav_fixation_push(locations, post):
 
 
 def build_uav_fixation_draft(locations, post):
-    """Черновик администратору о фиксации, без объявления тревоги."""
+    """Готовый для проверки и публикации пост о фиксации в конкретной территории или области."""
+    locations = list(dict.fromkeys(locations or ["Костромская область"]))
     territory = region_label_for_locations(locations, post)
     category = uav_category_label(post)
     published = format_time(post.get("date")) or "время неизвестно"
     source_url = str(post.get("url") or "")
-    lines = [
-        "🛰 UAV ALERT",
-        "ℹ️ Сообщение о фиксации воздушной цели",
-        f"📍 Территория: {territory}",
-        f"Категория: {category}",
-        f"Время публикации: {published}",
-    ]
-    if source_url.startswith("https://t.me/"):
-        lines.append(f"Проверить публикацию: {source_url}")
+    source_name = str(post.get("source_name") or "публичный источник")
+    lines = ["🛰 UAV ALERT", f"📍 Регион: {territory}"]
+    city_items = [item.split(": ", 1)[1] for item in locations if item.startswith("Город: ")]
+    district_items = [item.split(": ", 1)[1] for item in locations if item.startswith("Район: ")]
+    municipal_items = [item.split(": ", 1)[1] for item in locations if item.startswith("Муниципальный округ: ")]
+    other_items = [item for item in locations if not item.startswith(("Город: ", "Район: ", "Муниципальный округ: ")) and item != "Костромская область"]
+    if city_items:
+        lines.append("🏙 Город: " + ", ".join(city_items))
+    if district_items:
+        lines.append("🗺 Район: " + ", ".join(district_items))
+    if municipal_items:
+        lines.append("🏛 Муниципальный округ: " + ", ".join(municipal_items))
+    if other_items:
+        lines.append("📍 Территория: " + ", ".join(other_items))
     lines.extend([
         "",
-        "В публичном сообщении обнаружена информация о фиксации.",
-        "Независимое подтверждение отсутствует.",
+        f"ℹ️ Фиксация воздушной цели: {category}",
+        f"Время исходной публикации: {published}",
+        f"Источник: {source_name}",
+    ])
+    if source_url.startswith("https://t.me/"):
+        lines.append(f"Проверить исходную публикацию: {source_url}")
+    lines.extend([
+        "",
+        "В публичном сообщении появилась информация о фиксации воздушной цели.",
+        "Информация не подтверждена независимо и не означает автоматического объявления опасности.",
         "Информация собрана из публичных сообщений и не заменяет официальные оповещения.",
     ])
     return "\n".join(lines)
@@ -1783,8 +1797,11 @@ async def check_sources(application):
             before_levels = {territory: int(item.get("level", 0)) for territory, item in effective.items()}
             latest_rocket = None
             latest_uav_event = None
+            latest_fixation = None
             for post in candidates:
                 event = get_post_event(post)
+                if event.get("uav_fixation"):
+                    latest_fixation = (post, event)
                 if event["uav_event"] != "none":
                     latest_uav_event = (post, event)
                 if event.get("uav_observation") or event.get("unconfirmed"):
@@ -1811,6 +1828,16 @@ async def check_sources(application):
                                     effective[territory] = {"level": 0, "post": post}
                 if event["rocket_event"] != "none":
                     latest_rocket = (post, event)
+
+            # При первичном восстановлении создаём черновик только по самой свежей
+            # фиксации в пятчасовом окне, чтобы не присылать администратору старую ленту целиком.
+            if latest_fixation:
+                fixation_post, fixation_event = latest_fixation
+                await apply_uav_fixation_event(
+                    application,
+                    fixation_event.get("locations") or ["Костромская область"],
+                    fixation_post,
+                )
 
             changed_territories = []
             all_territories = set(before_levels) | set(effective)
