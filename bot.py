@@ -260,8 +260,11 @@ def normalize_text(value):
 # Формат: (регулярное выражение, подпись). Сначала более конкретные названия,
 # чтобы город и район/округ с похожим названием распознавались отдельно.
 KOSTROMA_RE = re.compile(r"\b(?:костромск\w*\s+област\w*|костром\w*)\b", re.I)
+# Не считаем любое слово с корнем «костром» указанием региона.
+# Регион целиком определяется по фразе «Костромская область», а город,
+# районы и округа — отдельными территориальными шаблонами ниже.
 TRACKED_REGION_RE = re.compile(
-    r"\b(?:костромск\w*\s+област\w*|костром\w*)\b", re.I
+    r"\bкостромск\w*\s+област\w*\b", re.I
 )
 REGION_NAMES = {
     "Костромская область": "Костромская область",
@@ -1511,22 +1514,22 @@ def get_post_event(post, inherited_locations=None):
     observation = detect_uav_observation(text)
     unconfirmed = is_unconfirmed_message(text)
 
-    # Прямое упоминание области не обязательно, если сообщение явно называет
-    # известный город, район или муниципальный округ Костромской области.
-    # У некоторых источников короткий заголовок «Отбой по БПЛА» не содержит географии:
-    # разрешаем его только если у бота уже есть активная территория UAV ALERT, чтобы
-    # не принять отбой в другом регионе за локальный.
+    # Строгая территориальная проверка: событие учитывается только если
+    # в самой публикации указана Костромская область либо распознаны город,
+    # район или муниципальный округ этого региона. Короткие сообщения без
+    # географии (например, «Отбой по БПЛА») намеренно не применяются к статусу:
+    # иначе можно ошибочно принять отбой из другого региона за костромской.
     explicit_region = has_kostroma_territory(text)
     is_uav_cancel = contains_uav(text) and detect_uav_cancel(text)
     known_active_locations = list(inherited_locations or state.get("active_locations") or [])
-    if not explicit_region and not (is_uav_cancel and known_active_locations):
+    if not explicit_region:
         return {"locations": [], "uav_event": "none", "uav_level": 0,
                 "rocket_event": "none", "uav_observation": observation,
                 "uav_fixation": False, "unconfirmed": unconfirmed, "region_match": False}
 
     locations = find_locations(text)
     if not locations:
-        locations = known_active_locations if is_uav_cancel and known_active_locations else ["Костромская область"]
+        locations = ["Костромская область"]
 
     uav_event, uav_level = "none", 0
     if contains_uav(text):
@@ -1692,6 +1695,17 @@ async def check_sources(application):
                 )
         unique = {p.get("key"): p for p in collected if p.get("key")}
         collected = sorted(unique.values(), key=lambda p: (parse_datetime(p.get("date")) or datetime.min.replace(tzinfo=MSK), int(p.get("post_id", 0)), p.get("source", "")))
+
+        # В дальнейшую обработку попадают только публикации, относящиеся к
+        # Костромской области: регион целиком, его города, районы и муниципальные
+        # округа. Посты про другие регионы не влияют на счётчик, последний пост,
+        # восстановление статуса, историю и уведомления UAV ALERT.
+        regional_posts = [p for p in collected if has_kostroma_territory(p.get("text", ""))]
+        ignored_nonregional = len(collected) - len(regional_posts)
+        if ignored_nonregional:
+            logger.info("Пропущено публикаций без территории Костромской области: %s", ignored_nonregional)
+        collected = regional_posts
+
         state["last_scan_time"] = now_msk().isoformat(timespec="seconds")
         state["last_scan_count"] = len(collected)
         state["last_scan_all_sources_ok"] = (successful_sources == len(SOURCES) and not failed_sources)
@@ -2055,7 +2069,7 @@ def format_status():
     if locations and stale:
         territory_line += "\nАктуальность не подтверждена для: " + html.escape(", ".join(name for name, _ in sorted(stale)))
 
-    # Показываем самую свежую публикацию, найденную среди всех полученных сообщений в окне 5 часов.
+    # Показываем самую свежую публикацию по Костромской области, найденную в окне 5 часов.
     latest_text = str(state.get("last_window_post_text") or "").strip()
     latest_source = state.get("last_window_post_source")
     latest_url = state.get("last_window_post_url")
@@ -2102,7 +2116,7 @@ def format_sources():
     lines = ["<b>📡 Источники мониторинга</b>", ""]
     for info in SOURCES.values():
         lines.append(f'<a href="{html.escape(info["url"], quote=True)}">{html.escape(info["name"])}</a>')
-    lines += ["", "Фильтр событий: Костромская область; распознаются города, районы и муниципальные округа.",
+    lines += ["", "Фильтр событий: только Костромская область, её города, районы и муниципальные округа. Публикации без распознанной территории игнорируются.",
               "Источники публичные и могут содержать неполную или неподтверждённую информацию."]
     return "\n".join(lines)
 
