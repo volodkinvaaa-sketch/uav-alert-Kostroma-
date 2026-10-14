@@ -1283,9 +1283,24 @@ async def apply_uav_event(application, new_level, locations, post):
             state["last_uav_post_text"] = post.get("text", "")
             state["last_uav_event_type"] = "uav_cancel"
             logger.info(
-                "Отбой по территории распознан и сохранён без push: активного статуса для отмены не было. Территории: %s",
+                "Отбой по территории распознан без активного статуса. Готовится черновик админу без push. Территории: %s",
                 ", ".join(locations),
             )
+            # Даже если активное состояние не было сохранено (например, после
+            # перезапуска или сброса state.json), явный и территориально
+            # подтверждённый отбой должен дать администратору готовый черновик.
+            # Подписчикам push не отправляем: нечего подтверждённо отменять.
+            cycle = int(state.get("uav_cycle", 0)) + 1
+            event_post = dict(post)
+            event_post["key"] = f"{post.get('key', '')}|cancel-no-active:{','.join(locations)}"
+            draft_key = notification_key("uav_cancel", 0, cycle, event_post)
+            add_history("uav_cancel", f"Отбой по опасности БПЛА — {', '.join(locations)}", post)
+            await send_admin_post_draft(
+                application,
+                build_uav_admin_draft(0, locations, post),
+                "uav_cancel", 0, cycle, event_post, key_override=draft_key,
+            )
+            state["uav_cycle"] = cycle
             save_state()
             return False
 
@@ -1522,6 +1537,41 @@ async def apply_rocket_event(application, active, post):
 # ============================================================
 # POST PARSER — KOSTROMA FILTER APPLIES TO UAV AND ROCKET EVENTS
 # ============================================================
+def cancel_is_specific_to_kostroma(text):
+    """Не принимает общий список нескольких областей за подтверждённый отбой в Костромской области."""
+    value = normalize_text(text)
+    region_mentions = list(re.finditer(r"\b[а-яё-]+\s+област[ьи]\b", value, re.I))
+    if len(region_mentions) <= 1:
+        return True
+
+    cancel_matches = list(re.finditer(
+        r"\b(?:отбой|отмен\w*|снят\w*|прекращен\w*|аннулирован\w*|"
+        r"миновал\w*|опасност\w*\s+больше\s+нет|угроз\w*\s+больше\s+нет)\b",
+        value, re.I))
+    if not cancel_matches:
+        return True
+
+    # Для списка нескольких регионов проверяем регион, непосредственно
+    # стоящий перед формулировкой об отбое. Если там другой регион, сообщение
+    # не должно отменять статус Костромской области.
+    cancel_start = cancel_matches[0].start()
+    previous_regions = [m for m in region_mentions if m.start() < cancel_start]
+    if previous_regions:
+        nearest_region = previous_regions[-1].group(0)
+        if "костром" not in nearest_region:
+            # Допускаем явную формулировку «отбой ... в Костромской области».
+            after_cancel = value[cancel_start:cancel_start + 180]
+            if not re.search(r"костромск\w*\s+област\w*", after_cancel):
+                return False
+    else:
+        # Если первым упоминанием территории после отбоя является другой регион,
+        # не переносим его событие на Костромскую область.
+        after_cancel = value[cancel_start:cancel_start + 180]
+        if not re.search(r"костромск\w*\s+област\w*", after_cancel):
+            return False
+    return True
+
+
 def get_post_event(post, inherited_locations=None):
     text = post.get("text", "")
     # Флаги фиксации и неподтверждённости доступны отдельно от статуса опасности.
@@ -1536,6 +1586,11 @@ def get_post_event(post, inherited_locations=None):
     explicit_region = has_kostroma_territory(text)
     is_uav_cancel = contains_uav(text) and detect_uav_cancel(text)
     known_active_locations = list(inherited_locations or state.get("active_locations") or [])
+    if is_uav_cancel and not cancel_is_specific_to_kostroma(text):
+        logger.info("Неоднозначный отбой по БПЛА в сообщении с несколькими регионами пропущен: %s", text[:220])
+        return {"locations": [], "uav_event": "none", "uav_level": 0,
+                "rocket_event": "none", "uav_observation": observation,
+                "uav_fixation": False, "unconfirmed": unconfirmed, "region_match": False}
     if not explicit_region:
         return {"locations": [], "uav_event": "none", "uav_level": 0,
                 "rocket_event": "none", "uav_observation": observation,
