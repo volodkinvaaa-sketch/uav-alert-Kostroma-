@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 import threading
+import time
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -30,6 +31,7 @@ def env_int(name, default, minimum=None):
         value = max(minimum, value)
     return value
 
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = env_int("ADMIN_ID", 1421675956, 1)
 PORT = env_int("PORT", 10000, 1)
@@ -50,7 +52,28 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("uav_alert")
 monitor_task = None
+monitor_watchdog_task = None
 monitor_lock = None
+PROCESS_STARTED_AT = None  # Заполняется после определения now_msk().
+HEALTH = {
+    "process_started_at": None,
+    "last_monitor_cycle_at": None,
+    "last_monitor_cycle_finished_at": None,
+    "monitor_cycle_started_monotonic": None,
+    "monitor_cycle_duration_seconds": None,
+    "last_watchdog_check_at": None,
+    "monitor_restarts": 0,
+    "last_monitor_restart_at": None,
+    "last_successful_scan_at": None,
+    "consecutive_all_source_failures": 0,
+    "total_source_failures": 0,
+    "total_source_successes": 0,
+    "last_error": None,
+    "last_error_at": None,
+    "source_health": {},
+    "admin_alerts": {},
+}
+ADMIN_ALERT_COOLDOWN_SECONDS = env_int("ADMIN_ALERT_COOLDOWN_SECONDS", 900, 60)
 
 # ============================================================
 # FILES / JSON
@@ -58,8 +81,14 @@ monitor_lock = None
 def now_msk():
     return datetime.now(MSK)
 
+
+PROCESS_STARTED_AT = now_msk().isoformat(timespec="seconds")
+HEALTH["process_started_at"] = PROCESS_STARTED_AT
+
+
 def json_path(filename):
     return os.path.join(DATA_DIR, filename)
+
 
 def parse_datetime(value):
     if not value:
@@ -72,9 +101,11 @@ def parse_datetime(value):
     except (ValueError, TypeError, OverflowError):
         return None
 
+
 def format_time(value):
     parsed = parse_datetime(value)
     return parsed.strftime("%d.%m.%Y %H:%M МСК") if parsed else "неизвестно"
+
 
 def load_json(filename, default):
     """Загружает путь, уже собранный через json_path(); битый JSON не роняет запуск."""
@@ -83,6 +114,7 @@ def load_json(filename, default):
             return json.load(f)
     except (OSError, json.JSONDecodeError, TypeError):
         return default
+
 
 def save_json(filename, value):
     temp = filename + ".tmp"
@@ -153,6 +185,7 @@ ADMIN_DRAFTS_FILE = json_path("admin_drafts.json")
 admin_drafts = load_json(ADMIN_DRAFTS_FILE, {})
 if not isinstance(admin_drafts, dict):
     admin_drafts = {}
+
 
 def save_state(): save_json(STATE_FILE, state)
 def save_history():
@@ -230,6 +263,7 @@ REGION_NAMES = {
     "Костромская область": "Костромская область",
 }
 
+
 def region_for_location(location):
     """Определяет регион по метке региона или распознанной территории."""
     value = normalize_text(str(location or ""))
@@ -243,6 +277,7 @@ def region_for_location(location):
         return "Костромская область"
     return None
 
+
 def region_label_for_locations(locations, post=None):
     """Возвращает регион для заголовка по меткам территории и исходному сообщению."""
     for location in locations or []:
@@ -253,6 +288,7 @@ def region_label_for_locations(locations, post=None):
     if re.search(r"\bкостромск\w*\s+област\w*\b", text):
         return "Костромская область"
     return "Костромская область"
+
 
 def is_region_wide_location(location):
     return str(location or "") in REGION_NAMES
@@ -322,6 +358,7 @@ SHORT_MO_PATTERNS = [
     for stem, adj in AREA_STEMS
 ]
 
+
 def find_locations(text):
     """Возвращает только распознанные территории, сохраняя тип каждой территории."""
     value = normalize_text(text)
@@ -359,6 +396,7 @@ def find_locations(text):
     # Упоминание области не должно скрывать конкретный найденный город/район.
     return found
 
+
 def has_kostroma_territory(text):
     """Совместимый фильтр: пропускает события только по Костромской области."""
     value = normalize_text(text)
@@ -381,6 +419,7 @@ ROCKET_CONTEXT_RE = re.compile(
     r"(?:\bракетн\w*\s+опасност\w*\b|\bракетн\w*\s+тревог\w*\b|"
     r"\bугроз\w*\s+ракетн\w*\b|\bракет\w*\s+опасност\w*\b)", re.I)
 
+
 def contains_uav(text): return bool(UAV_CONTEXT_RE.search(normalize_text(text)))
 def contains_rocket(text): return bool(ROCKET_CONTEXT_RE.search(normalize_text(text)))
 
@@ -388,34 +427,67 @@ CANCEL_RE = re.compile(
     r"\b(?:отбой|отмен\w*|снят\w*|снята|снято|прекращен\w*|"
     r"опасност\w*\s+больше\s+нет|угроз\w*\s+больше\s+нет|"
     r"больше\s+не\s+актуальн\w*)\b", re.I)
-PERSIST_RE = re.compile(r"\b(?:сохраня\w*|действу\w*|продолжа\w*|остает\w*|остаетс\w*)\b", re.I)
+PERSIST_RE = re.compile(
+    r"\b(?:сохраня\w*|действу\w*|продолжа\w*|остает\w*|остаетс\w*|"
+    r"не\s+снят\w*|не\s+отменен\w*|не\s+отменён\w*)\b", re.I)
+
+UAV_CANCEL_CONTEXT_RE = re.compile(
+    r"\b(?:бпла\b|беспилот\w*|дрон\w*|мвш\b|мрш\b|малоразмерн\w*\s+"
+    r"(?:разведывательн\w*\s+)?воздушн\w*\s+шар\w*|воздушн\w*\s+цел\w*)", re.I)
+ROCKET_CANCEL_CONTEXT_RE = re.compile(
+    r"\b(?:ракетн\w*\s+(?:опасност\w*|тревог\w*)|ракет\w*\s+опасност\w*|"
+    r"угроз\w*\s+ракетн\w*)", re.I)
+
 
 def detect_cancel(text):
+    """Общий признак отмены; сам по себе не определяет, какой статус отменён."""
     return bool(CANCEL_RE.search(normalize_text(text)))
+
+
+def _event_clauses(text):
+    """Разделяет сообщение на смысловые части, чтобы не смешивать разные угрозы."""
+    value = normalize_text(text)
+    return [part.strip() for part in re.split(r"[.!?;\n,]+", value) if part.strip()]
+
+
+def _has_target_cancel(text, target_re):
+    """Проверяет отмену именно целевого события внутри одной части сообщения."""
+    for clause in _event_clauses(text):
+        if not CANCEL_RE.search(clause) or not target_re.search(clause):
+            continue
+        # Отрицание отмены или указание, что статус сохраняется, не является отбоем.
+        direct_cancel = re.search(
+            r"(?:\b(?:отбой|отмен\w*|снят\w*|прекращен\w*)\b.{0,70}"
+            r"(?:бпла\b|беспилот\w*|дрон\w*|мвш\b|мрш\b|ракет\w*|опасност\w*|угроз\w*)|"
+            r"(?:бпла\b|беспилот\w*|дрон\w*|мвш\b|мрш\b|ракет\w*|опасност\w*|угроз\w*)"
+            r".{0,70}\b(?:отбой|отмен\w*|снят\w*|прекращен\w*)\b)", clause)
+        if re.search(r"\bне\s+(?:объявля\w*|было|подтвержд\w*|снят\w*|отмен\w*|прекращен\w*)\b", clause):
+            continue
+        if PERSIST_RE.search(clause) and not direct_cancel:
+            continue
+        if direct_cancel or not PERSIST_RE.search(clause):
+            return True
+    return False
+
 
 def detect_rocket_cancel(text):
     value = normalize_text(text)
-    return detect_cancel(value) and bool(re.search(r"\bракет\w*\b", value))
+    if not contains_rocket(value):
+        return False
+    return _has_target_cancel(value, ROCKET_CANCEL_CONTEXT_RE)
+
 
 def detect_uav_cancel(text):
     value = normalize_text(text)
-    if not detect_cancel(value) or not contains_uav(value):
+    if not contains_uav(value):
         return False
-    # A general cancellation word is not enough if the same text says the threat continues.
-    if PERSIST_RE.search(value) and not re.search(r"\b(?:отбой|отмен\w*|снят\w*|прекращен\w*)\b", value):
-        return False
-    if detect_rocket_cancel(value) and not re.search(r"\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш)\b.{0,100}\b(?:отбой|отмен\w*|снят\w*)\b", value):
-        return False
-    return True
+    return _has_target_cancel(value, UAV_CANCEL_CONTEXT_RE)
 
 def detect_uav_level(text):
     value = normalize_text(text)
     if detect_uav_cancel(value):
         return 0
     if not contains_uav(value):
-        return 0
-    # Do not interpret an old event mentioned in a cancellation / retrospective report as active.
-    if detect_cancel(value):
         return 0
     # Require an explicit status phrase near the UAV context, not just unrelated words elsewhere.
     patterns = [
@@ -426,20 +498,37 @@ def detect_uav_level(text):
         (1, r"\b(?:внимание|желт\w*\s+уровен\w*)\b.{0,100}\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b"),
         (1, r"\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b.{0,100}\bвнимание\b"),
     ]
-    for level, pattern in patterns:
-        if re.search(pattern, value):
-            return level
-    return 0
+    # Match status and target only inside the same clause. This prevents
+    # "отбой ракетной опасности, угроза БПЛА сохраняется" from becoming
+    # a red UAV danger merely because the word "опасность" is in the first clause.
+    detected_levels = []
+    for clause in _event_clauses(value):
+        if _has_target_cancel(clause, UAV_CANCEL_CONTEXT_RE):
+            continue
+        for level, pattern in patterns:
+            if re.search(pattern, clause):
+                detected_levels.append(level)
+                break
+    return max(detected_levels, default=0)
+
 
 def detect_rocket(text):
     value = normalize_text(text)
-    return contains_rocket(value) and not detect_rocket_cancel(value)
+    if not contains_rocket(value) or detect_rocket_cancel(value):
+        return False
+    # A rocket cancellation elsewhere in the message must not cancel a separately stated
+    # active rocket status; a cancellation of UAV danger is unrelated to rockets.
+    for clause in _event_clauses(value):
+        if ROCKET_CANCEL_CONTEXT_RE.search(clause) and PERSIST_RE.search(clause):
+            return True
+    return bool(ROCKET_CONTEXT_RE.search(value))
 
 # ============================================================
 # FETCH POSTS
 # ============================================================
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/131.0 Safari/537.36")
+
 
 def fetch_source(source_key, source_info):
     response = requests.get(source_info["url"], headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
@@ -468,6 +557,7 @@ def fetch_source(source_key, source_info):
     posts.sort(key=lambda p: (parse_datetime(p.get("date")) or datetime.min.replace(tzinfo=MSK), int(p.get("post_id", 0))))
     return posts[-SOURCE_LIMIT:]
 
+
 def mark_post_processed(post):
     key = post.get("key")
     if not key:
@@ -486,6 +576,7 @@ def notification_key(event_type, level, cycle, post):
     raw = "|".join([event_type, str(level), str(cycle), str(post.get("key", ""))])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+
 def add_history(event_type, title, post=None):
     post = post or {}
     history.append({"time": now_msk().isoformat(timespec="seconds"), "event": event_type,
@@ -500,6 +591,7 @@ def level_title(level):
     return {0: "🟢 Опасность по БПЛА не объявлена", 1: "🟡 Внимание по БПЛА",
             2: "🟠 Угроза по БПЛА", 3: "🔴 Опасность по БПЛА"}.get(level, "Статус БПЛА неизвестен")
 
+
 def source_line(post):
     """Сохраняет совместимость со старыми форматами; в новых постах не используется."""
     if not post:
@@ -510,6 +602,7 @@ def source_line(post):
     if url_raw:
         return f'Источник: <a href="{html.escape(url_raw, quote=True)}">{name}</a>\nПубликация: {published}'
     return f"Источник: {name}\nПубликация: {published}"
+
 
 def uav_category_label(post):
     """Возвращает категорию по тексту источника для точного текста пуша и поста."""
@@ -531,6 +624,7 @@ def uav_category_label(post):
         return " / ".join(labels)
     return "БПЛА"
 
+
 def uav_level_title_for_post(level, post):
     category = uav_category_label(post)
     titles = {
@@ -539,6 +633,7 @@ def uav_level_title_for_post(level, post):
         3: f"🔴 Опасность по {category}",
     }
     return titles.get(level, f"🟢 Статус по {category}")
+
 
 def build_uav_push(level, locations, post):
     territory = ", ".join(locations) if locations else "Кострома / Костромская область"
@@ -715,7 +810,7 @@ def build_uav_admin_draft(level, locations, post):
     city_items = [item.split(": ", 1)[1] for item in (locations or []) if item.startswith("Город: ")]
     district_items = [item.split(": ", 1)[1] for item in (locations or []) if item.startswith("Район: ")]
     municipal_items = [item.split(": ", 1)[1] for item in (locations or []) if item.startswith("Муниципальный округ: ")]
-    other_items = [item for item in (locations or []) if not item.startswith(("Город: ", "Район: ", "Муниципальный округ: ")) and item not in ("Костромская область", "Ярославская область")]
+    other_items = [item for item in (locations or []) if not item.startswith(("Город: ", "Район: ", "Муниципальный округ: ")) and item not in ("Костромская область")]
     if city_items:
         lines.append("🏙 Город: " + ", ".join(city_items))
     if district_items:
@@ -843,13 +938,15 @@ async def retry_pending_notifications(application):
         )
     return total_delivered
 
+
 async def retry_last_uav_notification(application):
     """Совместимость со старым названием функции; повторяет все ожидающие отправки."""
     return await retry_pending_notifications(application)
 
 async def send_current_status_to_user(application, user_id):
     territories = state.get("uav_territories") or {}
-    active = [(name, item) for name, item in territories.items() if int(item.get("level", 0)) > 0]
+    active = [(name, item) for name, item in territories.items()
+              if int(item.get("level", 0)) > 0 and not item.get("validity_expired", False)]
     if active:
         for territory, item in sorted(active, key=lambda pair: pair[0]):
             post = {"key": item.get("last_post_key") or "", "source_name": item.get("last_source") or "Автоматическая проверка",
@@ -884,18 +981,23 @@ async def send_current_status_to_user(application, user_id):
         except TelegramError:
             logger.exception("Не удалось отправить текущий ракетный статус пользователю %s", user_id)
 
+
 # ============================================================
 # APPLY EVENTS
 # ============================================================
 def sync_uav_summary():
     """Пересчитывает общий статус из независимых статусов городов/районов/округов."""
     territories = state.get("uav_territories") or {}
-    active = [(name, item) for name, item in territories.items() if int(item.get("level", 0)) > 0]
+    active = [
+        (name, item) for name, item in territories.items()
+        if int(item.get("level", 0)) > 0 and not item.get("validity_expired", False)
+    ]
     state["uav_level"] = max((int(item.get("level", 0)) for _, item in active), default=0)
     state["active_locations"] = [name for name, _ in sorted(active, key=lambda pair: pair[0])]
     if active:
         latest = max((item for _, item in active), key=lambda item: str(item.get("last_time") or ""))
         state["last_uav_time"] = latest.get("last_time") or state.get("last_uav_time")
+
 
 async def apply_uav_event(application, new_level, locations, post):
     """Обновляет каждую названную территорию отдельно; отбой не сбрасывает соседние районы."""
@@ -914,6 +1016,8 @@ async def apply_uav_event(application, new_level, locations, post):
                 "last_post_date": state.get("last_uav_post_date"), "last_post_text": state.get("last_uav_post_text") or "",
                 "last_event_type": state.get("last_uav_event_type"),
                 "last_notification_key": state.get("last_uav_notification_key"),
+                "validity_due_at": None, "validity_expired": False,
+                "validity_expired_at": None, "validity_notice_sent_at": None,
             }
 
     locations = list(dict.fromkeys(locations or ["Костромская область"]))
@@ -942,7 +1046,9 @@ async def apply_uav_event(application, new_level, locations, post):
                          "last_source": post.get("source_name"), "last_post_url": post.get("url"),
                          "last_post_key": post.get("key"), "last_post_date": post.get("date"),
                          "last_post_text": post.get("text", ""), "last_event_type": "uav_cancel",
-                         "reminder_due_at": None, "reminder_sent_at": None, "reminder_key": None})
+                         "reminder_due_at": None, "reminder_sent_at": None, "reminder_key": None,
+                         "validity_due_at": None, "validity_expired": False,
+                         "validity_expired_at": None, "validity_notice_sent_at": None})
             event_post = dict(post)
             event_post["key"] = f"{post.get('key', '')}|territory:{territory}"
             key = notification_key("uav_cancel", 0, cycle, event_post)
@@ -959,8 +1065,20 @@ async def apply_uav_event(application, new_level, locations, post):
         for territory in locations:
             item = territories.setdefault(territory, {"level": 0, "cycle": 0})
             old_level = int(item.get("level", 0))
+            announced_at = parse_datetime(post.get("date")) or now_msk()
+            validity_due = (announced_at + timedelta(hours=HISTORY_WINDOW_HOURS)).isoformat(timespec="seconds")
+            reminder_due = (announced_at + timedelta(hours=UAV_REMINDER_HOURS)).isoformat(timespec="seconds")
             if old_level == int(new_level):
-                logger.info("Статус %s по территории %s не изменился.", new_level, territory)
+                # Новая публикация с тем же уровнем обновляет срок актуальности,
+                # но не создаёт повторный push подписчикам.
+                item.update({"last_time": now, "last_source": post.get("source_name"),
+                             "last_post_url": post.get("url"), "last_post_key": post.get("key"),
+                             "last_post_date": post.get("date"), "last_post_text": post.get("text", ""),
+                             "validity_due_at": validity_due, "validity_expired": False,
+                             "validity_expired_at": None, "validity_notice_sent_at": None,
+                             "reminder_due_at": reminder_due, "reminder_sent_at": None, "reminder_key": None})
+                logger.info("Статус %s по территории %s подтверждён новой публикацией; срок актуальности обновлён.", new_level, territory)
+                changed = True
                 continue
             cycle = int(item.get("cycle", 0))
             if old_level == 0:
@@ -969,14 +1087,14 @@ async def apply_uav_event(application, new_level, locations, post):
             event_post = dict(post)
             event_post["key"] = f"{post.get('key', '')}|territory:{territory}"
             key = notification_key(event_type, int(new_level), cycle, event_post)
-            announced_at = parse_datetime(post.get("date")) or now_msk()
-            reminder_due = (announced_at + timedelta(hours=UAV_REMINDER_HOURS)).isoformat(timespec="seconds")
             item.update({"level": int(new_level), "cycle": cycle, "last_time": now,
                          "last_source": post.get("source_name"), "last_post_url": post.get("url"),
                          "last_post_key": post.get("key"), "last_post_date": post.get("date"),
                          "last_post_text": post.get("text", ""), "last_event_type": event_type,
                          "last_notification_key": key, "reminder_due_at": reminder_due,
-                         "reminder_sent_at": None, "reminder_key": None})
+                         "reminder_sent_at": None, "reminder_key": None,
+                         "validity_due_at": validity_due, "validity_expired": False,
+                         "validity_expired_at": None, "validity_notice_sent_at": None})
             state["last_uav_notification_key"] = key
             state["last_uav_event_type"] = event_type
             state["uav_cycle"] = max(int(state.get("uav_cycle", 0)), cycle)
@@ -1000,6 +1118,75 @@ async def apply_uav_event(application, new_level, locations, post):
         await retry_pending_notifications(application)
     return changed
 
+
+async def process_expired_uav_statuses(application):
+    """По истечении окна актуальности скрывает статус как подтверждённый и сообщает только админу."""
+    territories = state.get("uav_territories") or {}
+    now = now_msk()
+    changed = False
+
+    for territory, item in list(territories.items()):
+        try:
+            level = int(item.get("level", 0))
+        except (TypeError, ValueError):
+            level = 0
+        if level not in (1, 2, 3):
+            continue
+
+        due = parse_datetime(item.get("validity_due_at"))
+        if due is None:
+            # Миграция старых записей: считаем срок от времени исходной публикации,
+            # а если его нет — от последнего сохранённого времени события.
+            source_time = parse_datetime(item.get("last_post_date")) or parse_datetime(item.get("last_time"))
+            due = source_time + timedelta(hours=HISTORY_WINDOW_HOURS) if source_time else now
+            item["validity_due_at"] = due.isoformat(timespec="seconds")
+            changed = True
+
+        if now < due:
+            continue
+
+        if not item.get("validity_expired"):
+            item["validity_expired"] = True
+            item["validity_expired_at"] = now.isoformat(timespec="seconds")
+            item["validity_notice_sent_at"] = None
+            add_history("uav_stale", f"Актуальность не подтверждена — {territory}", {
+                "source_name": item.get("last_source"), "url": item.get("last_post_url"),
+                "date": item.get("last_post_date") or item.get("last_time")})
+            logger.info("Истёк срок актуальности статуса БПЛА по территории %s; статус скрыт из активных.", territory)
+            changed = True
+
+        # Уведомление отправляется только администратору; ключ стабилен после рестарта.
+        if not item.get("validity_notice_sent_at"):
+            post = {
+                "key": item.get("last_post_key") or "",
+                "source_name": item.get("last_source") or "Публичный источник",
+                "url": item.get("last_post_url") or "",
+                "date": item.get("last_post_date") or item.get("last_time"),
+                "text": item.get("last_post_text") or "",
+            }
+            due_key = item.get("validity_due_at") or due.isoformat(timespec="seconds")
+            key_post = dict(post)
+            key_post["key"] = f"{post.get('key', '')}|validity-expired:{territory}:{item.get('cycle', 0)}:{due_key}"
+            key = notification_key("uav_validity_expired", level, int(item.get("cycle", 0)), key_post)
+            message = (
+                "⏳ UAV ALERT — актуальность не подтверждена\n\n"
+                f"Территория: {str(territory)}\n"
+                f"Последний известный статус: {level_title(level)}\n"
+                f"Время исходной публикации: {format_time(post.get('date'))}\n"
+                f"Окно актуальности ({HISTORY_WINDOW_HOURS} ч.) истекло без обнаруженного отбоя.\n\n"
+                "Бот снял отметку актуальности, но это не означает, что опасность официально отменена. Проверьте свежие публикации и официальные оповещения."
+            )
+            sent = await send_admin_post_draft(application, message, "uav_validity_expired", level,
+                                               int(item.get("cycle", 0)), key_post, key_override=key)
+            if sent:
+                item["validity_notice_sent_at"] = now_msk().isoformat(timespec="seconds")
+                changed = True
+
+    sync_uav_summary()
+    if changed:
+        save_state()
+
+
 async def process_due_uav_reminders(application):
     """Отправляет сохранённое напоминание через N часов, только пока событие активно."""
     territories = state.get("uav_territories") or {}
@@ -1010,7 +1197,7 @@ async def process_due_uav_reminders(application):
             level = int(item.get("level", 0))
         except (TypeError, ValueError):
             level = 0
-        if level not in (1, 2, 3):
+        if level not in (1, 2, 3) or item.get("validity_expired", False):
             continue
         if item.get("reminder_sent_at"):
             continue
@@ -1050,6 +1237,7 @@ async def process_due_uav_reminders(application):
     if changed:
         save_state()
 
+
 async def apply_rocket_event(application, active, post):
     old_active = bool(state.get("rocket_active", False))
     if old_active == active:
@@ -1086,10 +1274,16 @@ async def apply_rocket_event(application, active, post):
 # ============================================================
 def get_post_event(post, inherited_locations=None):
     text = post.get("text", "")
+    # Флаги фиксации и неподтверждённости доступны отдельно от статуса опасности.
+    observation = detect_uav_observation(text)
+    unconfirmed = is_unconfirmed_message(text)
+
     # Прямое упоминание области не обязательно, если сообщение явно называет
     # известный город, район или муниципальный округ Костромской области.
     if not has_kostroma_territory(text):
-        return {"locations": [], "uav_event": "none", "uav_level": 0, "rocket_event": "none"}
+        return {"locations": [], "uav_event": "none", "uav_level": 0,
+                "rocket_event": "none", "uav_observation": observation,
+                "unconfirmed": unconfirmed}
 
     locations = find_locations(text)
     if not locations:
@@ -1101,13 +1295,68 @@ def get_post_event(post, inherited_locations=None):
             uav_event = "cancel"
             if not locations and inherited_locations:
                 locations = list(inherited_locations)
-        else:
+        elif not unconfirmed:
             uav_level = detect_uav_level(text)
             if uav_level > 0:
                 uav_event = "active"
 
-    rocket_event = "cancel" if detect_rocket_cancel(text) else ("active" if detect_rocket(text) else "none")
-    return {"locations": locations, "uav_event": uav_event, "uav_level": uav_level, "rocket_event": rocket_event}
+    # Явно неподтверждённые сообщения не меняют активный статус ни по БПЛА, ни по ракетам.
+    if unconfirmed:
+        rocket_event = "none"
+    else:
+        rocket_event = "cancel" if detect_rocket_cancel(text) else ("active" if detect_rocket(text) else "none")
+
+    return {"locations": locations, "uav_event": uav_event, "uav_level": uav_level,
+            "rocket_event": rocket_event, "uav_observation": observation,
+            "unconfirmed": unconfirmed}
+
+async def notify_admin_problem(application, key, message, cooldown_seconds=ADMIN_ALERT_COOLDOWN_SECONDS):
+    """Отправляет администратору диагностическое сообщение с защитой от спама."""
+    now = datetime.now(timezone.utc).timestamp()
+    previous = HEALTH["admin_alerts"].get(key, 0)
+    if now - previous < cooldown_seconds:
+        return False
+    HEALTH["admin_alerts"][key] = now
+    try:
+        await application.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"🛠 UAV ALERT — диагностика\n\n{message}\n\nВремя: {format_time(now_msk().isoformat())}",
+            disable_web_page_preview=True,
+        )
+        logger.info("Диагностическое уведомление администратору отправлено: %s", key)
+        return True
+    except Exception:
+        logger.exception("Не удалось отправить диагностику администратору.")
+        return False
+
+
+async def telegram_error_handler(update, context):
+    """Ловит необработанные ошибки обработчиков Telegram и сохраняет их для /status."""
+    error = context.error
+    HEALTH["last_error"] = f"Telegram handler: {type(error).__name__}: {error}"[:500]
+    HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
+    error_text = str(error)
+    is_polling_conflict = "Conflict" in type(error).__name__ or "terminated by other getUpdates request" in error_text
+    logger.error("Необработанная ошибка Telegram-обработчика", exc_info=(type(error), error, error.__traceback__))
+    try:
+        if is_polling_conflict:
+            diagnostic = (
+                "Telegram сообщил о конфликте getUpdates: вероятно, запущено больше одного экземпляра бота "
+                "с одним токеном или одновременно включён webhook. Оставь только один работающий экземпляр "
+                "и проверь настройки запуска Render.\n\nОшибка: " + html.escape(HEALTH["last_error"])
+            )
+            alert_key = "telegram_getupdates_conflict"
+        else:
+            diagnostic = "Ошибка обработчика Telegram. Проверь логи Render.\n\n" + html.escape(HEALTH["last_error"])
+            alert_key = "telegram_handler_error"
+        await notify_admin_problem(
+            context.application,
+            alert_key,
+            diagnostic,
+        )
+    except Exception:
+        logger.exception("Ошибка при обработке диагностического уведомления Telegram.")
+
 
 # ============================================================
 # MONITORING — PROCESS ONLY NEW POSTS; NO REPEATED SPAM
@@ -1120,10 +1369,22 @@ async def check_sources(application):
         logger.warning("Предыдущая проверка ещё выполняется.")
         return
     async with monitor_lock:
+        HEALTH["last_monitor_cycle_at"] = now_msk().isoformat(timespec="seconds")
+        HEALTH["monitor_cycle_started_monotonic"] = time.monotonic()
         collected = []
+        successful_sources = 0
+        failed_sources = []
         for source_key, source_info in SOURCES.items():
             try:
                 posts = await asyncio.to_thread(fetch_source, source_key, source_info)
+                successful_sources += 1
+                HEALTH["total_source_successes"] += 1
+                HEALTH["source_health"][source_key] = {
+                    "status": "ok",
+                    "last_success_at": now_msk().isoformat(timespec="seconds"),
+                    "last_error": None,
+                    "posts_returned": len(posts),
+                }
                 for post in posts:
                     published = parse_datetime(post.get("date"))
                     if published is None:
@@ -1131,10 +1392,47 @@ async def check_sources(application):
                     age = now_msk() - published
                     if timedelta(0) <= age <= timedelta(hours=HISTORY_WINDOW_HOURS):
                         collected.append(post)
-            except requests.RequestException:
+            except requests.RequestException as exc:
+                failed_sources.append(source_key)
+                HEALTH["total_source_failures"] += 1
+                HEALTH["source_health"][source_key] = {
+                    "status": "error", "last_error_at": now_msk().isoformat(timespec="seconds"),
+                    "last_error": f"{type(exc).__name__}: {exc}"[:300],
+                }
+                HEALTH["last_error"] = f"Источник {source_key}: {type(exc).__name__}: {exc}"[:500]
+                HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
                 logger.exception("Ошибка запроса к источнику %s", source_key)
-            except Exception:
+            except Exception as exc:
+                failed_sources.append(source_key)
+                HEALTH["total_source_failures"] += 1
+                HEALTH["source_health"][source_key] = {
+                    "status": "error", "last_error_at": now_msk().isoformat(timespec="seconds"),
+                    "last_error": f"{type(exc).__name__}: {exc}"[:300],
+                }
+                HEALTH["last_error"] = f"Обработка источника {source_key}: {type(exc).__name__}: {exc}"[:500]
+                HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
                 logger.exception("Ошибка обработки источника %s", source_key)
+        if successful_sources:
+            HEALTH["last_successful_scan_at"] = now_msk().isoformat(timespec="seconds")
+            HEALTH["consecutive_all_source_failures"] = 0
+            if failed_sources:
+                logger.warning("Часть источников недоступна: %s; успешно: %s/%s", ", ".join(failed_sources), successful_sources, len(SOURCES))
+                await notify_admin_problem(
+                    application, "partial_source_failures",
+                    f"Часть источников мониторинга недоступна.\nУспешно: {successful_sources}/{len(SOURCES)}\nОшибки: {', '.join(failed_sources)}",
+                )
+            elif HEALTH["admin_alerts"].get("all_sources_failed_active"):
+                HEALTH["admin_alerts"].pop("all_sources_failed_active", None)
+                await notify_admin_problem(application, "sources_recovered", "Мониторинг восстановлен: снова удаётся получать данные хотя бы из одного источника.", cooldown_seconds=60)
+        else:
+            HEALTH["consecutive_all_source_failures"] += 1
+            logger.error("Все источники недоступны: цикл подряд №%s", HEALTH["consecutive_all_source_failures"])
+            if HEALTH["consecutive_all_source_failures"] >= 3:
+                HEALTH["admin_alerts"]["all_sources_failed_active"] = True
+                await notify_admin_problem(
+                    application, "all_sources_failed",
+                    f"Не удалось получить данные ни из одного источника {HEALTH['consecutive_all_source_failures']} проверки подряд.\nПроверь доступность Telegram-публичных страниц и логи Render.",
+                )
         unique = {p.get("key"): p for p in collected if p.get("key")}
         collected = sorted(unique.values(), key=lambda p: (parse_datetime(p.get("date")) or datetime.min.replace(tzinfo=MSK), int(p.get("post_id", 0)), p.get("source", "")))
         state["last_scan_time"] = now_msk().isoformat(timespec="seconds")
@@ -1178,6 +1476,10 @@ async def check_sources(application):
             latest_rocket = None
             for post in candidates:
                 event = get_post_event(post)
+                if event.get("uav_observation") or event.get("unconfirmed"):
+                    logger.info("Фильтр публикации: observation=%s unconfirmed=%s source=%s text=%s",
+                                event.get("uav_observation"), event.get("unconfirmed"),
+                                post.get("source_name"), post.get("text", "")[:180])
                 if event["uav_event"] != "none":
                     logger.info("Региональное событие БПЛА: %s level=%s source=%s text=%s",
                                 event["uav_event"], event["uav_level"], post.get("source_name"), post.get("text", "")[:180])
@@ -1208,8 +1510,18 @@ async def check_sources(application):
                 if new_level != old_level:
                     changed_territories.append((territory, new_level, item.get("post") or {}))
 
+            changed_names = {territory for territory, _, _ in changed_territories}
             for territory, new_level, event_post in changed_territories:
                 await apply_uav_event(application, new_level, [territory], event_post)
+            # Если при первом сканировании найдено свежее сообщение того же уровня,
+            # обновляем срок актуальности без повторной рассылки статуса.
+            for territory, item in effective.items():
+                if territory in changed_names or int(item.get("level", 0)) not in (1, 2, 3):
+                    continue
+                event_post = item.get("post") or {}
+                saved_item = (state.get("uav_territories") or {}).get(territory, {})
+                if event_post.get("key") and event_post.get("key") != saved_item.get("last_post_key"):
+                    await apply_uav_event(application, int(item["level"]), [territory], event_post)
             if not changed_territories:
                 await retry_pending_notifications(application)
             if latest_rocket:
@@ -1223,6 +1535,10 @@ async def check_sources(application):
             saw_rocket_event = False
             for post in candidates:
                 event = get_post_event(post)
+                if event.get("uav_observation") or event.get("unconfirmed"):
+                    logger.info("Фильтр публикации: observation=%s unconfirmed=%s source=%s text=%s",
+                                event.get("uav_observation"), event.get("unconfirmed"),
+                                post.get("source_name"), post.get("text", "")[:180])
                 if event["uav_event"] != "none":
                     saw_uav_event = True
                     logger.info("Региональное событие БПЛА: %s level=%s source=%s text=%s",
@@ -1267,7 +1583,13 @@ async def check_sources(application):
         save_source_state()
         state["startup_completed"] = True
         save_state()
+        await process_expired_uav_statuses(application)
         await process_due_uav_reminders(application)
+        HEALTH["last_monitor_cycle_finished_at"] = now_msk().isoformat(timespec="seconds")
+        started = HEALTH.get("monitor_cycle_started_monotonic")
+        HEALTH["monitor_cycle_duration_seconds"] = round(time.monotonic() - started, 2) if started else None
+        HEALTH["monitor_cycle_started_monotonic"] = None
+
 
 async def monitor_loop(application):
     logger.info("Мониторинг запущен. Интервал %s сек.; окно %s ч.", CHECK_INTERVAL, HISTORY_WINDOW_HOURS)
@@ -1277,9 +1599,69 @@ async def monitor_loop(application):
         except asyncio.CancelledError:
             logger.info("Мониторинг остановлен.")
             raise
-        except Exception:
+        except Exception as exc:
+            HEALTH["last_error"] = f"Цикл мониторинга: {type(exc).__name__}: {exc}"[:500]
+            HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
+            HEALTH["last_monitor_cycle_finished_at"] = now_msk().isoformat(timespec="seconds")
+            HEALTH["monitor_cycle_started_monotonic"] = None
             logger.exception("Ошибка цикла мониторинга.")
+            try:
+                await notify_admin_problem(
+                    application, "monitor_cycle_error",
+                    "Ошибка цикла мониторинга. Следующая попытка будет выполнена автоматически.\n"
+                    + html.escape(HEALTH["last_error"]),
+                )
+            except Exception:
+                logger.exception("Не удалось отправить диагностику ошибки цикла.")
         await asyncio.sleep(CHECK_INTERVAL)
+
+
+async def monitor_watchdog_loop(application):
+    """Следит, чтобы задача мониторинга не завершилась и не зависла незаметно."""
+    global monitor_task
+    logger.info("Watchdog мониторинга запущен.")
+    while True:
+        try:
+            HEALTH["last_watchdog_check_at"] = now_msk().isoformat(timespec="seconds")
+            if monitor_task is None or monitor_task.done():
+                old_task = monitor_task
+                if old_task is not None and old_task.done() and not old_task.cancelled():
+                    try:
+                        exception = old_task.exception()
+                    except Exception as exc:
+                        exception = exc
+                    if exception:
+                        HEALTH["last_error"] = f"Задача мониторинга завершилась: {type(exception).__name__}: {exception}"[:500]
+                        HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
+                monitor_task = asyncio.create_task(monitor_loop(application), name="uav-alert-monitor-restarted")
+                HEALTH["monitor_restarts"] = int(HEALTH.get("monitor_restarts", 0)) + 1
+                HEALTH["last_monitor_restart_at"] = now_msk().isoformat(timespec="seconds")
+                logger.error("Watchdog перезапустил задачу мониторинга (всего перезапусков: %s).", HEALTH["monitor_restarts"])
+                await notify_admin_problem(
+                    application, "monitor_worker_restarted",
+                    "Задача мониторинга была остановлена и автоматически запущена повторно.\n"
+                    + html.escape(str(HEALTH.get("last_error") or "Причина неизвестна.")),
+                )
+            started = HEALTH.get("monitor_cycle_started_monotonic")
+            if started is not None:
+                elapsed = time.monotonic() - float(started)
+                slow_limit = max(REQUEST_TIMEOUT * max(1, len(SOURCES)) + CHECK_INTERVAL, 120)
+                if elapsed > slow_limit:
+                    await notify_admin_problem(
+                        application, "monitor_cycle_slow",
+                        f"Проверка источников выполняется дольше обычного: {int(elapsed)} сек.\n"
+                        f"Порог диагностики: {slow_limit} сек. Новые параллельные проверки не запускаются, "
+                        "чтобы не создавать дубликаты запросов.",
+                    )
+            await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            logger.info("Watchdog мониторинга остановлен.")
+            raise
+        except Exception as exc:
+            HEALTH["last_error"] = f"Watchdog: {type(exc).__name__}: {exc}"[:500]
+            HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
+            logger.exception("Ошибка watchdog мониторинга.")
+            await asyncio.sleep(15)
 
 # ============================================================
 # KEYBOARD / STATUS / HISTORY
@@ -1291,19 +1673,31 @@ def main_keyboard():
         [InlineKeyboardButton("📡 Источники", callback_data="sources"), InlineKeyboardButton("ℹ️ Помощь", callback_data="help")],
     ])
 
+
 def format_status():
     level = int(state.get("uav_level", 0))
     locations = state.get("active_locations") or []
+    territories = state.get("uav_territories") or {}
+    stale = [(name, item) for name, item in territories.items()
+             if int(item.get("level", 0)) in (1, 2, 3) and item.get("validity_expired", False)]
     rocket = "🟥 Активна" if state.get("rocket_active") else "🟢 Не объявлена"
     if locations:
         territory_line = "Активные территории: " + html.escape(", ".join(locations))
+        status_line = html.escape(level_title(level))
+    elif stale:
+        status_line = "⏳ Актуальность не подтверждена"
+        territory_line = "Последние известные статусы (уже не считаются актуальными): " + html.escape(", ".join(name for name, _ in sorted(stale)))
     else:
+        status_line = html.escape(level_title(0))
         territory_line = "Активных территорий в сохранённом статусе нет."
-    return ("<b>UAV ALERT — текущий статус</b>\n\n" + html.escape(level_title(level)) +
+    if locations and stale:
+        territory_line += "\nАктуальность не подтверждена для: " + html.escape(", ".join(name for name, _ in sorted(stale)))
+    return ("<b>UAV ALERT — текущий статус</b>\n\n" + status_line +
             f"\n{territory_line}\nПоследнее изменение: {format_time(state.get('last_uav_time'))}\n\n" +
             f"<b>Ракетная опасность:</b> {rocket}\nПоследняя проверка: {format_time(state.get('last_scan_time'))}\n" +
             f"Публикаций в окне: {int(state.get('last_scan_count', 0))}\n\n" +
             "<i>Автоматический мониторинг публичных сообщений; не заменяет официальные оповещения.</i>")
+
 
 def format_history(limit=10):
     if not history:
@@ -1319,13 +1713,15 @@ def format_history(limit=10):
         lines.append("")
     return "\n".join(lines)
 
+
 def format_sources():
     lines = ["<b>📡 Источники мониторинга</b>", ""]
     for info in SOURCES.values():
         lines.append(f'<a href="{html.escape(info["url"], quote=True)}">{html.escape(info["name"])}</a>')
-    lines += ["", "Фильтр событий: Костромская и Ярославская области; для Костромской области также распознаются города, районы и муниципальные округа.",
+    lines += ["", "Фильтр событий: Костромская область; распознаются города, районы и муниципальные округа.",
               "Источники публичные и могут содержать неполную или неподтверждённую информацию."]
     return "\n".join(lines)
+
 
 def format_stats():
     return ("<b>📊 Статистика UAV ALERT</b>\n\n" + f"Подписчиков: {len(subscribers)}\nЗаписей истории: {len(history)}\n" +
@@ -1339,9 +1735,11 @@ def is_admin(update):
     user = update.effective_user
     return bool(user and user.id == ADMIN_ID)
 
+
 async def start_command(update, context):
     if update.effective_message:
-        await update.effective_message.reply_text("🚨 <b>UAV ALERT</b>\nГражданский информационный сервис мониторинга публичных сообщений о БПЛА в Костромской и Ярославской областях.\n\nНажми «Подписаться», чтобы получать уведомления. Бот не заменяет официальные оповещения.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
+        await update.effective_message.reply_text("🚨 <b>UAV ALERT</b>\nГражданский информационный сервис мониторинга публичных сообщений о БПЛА в Костромской области.\n\nНажми «Подписаться», чтобы получать уведомления. Бот не заменяет официальные оповещения.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
+
 
 async def subscribe_user(application, user_id):
     was_subscribed = user_id in subscribers
@@ -1351,11 +1749,13 @@ async def subscribe_user(application, user_id):
     if not was_subscribed:
         await send_current_status_to_user(application, user_id)
 
+
 async def subscribe_command(update, context):
     user, message = update.effective_user, update.effective_message
     if user and message:
         await subscribe_user(context.application, user.id)
         await message.reply_text("🔔 Подписка включена. Ты будешь получать уведомления UAV ALERT.", reply_markup=main_keyboard())
+
 
 async def unsubscribe_command(update, context):
     user, message = update.effective_user, update.effective_message
@@ -1364,21 +1764,26 @@ async def unsubscribe_command(update, context):
         save_subscribers()
         await message.reply_text("🔕 Подписка отключена.", reply_markup=main_keyboard())
 
+
 async def status_command(update, context):
     if update.effective_message:
         await update.effective_message.reply_text(format_status(), parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
+
 
 async def history_command(update, context):
     if update.effective_message:
         await update.effective_message.reply_text(format_history(), parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
 
+
 async def sources_command(update, context):
     if update.effective_message:
         await update.effective_message.reply_text(format_sources(), parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
 
+
 async def stats_command(update, context):
     if update.effective_message:
         await update.effective_message.reply_text(format_stats(), parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
+
 
 async def test_command(update, context):
     if not update.effective_message:
@@ -1388,6 +1793,7 @@ async def test_command(update, context):
         return
     await update.effective_message.reply_text("✅ Тестовая проверка Telegram-бота прошла успешно.", reply_markup=main_keyboard())
 
+
 async def admin_command(update, context):
     if not update.effective_message:
         return
@@ -1396,12 +1802,19 @@ async def admin_command(update, context):
         return
     await update.effective_message.reply_text("<b>Админ-панель UAV ALERT</b>\n\n" +
         f"Подписчиков: {len(subscribers)}\nСтатус БПЛА: {html.escape(level_title(int(state.get('uav_level', 0))))}\n" +
-        f"Ракетная опасность: {'активна' if state.get('rocket_active') else 'не объявлена'}\nПоследняя проверка: {format_time(state.get('last_scan_time'))}",
+        f"Ракетная опасность: {'активна' if state.get('rocket_active') else 'не объявлена'}\nПоследняя проверка: {format_time(state.get('last_scan_time'))}\n" +
+        f"Последний успешный опрос источников: {format_time(HEALTH.get('last_successful_scan_at'))}\n" +
+        f"Источников с ошибкой: {sum(1 for item in HEALTH.get('source_health', {}).values() if item.get('status') == 'error')}\n" +
+        f"Ошибок источников всего: {HEALTH.get('total_source_failures', 0)}\n" +
+        f"Мониторинг: {'работает' if monitor_task and not monitor_task.done() else 'не запущен'}\n" +
+        f"Последняя ошибка: {html.escape(str(HEALTH.get('last_error') or 'нет данных'))}",
         parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
+
 
 async def help_command(update, context):
     if update.effective_message:
         await update.effective_message.reply_text("<b>Команды UAV ALERT</b>\n\n/start — главное меню\n/subscribe — подписаться\n/unsubscribe — отписаться\n/status — текущий статус\n/history — история событий\n/sources — источники\n/stats — статистика\n/test — тест (администратор)\n/admin — админ-информация\n/help — помощь\n\nБот использует публичные сообщения и не заменяет официальные оповещения.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
+
 
 async def callback_handler(update, context):
     query = update.callback_query
@@ -1419,7 +1832,7 @@ async def callback_handler(update, context):
     elif data == "status": text = format_status()
     elif data == "history": text = format_history()
     elif data == "sources": text = format_sources()
-    elif data == "help": text = "<b>UAV ALERT</b>\n\nИспользуй кнопки или команды /status, /history, /sources, /subscribe и /unsubscribe.\nФильтр — Костромская и Ярославская области. Бот не заменяет официальные оповещения."
+    elif data == "help": text = "<b>UAV ALERT</b>\n\nИспользуй кнопки или команды /status, /history, /sources, /subscribe и /unsubscribe.\nФильтр — Костромская область. Бот не заменяет официальные оповещения."
     else: text = "Неизвестная команда."
     try:
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
@@ -1436,14 +1849,48 @@ app = Flask(__name__)
 def index():
     return jsonify({"service": "UAV ALERT", "status": "running", "monitor_interval_seconds": CHECK_INTERVAL,
                     "history_window_hours": HISTORY_WINDOW_HOURS, "uav_reminder_hours": UAV_REMINDER_HOURS,
-                    "subscribers": len(subscribers),
-                    "channel_id": CHANNEL_ID, "publication_mode": "admin_dm_draft", "last_scan_time": state.get("last_scan_time")}), 200
+                    "subscribers": len(subscribers), "channel_id": CHANNEL_ID,
+                    "publication_mode": "admin_dm_draft", "last_scan_time": state.get("last_scan_time"),
+                    "last_successful_scan_at": HEALTH.get("last_successful_scan_at"),
+                    "consecutive_all_source_failures": HEALTH.get("consecutive_all_source_failures", 0)}), 200
 
 @app.get("/status")
+@app.get("/health")
 def health_status():
-    return jsonify({"status": "ok", "uav_level": state.get("uav_level", 0),
-                    "rocket_active": state.get("rocket_active", False), "last_scan_time": state.get("last_scan_time"),
-                    "last_scan_count": state.get("last_scan_count", 0)}), 200
+    last_success = parse_datetime(HEALTH.get("last_successful_scan_at"))
+    seconds_since_success = int((now_msk() - last_success).total_seconds()) if last_success else None
+    stale_after = max(CHECK_INTERVAL * 4, REQUEST_TIMEOUT * max(1, len(SOURCES)) + CHECK_INTERVAL)
+    scan_stale = seconds_since_success is None or seconds_since_success > stale_after
+    monitor_running = bool(monitor_task and not monitor_task.done())
+    all_sources_down = HEALTH.get("consecutive_all_source_failures", 0) >= 3
+    healthy = monitor_running and not scan_stale and not all_sources_down
+    return jsonify({
+        "status": "ok" if healthy else "degraded",
+        "service": "UAV ALERT",
+        "process_started_at": HEALTH.get("process_started_at"),
+        "monitor_running": monitor_running,
+        "monitor_interval_seconds": CHECK_INTERVAL,
+        "last_monitor_cycle_at": HEALTH.get("last_monitor_cycle_at"),
+        "last_monitor_cycle_finished_at": HEALTH.get("last_monitor_cycle_finished_at"),
+        "monitor_cycle_duration_seconds": HEALTH.get("monitor_cycle_duration_seconds"),
+        "last_watchdog_check_at": HEALTH.get("last_watchdog_check_at"),
+        "monitor_restarts": HEALTH.get("monitor_restarts", 0),
+        "last_monitor_restart_at": HEALTH.get("last_monitor_restart_at"),
+        "last_scan_time": state.get("last_scan_time"),
+        "last_successful_scan_at": HEALTH.get("last_successful_scan_at"),
+        "seconds_since_successful_scan": seconds_since_success,
+        "stale_after_seconds": stale_after,
+        "consecutive_all_source_failures": HEALTH.get("consecutive_all_source_failures", 0),
+        "source_failures_total": HEALTH.get("total_source_failures", 0),
+        "source_successes_total": HEALTH.get("total_source_successes", 0),
+        "source_health": HEALTH.get("source_health", {}),
+        "last_error": HEALTH.get("last_error"),
+        "last_error_at": HEALTH.get("last_error_at"),
+        "uav_level": state.get("uav_level", 0),
+        "rocket_active": state.get("rocket_active", False),
+        "last_scan_count": state.get("last_scan_count", 0),
+    }), 200
+
 
 def run_flask():
     app.run(host="0.0.0.0", port=PORT, use_reloader=False)
@@ -1452,7 +1899,7 @@ def run_flask():
 # APPLICATION LIFECYCLE / MAIN
 # ============================================================
 async def post_init(application):
-    global monitor_task
+    global monitor_task, monitor_watchdog_task
     commands = [BotCommand("start", "Главное меню"), BotCommand("subscribe", "Подписаться"),
                 BotCommand("unsubscribe", "Отписаться"), BotCommand("status", "Текущий статус"),
                 BotCommand("history", "История событий"), BotCommand("sources", "Источники"),
@@ -1463,20 +1910,25 @@ async def post_init(application):
     except TelegramError:
         logger.exception("Не удалось установить команды Telegram.")
     monitor_task = asyncio.create_task(monitor_loop(application), name="uav-alert-monitor")
-    logger.info("UAV ALERT готов к работе.")
+    monitor_watchdog_task = asyncio.create_task(monitor_watchdog_loop(application), name="uav-alert-watchdog")
+    logger.info("UAV ALERT готов к работе. Запущены мониторинг и watchdog.")
+
 
 async def post_shutdown(application):
-    global monitor_task
+    global monitor_task, monitor_watchdog_task
     logger.info("UAV ALERT завершает работу.")
-    if monitor_task and not monitor_task.done():
-        monitor_task.cancel()
-        try:
-            await monitor_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("Ошибка при остановке мониторинга.")
+    for task in (monitor_watchdog_task, monitor_task):
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Ошибка при остановке фоновой задачи %s.", task.get_name())
     monitor_task = None
+    monitor_watchdog_task = None
+
 
 def main():
     if not BOT_TOKEN:
@@ -1494,8 +1946,10 @@ def main():
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
+    application.add_error_handler(telegram_error_handler)
     logger.info("Запускаем Telegram polling.")
     application.run_polling(drop_pending_updates=False, allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
