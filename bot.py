@@ -867,7 +867,7 @@ def build_rocket_push(active, post):
     return f"<b>{title}</b>\n\n{note}"
 
 async def send_push(application, message, event_type, level=0, cycle=0, post=None, key_override=None):
-    """Отправляет push и сохраняет точный текст для повторной доставки после ошибки/перезапуска."""
+    """Доставляет push подписчикам, сохраняет прогресс по каждому получателю и повторяет ошибки."""
     post = post or {}
     key = key_override or notification_key(event_type, level, cycle, post)
     record = notification_events.get(key, {})
@@ -875,36 +875,39 @@ async def send_push(application, message, event_type, level=0, cycle=0, post=Non
         delivered_users = {int(x) for x in record.get("delivered_users", [])}
     except (TypeError, ValueError):
         delivered_users = set()
-    if record.get("sent"):
-        logger.info("Уведомление %s уже доставлено.", event_type)
-        return int(record.get("sent_count", 0))
 
-    # Записываем сообщение до отправки. При следующей проверке повторяем именно этот текст.
+    # Если в сохранённой записи были отмечены все текущие получатели, повтор не нужен.
+    if record.get("sent"):
+        logger.info("Push %s (%s) уже отмечен доставленным: %s получателей.", event_type, key[:12], record.get("sent_count", 0))
+        return int(record.get("sent_count", 0) or 0)
+
+    recipient_ids = sorted(set(int(uid) for uid in subscribers))
     record.update({
         "sent": False, "message": message, "event": event_type,
         "level": int(level), "cycle": int(cycle), "post_data": post,
         "post": post.get("key"), "key": key,
         "attempted_at": now_msk().isoformat(timespec="seconds"),
         "delivered_users": sorted(delivered_users),
+        "recipient_count": len(recipient_ids),
     })
     notification_events[key] = record
     save_notification_events()
 
-    if not subscribers:
-        # Не ставим событие в очередь на будущее: новый подписчик получит актуальный
-        # статус при подписке, а не устаревшее уведомление из прошлого.
+    if not recipient_ids:
+        # Событие без получателей не должно превращаться в устаревшую рассылку позже.
         record.update({"sent": True, "sent_count": 0, "failed_count": 0,
                        "delivered_users": [],
                        "error": "Пропущено: на момент события не было подписчиков.",
                        "completed_at": now_msk().isoformat(timespec="seconds")})
         notification_events[key] = record
         save_notification_events()
-        logger.info("Push %s пропущен: на момент события не было подписчиков.", event_type)
+        logger.warning("Push %s (%s) не отправлен: список подписчиков пуст.", event_type, key[:12])
         return 0
 
     dead_users = []
     errors = []
-    for user_id in list(subscribers):
+    delivered_this_run = 0
+    for user_id in recipient_ids:
         if user_id in delivered_users:
             continue
         delivered = False
@@ -915,47 +918,83 @@ async def send_push(application, message, event_type, level=0, cycle=0, post=Non
                     disable_web_page_preview=True,
                 )
                 delivered_users.add(user_id)
+                delivered_this_run += 1
                 delivered = True
+                logger.info("Push %s (%s) доставлен пользователю %s.", event_type, key[:12], user_id)
                 break
             except RetryAfter as exc:
+                retry_delay = getattr(exc, "retry_after", 2)
+                if hasattr(retry_delay, "total_seconds"):
+                    retry_delay = retry_delay.total_seconds()
                 if attempt == 0:
-                    retry_delay = getattr(exc, "retry_after", 2)
-                    if hasattr(retry_delay, "total_seconds"):
-                        retry_delay = retry_delay.total_seconds()
                     await asyncio.sleep(max(1.0, float(retry_delay)))
                     continue
                 errors.append(f"{user_id}: RetryAfter")
-            except Forbidden:
+                logger.warning("Push %s: Telegram ограничил отправку пользователю %s.", key[:12], user_id)
+            except Forbidden as exc:
                 dead_users.append(user_id)
-                errors.append(f"{user_id}: Forbidden")
+                errors.append(f"{user_id}: Forbidden: {str(exc)[:120]}")
+                logger.warning("Push %s: пользователь %s недоступен боту (возможно, заблокировал его).", key[:12], user_id)
                 break
-            except (BadRequest, TelegramError) as exc:
-                errors.append(f"{user_id}: {str(exc)[:180]}")
-                logger.warning("Не удалось отправить push пользователю %s: %s", user_id, exc)
+            except BadRequest as exc:
+                # Если HTML в тексте не принят Telegram, повторяем сообщение как обычный текст.
+                error_text = str(exc)
+                if attempt == 0 and ("parse entities" in error_text.lower() or "can't parse" in error_text.lower() or "can't find end" in error_text.lower()):
+                    plain_message = html.unescape(BeautifulSoup(message, "html.parser").get_text(" ", strip=True))
+                    try:
+                        await application.bot.send_message(
+                            chat_id=user_id, text=plain_message,
+                            disable_web_page_preview=True,
+                        )
+                        delivered_users.add(user_id)
+                        delivered_this_run += 1
+                        delivered = True
+                        logger.warning("Push %s пользователю %s доставлен как обычный текст после ошибки HTML.", key[:12], user_id)
+                        break
+                    except TelegramError as fallback_exc:
+                        errors.append(f"{user_id}: HTML fallback: {str(fallback_exc)[:160]}")
+                        logger.exception("Не сработала резервная отправка push пользователю %s.", user_id)
+                        break
+                errors.append(f"{user_id}: BadRequest: {error_text[:160]}")
+                logger.warning("Telegram отклонил push для пользователя %s: %s", user_id, error_text[:200])
+                break
+            except TelegramError as exc:
+                errors.append(f"{user_id}: {type(exc).__name__}: {str(exc)[:160]}")
+                logger.warning("Ошибка Telegram при отправке push пользователю %s: %s: %s", user_id, type(exc).__name__, exc)
+                break
+            except Exception as exc:
+                errors.append(f"{user_id}: {type(exc).__name__}: {str(exc)[:160]}")
+                logger.exception("Неожиданная ошибка отправки push пользователю %s.", user_id)
                 break
         if not delivered and user_id not in dead_users:
-            logger.warning("Уведомление пока не доставлено пользователю %s", user_id)
+            logger.warning("Push %s пока не доставлен пользователю %s; будет повторная попытка.", key[:12], user_id)
 
     for user_id in dead_users:
         subscribers.discard(user_id)
     if dead_users:
         save_subscribers()
 
-    failed_count = sum(1 for user_id in subscribers if user_id not in delivered_users)
+    current_subscribers = set(subscribers)
+    delivered_current = delivered_users.intersection(current_subscribers)
+    failed_users = current_subscribers - delivered_current
     notification_events[key] = {
-        "sent": failed_count == 0 and len(subscribers) > 0,
-        "sent_count": len(delivered_users.intersection(subscribers)),
-        "failed_count": failed_count,
+        "sent": len(failed_users) == 0 and len(current_subscribers) > 0,
+        "sent_count": len(delivered_current),
+        "failed_count": len(failed_users),
+        "recipient_count": len(recipient_ids),
         "delivered_users": sorted(delivered_users),
         "attempted_at": now_msk().isoformat(timespec="seconds"),
         "event": event_type, "level": int(level), "cycle": int(cycle),
         "post": post.get("key"), "post_data": post, "message": message, "key": key,
-        "error": "; ".join(errors[:10]) if errors else None,
+        "error": "; ".join(errors[:20]) if errors else None,
     }
+    if not failed_users:
+        notification_events[key]["completed_at"] = now_msk().isoformat(timespec="seconds")
     save_notification_events()
-    logger.info("Push %s: доставлено %s; осталось %s", event_type,
-                len(delivered_users.intersection(subscribers)), failed_count)
-    return len(delivered_users.intersection(subscribers))
+    logger.info("Push %s (%s): получателей=%s, доставлено=%s, не доставлено=%s, ошибок=%s",
+                event_type, key[:12], len(current_subscribers), len(delivered_current),
+                len(failed_users), len(errors))
+    return delivered_this_run
 
 def build_uav_admin_draft(level, locations, post):
     """Формирует черновик для @RADAR_Kostroma без заголовка-подсказки и строк источника."""
@@ -2105,7 +2144,7 @@ async def stats_command(update, context):
 
 
 async def test_command(update, context):
-    """Проверяет реальную отправку сообщения через Bot API, не рассылая тест подписчикам."""
+    """Проверяет доставку нейтрального технического push всем текущим подписчикам."""
     message = update.effective_message
     if not message:
         return
@@ -2113,40 +2152,63 @@ async def test_command(update, context):
         await message.reply_text("Команда доступна только администратору.")
         return
 
+    test_text = (
+        "🧪 UAV ALERT — тест push-уведомлений\n\n"
+        "Это техническая проверка доставки. Это сообщение не означает наличие опасности.\n"
+        f"Время: {now_msk().strftime('%d.%m.%Y %H:%M МСК')}"
+    )
+    recipient_ids = sorted(set(int(uid) for uid in subscribers))
+    delivered = []
+    failed = []
+    blocked = []
+    if not recipient_ids:
+        await message.reply_text(
+            "⚠️ Тест не отправлен: список подписчиков пуст.\n"
+            "Проверь /stats и файл subscribers.json в DATA_DIR. Каждый получатель должен сначала открыть бота и подписаться."
+        )
+        logger.warning("Администратор запросил /test, но subscribers пуст.")
+        return
+
+    for user_id in recipient_ids:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=test_text, disable_web_page_preview=True)
+            delivered.append(user_id)
+            logger.info("Тестовый push доставлен пользователю %s.", user_id)
+        except Forbidden as exc:
+            blocked.append(user_id)
+            failed.append((user_id, f"Forbidden: {str(exc)[:120]}"))
+            logger.warning("Тестовый push: пользователь %s недоступен боту: %s", user_id, exc)
+        except TelegramError as exc:
+            failed.append((user_id, f"{type(exc).__name__}: {str(exc)[:160]}"))
+            logger.warning("Тестовый push не доставлен пользователю %s: %s: %s", user_id, type(exc).__name__, exc)
+        except Exception as exc:
+            failed.append((user_id, f"{type(exc).__name__}: {str(exc)[:160]}"))
+            logger.exception("Неожиданная ошибка тестового push пользователю %s.", user_id)
+
+    if blocked:
+        for user_id in blocked:
+            subscribers.discard(user_id)
+        save_subscribers()
+
     pending_pushes = sum(
         1 for item in notification_events.values()
         if isinstance(item, dict) and not item.get("sent") and item.get("message") and item.get("event")
     )
-    try:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                "🧪 UAV ALERT — тест доставки\n\n"
-                "Это тестовое техническое сообщение. Оно не означает наличие опасности.\n"
-                f"Подписчиков сейчас: {len(subscribers)}\n"
-                f"Уведомлений в очереди повтора: {pending_pushes}\n"
-                f"Время: {now_msk().strftime('%d.%m.%Y %H:%M МСК')}"
-            ),
-            disable_web_page_preview=True,
+    report = (
+        "🧪 <b>UAV ALERT — результат теста push</b>\n\n"
+        f"Подписчиков до проверки: {len(recipient_ids)}\n"
+        f"Успешно отправлено: {len(delivered)}\n"
+        f"Ошибок доставки: {len(failed)}\n"
+        f"Удалено недоступных подписчиков: {len(blocked)}\n"
+        f"Ожидают повторной доставки: {pending_pushes}\n"
+        f"Время: {now_msk().strftime('%d.%m.%Y %H:%M МСК')}"
+    )
+    if failed:
+        report += "\n\n<b>Первые ошибки:</b>\n" + "\n".join(
+            f"• <code>{html.escape(str(uid))}</code>: {html.escape(err[:180])}" for uid, err in failed[:5]
         )
-        await message.reply_text(
-            "✅ Тестовое сообщение отправлено администратору через Telegram Bot API.\n\n"
-            f"Подписчиков: {len(subscribers)}\n"
-            f"Ожидают повторной доставки: {pending_pushes}\n\n"
-            "Важно: тест проверяет отправку бота в этот чат, но не отправляет тест всем подписчикам.",
-            reply_markup=main_keyboard(),
-        )
-    except TelegramError as exc:
-        logger.exception("Тестовая отправка Telegram не удалась.")
-        HEALTH["last_error"] = f"Тест отправки: {type(exc).__name__}: {exc}"[:500]
-        HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
-        await message.reply_text(
-            "❌ Тестовая отправка не удалась. Проверь Logs в Render.\n\n"
-            f"Ошибка: {html.escape(str(exc)[:300])}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard(),
-        )
-
+    await message.reply_text(report, parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
+    logger.info("Тест push завершён: получателей=%s доставлено=%s ошибок=%s.", len(recipient_ids), len(delivered), len(failed))
 
 async def admin_command(update, context):
     if not update.effective_message:
