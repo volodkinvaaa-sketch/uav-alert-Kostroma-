@@ -1925,10 +1925,29 @@ def format_status():
         status_line = "⏳ Актуальность не подтверждена"
         territory_line = "Последние известные статусы (уже не считаются актуальными): " + html.escape(", ".join(name for name, _ in sorted(stale)))
     elif not state.get("last_uav_time"):
-        # Не показываем зелёный статус, если в сохранённых данных вообще нет
-        # времени последнего события: отсутствие данных не означает отсутствие угрозы.
+        # Не превращаем отсутствие распознанных публикаций в официальное «отбоя нет/опасности нет».
+        # Если мониторинг уже выполнял проверку, показываем это явно, а не сообщаем,
+        # будто время проверки неизвестно. До первой проверки сообщаем, что она ожидается.
         status_line = "⏳ Статус не подтверждён"
-        territory_line = "Не удалось восстановить последнее событие БПЛА из сохранённых данных. Проверяйте официальные оповещения."
+        if state.get("last_scan_time"):
+            scan_count = int(state.get("last_scan_count", 0) or 0)
+            if scan_count:
+                territory_line = (
+                    f"За последнее окно мониторинга найдено публикаций: {scan_count}, "
+                    "но последнее событие БПЛА не удалось надёжно восстановить. "
+                    "Проверяйте официальные оповещения."
+                )
+            else:
+                territory_line = (
+                    "Проверка публичных источников выполнена, но публикаций в заданном "
+                    "окне мониторинга не найдено. Это не подтверждает отсутствие угрозы; "
+                    "проверяйте официальные оповещения."
+                )
+        else:
+            territory_line = (
+                "Первая проверка публичных источников ещё не завершена. "
+                "Проверяйте официальные оповещения."
+            )
     else:
         status_line = html.escape(level_title(0))
         territory_line = "Активных территорий в сохранённом статусе нет."
@@ -2194,9 +2213,18 @@ async def post_init(application):
         await application.bot.set_my_commands(commands)
     except TelegramError:
         logger.exception("Не удалось установить команды Telegram.")
+    # Выполняем первую проверку до того, как бот начнёт отвечать на команды.
+    # Это не даёт /status сразу после запуска показывать «Последняя проверка: неизвестно»
+    # только потому, что фоновая задача ещё не успела стартовать.
+    try:
+        await check_sources(application)
+    except Exception as exc:
+        HEALTH["last_error"] = f"Первичная проверка мониторинга: {type(exc).__name__}: {exc}"[:500]
+        HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
+        logger.exception("Ошибка первичной проверки источников; фоновый мониторинг будет повторять попытки.")
     monitor_task = asyncio.create_task(monitor_loop(application), name="uav-alert-monitor")
     monitor_watchdog_task = asyncio.create_task(monitor_watchdog_loop(application), name="uav-alert-watchdog")
-    logger.info("UAV ALERT готов к работе. Запущены мониторинг и watchdog.")
+    logger.info("UAV ALERT готов к работе. Запущены первичная проверка, мониторинг и watchdog.")
 
 
 async def post_shutdown(application):
