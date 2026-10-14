@@ -1487,9 +1487,20 @@ def get_post_event(post, inherited_locations=None):
     uav_event, uav_level = "none", 0
     if contains_uav(text):
         if is_uav_cancel:
-            uav_event = "cancel"
+            # Отбой имеет приоритет, кроме сообщений, где в той же публикации
+            # явно говорится, что угроза сохраняется: тогда detect_uav_level()
+            # может вернуть активный уровень.
             uav_level = detect_uav_level(text)
             if uav_level > 0:
+                uav_event = "active"
+            else:
+                uav_event = "cancel"
+        else:
+            # ВАЖНО: раньше здесь отсутствовала ветка активных статусов.
+            # Из-за этого «Внимание/Угроза/Опасность по БПЛА» проходили
+            # территориальную проверку, но оставались событием "none".
+            uav_level = detect_uav_level(text)
+            if uav_level > 0 and not unconfirmed:
                 uav_event = "active"
 
     # Явно неподтверждённые сообщения не меняют активный статус ни по БПЛА, ни по ракетам.
