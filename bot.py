@@ -148,6 +148,9 @@ DEFAULT_STATE = {
     "last_rocket_event_type": None, "last_rocket_notification_key": None,
     "startup_completed": False, "status_recovery_checked": False,
     "last_scan_time": None, "last_scan_count": 0,
+    "last_scan_all_sources_ok": False, "last_window_post_text": None,
+    "last_window_post_source": None, "last_window_post_url": None,
+    "last_window_post_date": None,
 }
 state = load_json(STATE_FILE, DEFAULT_STATE.copy())
 if not isinstance(state, dict):
@@ -647,7 +650,9 @@ def fetch_source(source_key, source_info):
             "url": f"https://t.me/{data_post}",
         })
     posts.sort(key=lambda p: (parse_datetime(p.get("date")) or datetime.min.replace(tzinfo=MSK), int(p.get("post_id", 0))))
-    return posts[-SOURCE_LIMIT:]
+    # Возвращаем все публикации, которые присутствуют в загруженной странице Telegram.
+    # В check_sources затем отбирается полное окно актуальности в 5 часов.
+    return posts
 
 
 def mark_post_processed(post):
@@ -1637,7 +1642,7 @@ async def check_sources(application):
                     # Только публикации не старше 5 часов участвуют в восстановлении
                     # статуса и обработке событий. Будущие/ошибочно датированные посты
                     # пропускаются, чтобы они не продлевали актуальность статуса.
-                    if timedelta(0) <= age <= timedelta(hours=5):
+                    if timedelta(0) <= age <= timedelta(hours=HISTORY_WINDOW_HOURS):
                         collected.append(post)
                     else:
                         logger.debug(
@@ -1689,8 +1694,20 @@ async def check_sources(application):
         collected = sorted(unique.values(), key=lambda p: (parse_datetime(p.get("date")) or datetime.min.replace(tzinfo=MSK), int(p.get("post_id", 0)), p.get("source", "")))
         state["last_scan_time"] = now_msk().isoformat(timespec="seconds")
         state["last_scan_count"] = len(collected)
+        state["last_scan_all_sources_ok"] = (successful_sources == len(SOURCES) and not failed_sources)
+        latest_window_post = collected[-1] if collected else None
+        if latest_window_post:
+            state["last_window_post_text"] = str(latest_window_post.get("text") or "")[:1200]
+            state["last_window_post_source"] = latest_window_post.get("source_name") or latest_window_post.get("source")
+            state["last_window_post_url"] = latest_window_post.get("url")
+            state["last_window_post_date"] = latest_window_post.get("date")
+        else:
+            state["last_window_post_text"] = None
+            state["last_window_post_source"] = None
+            state["last_window_post_url"] = None
+            state["last_window_post_date"] = None
         save_state()
-        logger.info("Найдено публикаций в окне: %s; новых: %s", len(collected), sum(1 for p in collected if p.get("key") not in sent_posts))
+        logger.info("Найдено публикаций в окне 5 ч.: %s; новых: %s; все источники доступны: %s; последняя публикация: %s", len(collected), sum(1 for p in collected if p.get("key") not in sent_posts), state["last_scan_all_sources_ok"], latest_window_post.get("key") if latest_window_post else "нет")
 
         # During the first scan, reconstruct current state from recent posts.
         # Recovery safeguard: if the bot says startup is complete but all UAV state
@@ -2015,46 +2032,55 @@ def format_status():
     stale = [(name, item) for name, item in territories.items()
              if int(item.get("level", 0)) in (1, 2, 3) and item.get("validity_expired", False)]
     rocket = "🟥 Активна" if state.get("rocket_active") else "🟢 Не объявлена"
+    scan_done = bool(state.get("last_scan_time"))
+    all_sources_ok = bool(state.get("last_scan_all_sources_ok"))
+
     if locations:
         territory_line = "Активные территории: " + html.escape(", ".join(locations))
         status_line = html.escape(level_title(level))
     elif stale:
         status_line = "⏳ Актуальность не подтверждена"
-        territory_line = "Последние известные статусы (уже не считаются актуальными): " + html.escape(", ".join(name for name, _ in sorted(stale)))
-    elif not state.get("last_uav_time"):
-        # Не превращаем отсутствие распознанных публикаций в официальное «отбоя нет/опасности нет».
-        # Если мониторинг уже выполнял проверку, показываем это явно, а не сообщаем,
-        # будто время проверки неизвестно. До первой проверки сообщаем, что она ожидается.
-        status_line = "⏳ Статус не подтверждён"
-        if state.get("last_scan_time"):
-            scan_count = int(state.get("last_scan_count", 0) or 0)
-            if scan_count:
-                territory_line = (
-                    f"За последнее окно мониторинга найдено публикаций: {scan_count}, "
-                    "но последнее событие БПЛА не удалось надёжно восстановить. "
-                    "Проверяйте официальные оповещения."
-                )
-            else:
-                territory_line = (
-                    "Проверка публичных источников выполнена, но публикаций в заданном "
-                    "окне мониторинга не найдено. Это не подтверждает отсутствие угрозы; "
-                    "проверяйте официальные оповещения."
-                )
-        else:
-            territory_line = (
-                "Первая проверка публичных источников ещё не завершена. "
-                "Проверяйте официальные оповещения."
-            )
+        territory_line = "Последние известные статусы уже не считаются актуальными: " + html.escape(", ".join(name for name, _ in sorted(stale)))
+    elif scan_done and all_sources_ok:
+        # Это вывод только по проверенным публичным источникам, а не официальное заверение об отсутствии угрозы.
+        status_line = "🟢 Активная опасность по БПЛА не обнаружена в публикациях за последние 5 часов"
+        territory_line = "В доступных отслеживаемых источниках за последние 5 часов не найдено актуального активного статуса по БПЛА. Это не является официальным подтверждением отсутствия угрозы."
+    elif scan_done:
+        status_line = "⏳ Статус не подтверждён: не все источники доступны"
+        territory_line = "Нельзя надёжно сделать вывод по неполному набору источников. Проверяйте официальные оповещения региона."
     else:
-        status_line = html.escape(level_title(0))
-        territory_line = "Активных территорий в сохранённом статусе нет."
+        status_line = "⏳ Статус не подтверждён"
+        territory_line = "Первая проверка публичных источников ещё не завершена. Проверяйте официальные оповещения."
+
     if locations and stale:
         territory_line += "\nАктуальность не подтверждена для: " + html.escape(", ".join(name for name, _ in sorted(stale)))
+
+    # Показываем самую свежую публикацию, найденную среди всех полученных сообщений в окне 5 часов.
+    latest_text = str(state.get("last_window_post_text") or "").strip()
+    latest_source = state.get("last_window_post_source")
+    latest_url = state.get("last_window_post_url")
+    latest_date = state.get("last_window_post_date")
+    latest_line = "\n\n<b>Последняя публикация из проверенных источников за 5 часов (может не относиться к БПЛА):</b> "
+    if latest_text and latest_date:
+        source_name = html.escape(str(latest_source or "Публичный источник"))
+        if latest_url and str(latest_url).startswith("https://t.me/"):
+            source_name = f'<a href="{html.escape(str(latest_url), quote=True)}">{source_name}</a>'
+        excerpt = html.escape(latest_text[:350])
+        if len(latest_text) > 350:
+            excerpt += "…"
+        latest_line += f"{source_name} — {format_time(latest_date)}\n{excerpt}"
+    elif scan_done:
+        latest_line += "за последние 5 часов публикаций не найдено."
+    else:
+        latest_line += "ожидается первая проверка."
+
     return ("<b>UAV ALERT — текущий статус</b>\n\n" + status_line +
-            f"\n{territory_line}\nПоследнее изменение: {format_time(state.get('last_uav_time'))}\n\n" +
+            f"\n{territory_line}\nПоследнее изменение: {format_time(state.get('last_uav_time'))}" +
+            latest_line + "\n\n" +
             f"<b>Ракетная опасность:</b> {rocket}\nПоследняя проверка: {format_time(state.get('last_scan_time'))}\n" +
-            f"Публикаций в окне: {int(state.get('last_scan_count', 0))}\n\n" +
-            "<i>Автоматический мониторинг публичных сообщений; не заменяет официальные оповещения.</i>")
+            f"Источников доступно: {sum(1 for item in HEALTH.get('source_health', {}).values() if item.get('status') == 'ok')}/{len(SOURCES)}\n" +
+            f"Публикаций в окне 5 ч.: {int(state.get('last_scan_count', 0) or 0)}\n\n" +
+            "<i>Мониторинг публичных сообщений; не заменяет официальные оповещения.</i>")
 
 
 def format_history(limit=10):
