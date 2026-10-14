@@ -509,21 +509,48 @@ def _event_clauses(text):
 
 
 def _has_target_cancel(text, target_re):
-    """Проверяет отмену именно целевого события внутри одной части сообщения."""
-    for clause in _event_clauses(text):
-        if not CANCEL_RE.search(clause) or not target_re.search(clause):
+    """Проверяет отбой целевого события, включая короткие заголовки и варианты порядка слов."""
+    value = normalize_text(text)
+    clauses = _event_clauses(value)
+    for index, clause in enumerate(clauses):
+        if not CANCEL_RE.search(clause):
             continue
-        # Отрицание отмены или указание, что статус сохраняется, не является отбоем.
-        direct_cancel = re.search(
-            r"(?:\b(?:отбой|отмен\w*|снят\w*|прекращен\w*)\b.{0,70}"
-            r"(?:бпла\b|беспилот\w*|дрон\w*|мвш\b|мрш\b|ракет\w*|опасност\w*|угроз\w*)|"
-            r"(?:бпла\b|беспилот\w*|дрон\w*|мвш\b|мрш\b|ракет\w*|опасност\w*|угроз\w*)"
-            r".{0,70}\b(?:отбой|отмен\w*|снят\w*|прекращен\w*)\b)", clause)
+
+        # Обычно контекст цели находится в той же фразе: «отбой по БПЛА».
+        # Для заголовков вроде «Отбой!» + следующая строка «по БПЛА в Костроме»
+        # учитываем соседнюю часть, но не смешиваем отмену ракетной опасности с БПЛА.
+        target_in_clause = bool(target_re.search(clause))
+        context = clause
+        if not target_in_clause and index + 1 < len(clauses):
+            # Соседняя часть разрешена только для отдельного короткого заголовка
+            # «Отбой», но не для «Отбой ракетной опасности, угроза БПЛА сохраняется».
+            has_rocket_context = bool(ROCKET_CANCEL_CONTEXT_RE.search(clause))
+            bare_cancel_heading = bool(re.fullmatch(
+                r"\s*(?:отбой|отмена|отменен\w*|отменена|снят\w*|снята|снято|прекращен\w*)\s*",
+                clause))
+            if bare_cancel_heading and not has_rocket_context:
+                context = " ".join((clause, clauses[index + 1]))
+            else:
+                continue
+        if not target_re.search(context):
+            continue
+
+        # Если следующая фраза говорит, что угроза БПЛА сохраняется, отдельный
+        # заголовок «Отбой» не должен отменять этот активный статус.
+        if context != clause and PERSIST_RE.search(context):
+            continue
+
+        # Не трактуем отрицание отмены как реальный отбой.
         if re.search(r"\bне\s+(?:объявля\w*|было|подтвержд\w*|снят\w*|отмен\w*|прекращен\w*)\b", clause):
             continue
-        if PERSIST_RE.search(clause) and not direct_cancel:
+
+        # «Угроза БПЛА сохраняется», «отбой не объявлен» — не отмена.
+        explicit_cancel = re.search(
+            r"\b(?:отбой|отмен\w*|снят\w*|прекращен\w*|аннулирован\w*|"
+            r"миновал\w*|больше\s+нет|больше\s+не\s+актуальн\w*)\b", clause)
+        if PERSIST_RE.search(context) and not explicit_cancel:
             continue
-        if direct_cancel or not PERSIST_RE.search(clause):
+        if explicit_cancel:
             return True
     return False
 
@@ -1442,22 +1469,25 @@ def get_post_event(post, inherited_locations=None):
 
     # Прямое упоминание области не обязательно, если сообщение явно называет
     # известный город, район или муниципальный округ Костромской области.
-    if not has_kostroma_territory(text):
+    # У некоторых источников короткий заголовок «Отбой по БПЛА» не содержит географии:
+    # разрешаем его только если у бота уже есть активная территория UAV ALERT, чтобы
+    # не принять отбой в другом регионе за локальный.
+    explicit_region = has_kostroma_territory(text)
+    is_uav_cancel = contains_uav(text) and detect_uav_cancel(text)
+    known_active_locations = list(inherited_locations or state.get("active_locations") or [])
+    if not explicit_region and not (is_uav_cancel and known_active_locations):
         return {"locations": [], "uav_event": "none", "uav_level": 0,
                 "rocket_event": "none", "uav_observation": observation,
                 "uav_fixation": False, "unconfirmed": unconfirmed, "region_match": False}
 
     locations = find_locations(text)
     if not locations:
-        locations = ["Костромская область"]
+        locations = known_active_locations if is_uav_cancel and known_active_locations else ["Костромская область"]
 
     uav_event, uav_level = "none", 0
     if contains_uav(text):
-        if detect_uav_cancel(text):
+        if is_uav_cancel:
             uav_event = "cancel"
-            if not locations and inherited_locations:
-                locations = list(inherited_locations)
-        elif not unconfirmed:
             uav_level = detect_uav_level(text)
             if uav_level > 0:
                 uav_event = "active"
