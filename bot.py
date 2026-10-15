@@ -1681,6 +1681,22 @@ def rocket_event_is_specific_to_kostroma(text):
     return False
 
 
+def is_region_wide_uav_event(text):
+    """True only when an active UAV status is explicitly tied to the whole Kostroma region."""
+    value = normalize_text(text)
+    if not TRACKED_REGION_RE.search(value):
+        return False
+    for clause in _event_clauses(value):
+        if not TRACKED_REGION_RE.search(clause) or detect_uav_level(clause) <= 0:
+            continue
+        # If the same clause names specific districts/cities, keep it local instead
+        # of turning a district-level report into a region-wide announcement.
+        specific = [item for item in find_locations(clause) if item != "Костромская область"]
+        if not specific:
+            return True
+    return False
+
+
 def get_post_event(post, inherited_locations=None):
     text = post.get("text", "")
     # Флаги фиксации и неподтверждённости доступны отдельно от статуса опасности.
@@ -1727,6 +1743,11 @@ def get_post_event(post, inherited_locations=None):
             uav_level = detect_uav_level(text)
             if uav_level > 0 and not unconfirmed:
                 uav_event = "active"
+                # Региональное объявление должно обрабатываться как событие по всей
+                # Костромской области, даже если в тексте нет списка из 3+ территорий.
+                # Локальные сообщения с конкретным районом/городом остаются локальными.
+                if is_region_wide_uav_event(text):
+                    locations = ["Костромская область"]
 
     # Ракетный статус меняется только по явно территориальному сообщению.
     # При нескольких перечисленных областях общая фраза «ракетная опасность/отбой»
