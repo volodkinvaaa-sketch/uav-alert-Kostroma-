@@ -1427,6 +1427,14 @@ async def apply_uav_event(application, new_level, locations, post):
                                 event_type, int(new_level), cycle, event_post, key_override=key)
                 await send_admin_post_draft(application, build_uav_admin_draft(int(new_level), [territory], post),
                                             event_type, int(new_level), cycle, event_post, key_override=key)
+                # Публикуем и обычные события по одной/двум территориям.
+                # Раньше публикация в канал выполнялась только для сгруппированных
+                # объявлений на 3+ территорий.
+                await publish_to_channel(
+                    application,
+                    build_uav_channel_post(int(new_level), [territory], post),
+                    event_type, int(new_level), cycle, event_post, key_override=key,
+                )
             changed = True
 
         if grouped_announcement and group_notification_needed:
