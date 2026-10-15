@@ -1834,52 +1834,61 @@ async def check_sources(application):
         collected = []
         successful_sources = 0
         failed_sources = []
-        for source_key, source_info in SOURCES.items():
+        # Запрашиваем все источники параллельно: медленный канал больше не задерживает
+        # начало проверки остальных источников. Каждый результат обрабатывается отдельно.
+        async def fetch_one(source_key, source_info):
             try:
                 posts = await asyncio.to_thread(fetch_source, source_key, source_info)
-                successful_sources += 1
-                HEALTH["total_source_successes"] += 1
-                HEALTH["source_health"][source_key] = {
-                    "status": "ok",
-                    "last_success_at": now_msk().isoformat(timespec="seconds"),
-                    "last_error": None,
-                    "posts_returned": len(posts),
-                }
-                for post in posts:
-                    published = parse_datetime(post.get("date"))
-                    if published is None:
-                        continue
-                    age = now_msk() - published
-                    # Только публикации не старше 5 часов участвуют в восстановлении
-                    # статуса и обработке событий. Будущие/ошибочно датированные посты
-                    # пропускаются, чтобы они не продлевали актуальность статуса.
-                    if timedelta(0) <= age <= timedelta(hours=HISTORY_WINDOW_HOURS):
-                        collected.append(post)
-                    else:
-                        logger.debug(
-                            "Публикация вне окна актуальности 5 ч. пропущена: source=%s date=%s age=%s",
-                            source_key, post.get("date"), age,
-                        )
-            except requests.RequestException as exc:
-                failed_sources.append(source_key)
-                HEALTH["total_source_failures"] += 1
-                HEALTH["source_health"][source_key] = {
-                    "status": "error", "last_error_at": now_msk().isoformat(timespec="seconds"),
-                    "last_error": f"{type(exc).__name__}: {exc}"[:300],
-                }
-                HEALTH["last_error"] = f"Источник {source_key}: {type(exc).__name__}: {exc}"[:500]
-                HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
-                logger.exception("Ошибка запроса к источнику %s", source_key)
+                return source_key, posts, None
             except Exception as exc:
+                return source_key, None, exc
+
+        source_results = await asyncio.gather(*(
+            fetch_one(source_key, source_info)
+            for source_key, source_info in SOURCES.items()
+        ))
+
+        for source_key, posts, error in source_results:
+            if error is not None:
                 failed_sources.append(source_key)
                 HEALTH["total_source_failures"] += 1
                 HEALTH["source_health"][source_key] = {
-                    "status": "error", "last_error_at": now_msk().isoformat(timespec="seconds"),
-                    "last_error": f"{type(exc).__name__}: {exc}"[:300],
+                    "status": "error",
+                    "last_error_at": now_msk().isoformat(timespec="seconds"),
+                    "last_error": f"{type(error).__name__}: {error}"[:300],
                 }
-                HEALTH["last_error"] = f"Обработка источника {source_key}: {type(exc).__name__}: {exc}"[:500]
+                HEALTH["last_error"] = f"Источник {source_key}: {type(error).__name__}: {error}"[:500]
                 HEALTH["last_error_at"] = now_msk().isoformat(timespec="seconds")
-                logger.exception("Ошибка обработки источника %s", source_key)
+                logger.error(
+                    "Ошибка проверки источника %s: %s: %s",
+                    source_key, type(error).__name__, error,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+                continue
+
+            successful_sources += 1
+            HEALTH["total_source_successes"] += 1
+            HEALTH["source_health"][source_key] = {
+                "status": "ok",
+                "last_success_at": now_msk().isoformat(timespec="seconds"),
+                "last_error": None,
+                "posts_returned": len(posts),
+            }
+            for post in posts:
+                published = parse_datetime(post.get("date"))
+                if published is None:
+                    continue
+                age = now_msk() - published
+                # Только публикации не старше 5 часов участвуют в восстановлении
+                # статуса и обработке событий. Будущие/ошибочно датированные посты
+                # пропускаются, чтобы они не продлевали актуальность статуса.
+                if timedelta(0) <= age <= timedelta(hours=HISTORY_WINDOW_HOURS):
+                    collected.append(post)
+                else:
+                    logger.debug(
+                        "Публикация вне окна актуальности 5 ч. пропущена: source=%s date=%s age=%s",
+                        source_key, post.get("date"), age,
+                    )
         if successful_sources:
             HEALTH["last_successful_scan_at"] = now_msk().isoformat(timespec="seconds")
             HEALTH["consecutive_all_source_failures"] = 0
