@@ -2365,8 +2365,33 @@ def is_admin(update):
 
 
 async def start_command(update, context):
-    if update.effective_message:
-        await update.effective_message.reply_text("🚨 <b>UAV ALERT</b>\nГражданский информационный сервис мониторинга публичных сообщений о БПЛА в Костромской области.\n\nНажми «Подписаться», чтобы получать уведомления. Бот не заменяет официальные оповещения.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
+    """Автоматически включает push после первого запуска бота.
+
+    Подписка на Telegram-канал для получения push не нужна. Пользователь
+    должен хотя бы один раз открыть бота и нажать /start: Telegram не
+    разрешает боту первым начинать личный диалог с пользователем.
+    """
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return
+
+    # Регистрируем пользователя для push без отдельного нажатия «Подписаться».
+    await subscribe_user(context.application, user.id)
+
+    await message.reply_text(
+        "🚨 <b>UAV ALERT</b>\n"
+        "Гражданский информационный сервис мониторинга публичных сообщений "
+        "о БПЛА в Костромской области.\n\n"
+        "🔔 <b>Push-уведомления включены.</b>\n"
+        "Подписываться на канал не нужно. После запуска бота уведомления "
+        "об обнаруженных статусах будут приходить сюда автоматически.\n\n"
+        "Информация из публичных источников может быть неполной и не заменяет "
+        "официальные оповещения региона.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(),
+        disable_web_page_preview=True,
+    )
 
 
 async def subscribe_user(application, user_id):
