@@ -618,17 +618,23 @@ async def send_push(application, message, event_type, level=0, cycle=0, post=Non
     notification_events[key] = record
     save_notification_events()
 
-    if not subscribers:
+    # Администратор получает служебные/официальные push независимо от подписки.
+    # Пользователи получают их только если подписались на рассылку.
+    recipients = set(subscribers)
+    if ADMIN_ID > 0:
+        recipients.add(ADMIN_ID)
+
+    if not recipients:
         record.update({"sent": False, "sent_count": len(delivered_users), "failed_count": 0,
-                       "error": "Нет подписчиков; событие сохранено для повторной проверки."})
+                       "error": "Нет получателей; событие сохранено для повторной проверки."})
         notification_events[key] = record
         save_notification_events()
-        logger.warning("Push %s пока не отправлен: нет подписчиков.", event_type)
+        logger.warning("Push %s пока не отправлен: нет получателей.", event_type)
         return len(delivered_users)
 
     dead_users = []
     errors = []
-    for user_id in list(subscribers):
+    for user_id in sorted(recipients):
         if user_id in delivered_users:
             continue
         delivered = False
@@ -665,10 +671,10 @@ async def send_push(application, message, event_type, level=0, cycle=0, post=Non
     if dead_users:
         save_subscribers()
 
-    failed_count = sum(1 for user_id in subscribers if user_id not in delivered_users)
+    failed_count = sum(1 for user_id in recipients if user_id not in delivered_users)
     notification_events[key] = {
-        "sent": failed_count == 0 and len(subscribers) > 0,
-        "sent_count": len(delivered_users.intersection(subscribers)),
+        "sent": failed_count == 0 and bool(recipients),
+        "sent_count": len(delivered_users.intersection(recipients)),
         "failed_count": failed_count,
         "delivered_users": sorted(delivered_users),
         "attempted_at": now_msk().isoformat(timespec="seconds"),
@@ -678,8 +684,8 @@ async def send_push(application, message, event_type, level=0, cycle=0, post=Non
     }
     save_notification_events()
     logger.info("Push %s: доставлено %s; осталось %s", event_type,
-                len(delivered_users.intersection(subscribers)), failed_count)
-    return len(delivered_users.intersection(subscribers))
+                len(delivered_users.intersection(recipients)), failed_count)
+    return len(delivered_users.intersection(recipients))
 
 def build_uav_admin_draft(level, locations, post):
     """Формирует простой текст поста, который удобно скопировать в @RADAR_Kostroma."""
@@ -859,7 +865,7 @@ async def send_current_status_to_user(application, user_id):
     try:
         await application.bot.send_message(
             chat_id=user_id,
-            text=("🛰 <b>UAV ALERT</b>\n\nПодписка активирована. В боте доступны погодные сведения, памятки безопасности, полезные контакты и проверенные сообщения, которые администратор вручную проверяет перед рассылкой.\n\nАвтоматическая обработка публикаций о фиксации БПЛА отключена."),
+            text=("🛰 <b>UAV ALERT</b>\n\nПодписка активирована. В боте доступны погодные сведения, памятки безопасности, полезные контакты и проверенные сообщения, которые администратор вручную проверяет перед рассылкой.\n\nАвтоматический сбор сведений о местах фиксации и маршрутах БПЛА отключён. Официальные сообщения рассылаются после проверки администратором."),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -1134,7 +1140,7 @@ def main_keyboard():
 
 def format_status():
     return ("<b>🛰 UAV ALERT — информационный сервис</b>\n\n"
-            "Автоматическая обработка публикаций о фиксации БПЛА отключена.\n"
+            "Автоматический сбор сведений о местах фиксации и маршрутах БПЛА отключён. Официальные сообщения рассылаются после проверки администратором.\n"
             "Сервис предназначен для полезной информации, погодных сведений и проверенных официальных сообщений.\n\n"
             f"Последняя проверка сервиса: {format_time(state.get('last_scan_time'))}\n\n"
             "<i>Бот не является официальной системой оповещения. В экстренной ситуации следуйте указаниям уполномоченных служб.</i>")
@@ -1171,7 +1177,7 @@ def format_stats():
     return ("<b>📊 Статистика UAV ALERT</b>\n\n" +
             f"Подписчиков: {len(subscribers)}\nЗаписей истории: {len(history)}\n" +
             f"Проверенных публикаций в базе: {len(sent_posts)}\nСобытий уведомлений: {len(notification_events)}\n" +
-            "Автоматический сбор сообщений о фиксации БПЛА: отключён.")
+            "Автоматический сбор сведений о местах фиксации и маршрутах БПЛА: отключён; рассылка официальных сообщений — после проверки администратором.")
 
 
 # ============================================================
@@ -1217,7 +1223,7 @@ async def review_sources_command(update, context):
 
 async def start_command(update, context):
     if update.effective_message:
-        await update.effective_message.reply_text("🛰 <b>UAV ALERT</b>\nГражданский информационный сервис Костромской области. Здесь доступны погодные сведения, памятки безопасности и проверенные официальные сообщения. Автоматическая обработка публикаций о фиксации БПЛА отключена.\n\nВ экстренной ситуации следуйте указаниям уполномоченных служб.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
+        await update.effective_message.reply_text("🛰 <b>UAV ALERT</b>\nГражданский информационный сервис Костромской области. Здесь доступны погодные сведения, памятки безопасности и проверенные официальные сообщения. Автоматический сбор сведений о местах фиксации и маршрутах БПЛА отключён. Официальные сообщения рассылаются после проверки администратором.\n\nВ экстренной ситуации следуйте указаниям уполномоченных служб.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
 
 
 async def subscribe_user(application, user_id):
@@ -1287,7 +1293,7 @@ async def admin_command(update, context):
 
 async def help_command(update, context):
     if update.effective_message:
-        await update.effective_message.reply_text("<b>Команды UAV ALERT</b>\n\n/start — главное меню\n/subscribe — подписаться\n/unsubscribe — отписаться\n/status — информация о сервисе\n/history — история\n/sources — официальные ресурсы\n/stats — статистика\n/test — тест (администратор)\n/admin — админ-информация\n/broadcast категория | текст | официальная ссылка — ручная проверенная рассылка (администратор)\n/review_sources — дополнительные источники (администратор)\n/help — помощь\n\nАвтоматическая обработка публикаций о фиксации БПЛА отключена.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
+        await update.effective_message.reply_text("<b>Команды UAV ALERT</b>\n\n/start — главное меню\n/subscribe — подписаться\n/unsubscribe — отписаться\n/status — информация о сервисе\n/history — история\n/sources — официальные ресурсы\n/stats — статистика\n/test — тест (администратор)\n/admin — админ-информация\n/broadcast категория | текст | официальная ссылка — ручная проверенная рассылка (администратор)\n/review_sources — дополнительные источники (администратор)\n/help — помощь\n\nАвтоматический сбор сведений о местах фиксации и маршрутах БПЛА отключён. Официальные сообщения рассылаются после проверки администратором.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
 
 
 async def weather_text():
@@ -1402,7 +1408,9 @@ async def broadcast_command(update, context):
     )
     sent = 0
     failed = 0
-    for user_id in list(subscribers):
+    recipients = set(subscribers)
+    recipients.add(ADMIN_ID)
+    for user_id in sorted(recipients):
         try:
             await context.application.bot.send_message(
                 chat_id=user_id, text=announcement, parse_mode=ParseMode.HTML,
@@ -1432,14 +1440,14 @@ async def callback_handler(update, context):
     elif data == "history": text = format_history()
     elif data == "sources" or data == "news": text = format_sources()
     elif data == "official": text = ("<b>📣 Официальные сообщения</b>\n\n" +
-        "Автоматическая перепубликация сообщений о фиксации БПЛА отключена. Здесь будут появляться только сообщения, которые администратор вручную проверил и счёл допустимыми для распространения.\n\n" +
+        "Автоматический сбор сведений о местах фиксации и маршрутах БПЛА отключён. Официальные сообщения публикуются только после проверки администратором.\n\n" +
         "При угрозе руководствуйтесь официальными каналами властей и экстренных служб.")
     elif data == "weather": text = await weather_text()
     elif data == "safety": text = safety_text()
     elif data == "contacts": text = contacts_text()
     elif data == "help": text = ("<b>🛰 UAV ALERT</b>\n\nГражданский информационный сервис Костромской области.\n" +
         "Погода, памятки, контакты, ссылки на официальные ресурсы и проверенные сообщения.\n\n" +
-        "Автоматическая обработка публикаций о фиксации БПЛА отключена. Бот не является официальной системой оповещения.")
+        "Автоматический сбор сведений о местах фиксации и маршрутах БПЛА отключён. Официальные сообщения рассылаются после проверки администратором. Бот не является официальной системой оповещения.")
     else: text = "Неизвестная команда."
     try:
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
