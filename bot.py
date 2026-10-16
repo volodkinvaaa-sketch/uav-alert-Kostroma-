@@ -37,7 +37,8 @@ ADMIN_ID = env_int("ADMIN_ID", 1421675956, 1)
 PORT = env_int("PORT", 10000, 1)
 CHECK_INTERVAL = env_int("CHECK_INTERVAL", 30, 15)
 HISTORY_WINDOW_HOURS = env_int("HISTORY_WINDOW_HOURS", 5, 1)
-UAV_REMINDER_HOURS = env_int("UAV_REMINDER_HOURS", 10, 1)
+UAV_REMINDER_HOURS = env_int("UAV_REMINDER_HOURS", 5, 1)
+OFFICIAL_ALERT_RECHECK_HOURS = env_int("OFFICIAL_ALERT_RECHECK_HOURS", 5, 1)
 REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 15, 5)
 SOURCE_LIMIT = env_int("SOURCE_LIMIT", 100, 30)
 DATA_DIR = os.getenv("DATA_DIR", ".")
@@ -206,7 +207,8 @@ OFFICIAL_MONITOR_SOURCES = [
     ("Департамент региональной безопасности Костромской области", "https://drb.kostroma.gov.ru/"),
 ]
 OFFICIAL_ALERT_TERMS = re.compile(
-    r"(?:бпла|беспилот\w*|беспилотн\w*)", re.I
+    r"(?:бпла|беспилот\w*|беспилотн\w*|ракетн\w*\s+(?:опасност\w*|тревог\w*)|"
+    r"угроз\w*\s+ракетн\w*|ракет\w*\s+опасност\w*)", re.I
 )
 OFFICIAL_STATUS_TERMS = re.compile(
     r"(?:опасност\w*|угроз\w*|отбо\w*|внимани\w*|тревог\w*|отмен\w*|снят\w*)", re.I
@@ -1147,6 +1149,104 @@ def _fetch_official_alert_headlines(source_name, source_url):
     return results[:20]
 
 
+def classify_official_alert_title(title):
+    """Classifies explicit warning/cancellation wording in an official-site headline."""
+    value = normalize_text(title)
+    if detect_rocket_cancel(value):
+        return "rocket_cancel", 0
+    if detect_rocket(value):
+        return "rocket_active", 1
+    if detect_uav_cancel(value):
+        return "uav_cancel", 0
+    level = detect_uav_level(value)
+    if level in (1, 2, 3):
+        return f"uav_level_{level}", level
+    return None
+
+
+async def process_official_alert_title(application, item):
+    """Pushes new, explicit official warning/cancellation headlines to subscribers and admin."""
+    classified = classify_official_alert_title(item.get("title", ""))
+    if not classified:
+        return
+    event_type, level = classified
+    post = {
+        "key": item.get("key", ""),
+        "source_name": item.get("source", "официальный сайт"),
+        "url": item.get("url", ""),
+        "date": now_msk().isoformat(timespec="seconds"),
+        "text": item.get("title", ""),
+    }
+    if event_type == "rocket_active":
+        message = build_rocket_push(True, post)
+    elif event_type == "rocket_cancel":
+        message = build_rocket_push(False, post)
+    elif event_type == "uav_cancel":
+        message = build_uav_cancel_push(post, ["Костромская область"])
+    else:
+        message = build_uav_push(level, ["Костромская область"], post)
+
+    # Stable key: same official headline cannot create duplicate pushes after restart.
+    daily_title_key = normalize_text(item.get("title", ""))
+    key_override = hashlib.sha256(
+        f"official-alert|{event_type}|{daily_title_key}|{now_msk().date().isoformat()}".encode("utf-8")
+    ).hexdigest()
+    await send_push(application, message, event_type, level, 0, post, key_override=key_override)
+
+    active = source_state.setdefault("official_active_alerts", {})
+    alert_key = f"{event_type}|{hashlib.sha256(normalize_text(item.get('title', '')).encode('utf-8')).hexdigest()}"
+    if event_type in ("uav_level_1", "uav_level_2", "uav_level_3", "rocket_active"):
+        active[alert_key] = {
+            "event_type": event_type, "level": level,
+            "source": post["source_name"], "title": post["text"], "url": post["url"],
+            "last_admin_recheck": now_msk().isoformat(timespec="seconds"),
+        }
+    elif event_type == "uav_cancel":
+        for key, old in list(active.items()):
+            if str(old.get("event_type", "")).startswith("uav_level_"):
+                active.pop(key, None)
+    elif event_type == "rocket_cancel":
+        for key, old in list(active.items()):
+            if old.get("event_type") == "rocket_active":
+                active.pop(key, None)
+    save_source_state()
+
+
+async def send_due_official_rechecks(application):
+    """Every five hours, remind only the admin to verify a previously seen warning."""
+    active = source_state.get("official_active_alerts", {})
+    if not isinstance(active, dict):
+        return
+    now = now_msk()
+    changed = False
+    for key, item in list(active.items()):
+        last_check = parse_datetime(item.get("last_admin_recheck"))
+        if last_check and now - last_check < timedelta(hours=OFFICIAL_ALERT_RECHECK_HOURS):
+            continue
+        url = str(item.get("url", ""))
+        source = html.escape(str(item.get("source", "официальный сайт")))
+        title = html.escape(str(item.get("title", "")))
+        url_html = html.escape(url, quote=True)
+        message = (
+            "⏰ <b>Плановая перепроверка официального предупреждения</b>\n\n"
+            f"Заголовок: {title}\n"
+            f"Источник: <a href=\"{url_html}\">{source}</a>\n\n"
+            "Проверьте полную публикацию: действует ли предупреждение или опубликован отбой. "
+            "Старая публикация сама по себе не подтверждает текущую угрозу. Это напоминание только администратору."
+        )
+        try:
+            await application.bot.send_message(
+                chat_id=ADMIN_ID, text=message, parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            item["last_admin_recheck"] = now.isoformat(timespec="seconds")
+            changed = True
+        except TelegramError:
+            logger.exception("Не удалось отправить напоминание о перепроверке официального предупреждения.")
+    if changed:
+        save_source_state()
+
+
 async def _check_official_source(application, source_name, source_url):
     try:
         headlines = await asyncio.to_thread(
@@ -1156,10 +1256,11 @@ async def _check_official_source(application, source_name, source_url):
         source_record = record.setdefault(source_url, {"initialized": False, "seen": []})
         old_seen = set(source_record.get("seen", []))
         new_items = [item for item in headlines if item["key"] not in old_seen]
+        was_initialized = bool(source_record.get("initialized"))
 
-        # На первом запуске уведомляем администратора о найденных заголовках для проверки.
-        # Далее сообщаем только о новых заголовках; автоматической публикации в канал нет.
-        if not source_record.get("initialized"):
+        # На первом запуске старые заголовки показываются администратору для проверки,
+        # но не рассылаются подписчикам как будто это новое предупреждение.
+        if not was_initialized:
             candidates = headlines[:5]
             source_record["initialized"] = True
         else:
@@ -1171,7 +1272,7 @@ async def _check_official_source(application, source_name, source_url):
                 f"Источник: {html.escape(item['source'])}\n"
                 f"Заголовок: {html.escape(item['title'])}\n\n"
                 f"<a href=\"{html.escape(item['url'], quote=True)}\">Открыть официальную публикацию</a>\n\n"
-                "Проверь актуальность и содержание вручную. Это уведомление не подтверждает наличие угрозы; в канал автоматически не публикуется."
+                "Проверьте полную публикацию. В канал автоматически ничего не публикуется."
             )
             try:
                 await application.bot.send_message(
@@ -1180,6 +1281,10 @@ async def _check_official_source(application, source_name, source_url):
                 )
             except TelegramError:
                 logger.exception("Не удалось отправить администратору ссылку на официальную публикацию.")
+            # On the first scan, old headlines establish a baseline and go to admin for review only.
+            # Push subscribers only for a newly discovered headline after initialization.
+            if was_initialized and item in new_items:
+                await process_official_alert_title(application, item)
 
         source_record["seen"] = list(dict.fromkeys(
             list(source_record.get("seen", [])) + [item["key"] for item in headlines]
@@ -1200,10 +1305,11 @@ async def _check_official_source(application, source_name, source_url):
 
 
 async def check_sources(application):
-    """Проверяет официальные региональные сайты на предупреждающие заголовки.
+    """Проверяет официальные сайты на заголовки предупреждений и отбоя.
 
-    Никаких каналов фиксации БПЛА не сканирует, сведения о маршрутах/местах не собирает,
-    подписчикам и в канал ничего автоматически не публикует. Уведомляет только админа.
+    Не сканирует каналы фиксации БПЛА и не собирает сведения о маршрутах/местах.
+    Новые явные официальные предупреждения отправляются push подписчикам и админу;
+    в канал автоматической публикации нет.
     """
     results = await asyncio.gather(*(
         _check_official_source(application, name, url)
@@ -1218,6 +1324,7 @@ async def check_sources(application):
     )
     state["official_sources_total"] = len(OFFICIAL_MONITOR_SOURCES)
     save_state()
+    await send_due_official_rechecks(application)
     await retry_pending_notifications(application)
 
 
