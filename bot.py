@@ -1182,6 +1182,39 @@ def is_admin(update):
     return bool(user and user.id == ADMIN_ID)
 
 
+# Ссылки для ручной проверки администратором. Они не подключены к автоматическому сбору.
+REVIEW_SOURCES = [
+    ("Локатор России", "https://t.me/locatorru"),
+    ("Радар России", "https://t.me/radarrussiia"),
+    ("БПЛА России", "https://t.me/bplarussiaru"),
+]
+
+
+async def review_sources_command(update, context):
+    """Показывает администратору ссылки для ручной проверки источников."""
+    message = update.effective_message
+    if not message:
+        return
+
+    if not is_admin(update):
+        await message.reply_text("⛔ Команда доступна только администратору.")
+        return
+
+    lines = [
+        "📡 Дополнительные источники UAV ALERT",
+        "",
+        "Ссылки для ручной проверки публикаций:",
+        "",
+    ]
+    lines.extend(f"{name}: {url}" for name, url in REVIEW_SOURCES)
+    lines.extend([
+        "",
+        "Автоматический сбор и пересылка сообщений из этих источников не выполняются.",
+        "Перед публикацией проверяй официальные предупреждения.",
+    ])
+    await message.reply_text("\n".join(lines), disable_web_page_preview=True)
+
+
 async def start_command(update, context):
     if update.effective_message:
         await update.effective_message.reply_text("🛰 <b>UAV ALERT</b>\nГражданский информационный сервис Костромской области. Здесь доступны погодные сведения, памятки безопасности и проверенные официальные сообщения. Автоматическая обработка публикаций о фиксации БПЛА отключена.\n\nВ экстренной ситуации следуйте указаниям уполномоченных служб.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
@@ -1254,7 +1287,7 @@ async def admin_command(update, context):
 
 async def help_command(update, context):
     if update.effective_message:
-        await update.effective_message.reply_text("<b>Команды UAV ALERT</b>\n\n/start — главное меню\n/subscribe — подписаться\n/unsubscribe — отписаться\n/status — информация о сервисе\n/history — история\n/sources — официальные ресурсы\n/stats — статистика\n/test — тест (администратор)\n/admin — админ-информация\n/broadcast категория | текст | официальная ссылка — ручная проверенная рассылка (администратор)\n/help — помощь\n\nАвтоматическая обработка публикаций о фиксации БПЛА отключена.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
+        await update.effective_message.reply_text("<b>Команды UAV ALERT</b>\n\n/start — главное меню\n/subscribe — подписаться\n/unsubscribe — отписаться\n/status — информация о сервисе\n/history — история\n/sources — официальные ресурсы\n/stats — статистика\n/test — тест (администратор)\n/admin — админ-информация\n/broadcast категория | текст | официальная ссылка — ручная проверенная рассылка (администратор)\n/review_sources — дополнительные источники (администратор)\n/help — помощь\n\nАвтоматическая обработка публикаций о фиксации БПЛА отключена.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
 
 
 async def weather_text():
@@ -1443,7 +1476,7 @@ async def post_init(application):
                 BotCommand("unsubscribe", "Отписаться"), BotCommand("status", "Текущий статус"),
                 BotCommand("history", "История событий"), BotCommand("sources", "Источники"),
                 BotCommand("stats", "Статистика"), BotCommand("test", "Тест уведомления"),
-                BotCommand("admin", "Админ-информация"), BotCommand("broadcast", "Рассылка проверенного сообщения"), BotCommand("help", "Помощь")]
+                BotCommand("admin", "Админ-информация"), BotCommand("broadcast", "Рассылка проверенного сообщения"), BotCommand("review_sources", "Дополнительные источники"), BotCommand("help", "Помощь")]
     try:
         await application.bot.set_my_commands(commands)
     except TelegramError:
@@ -1481,6 +1514,7 @@ def main():
     application.add_handler(CommandHandler("test", test_command))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
+    application.add_handler(CommandHandler("review_sources", review_sources_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     logger.info("Запускаем Telegram polling.")
