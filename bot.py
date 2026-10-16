@@ -197,7 +197,19 @@ logger.info("Загружено подписчиков: %s", len(subscribers))
 # ============================================================
 # SOURCES
 # ============================================================
-SOURCES = {}  # Автоматический сбор публикаций о фиксации БПЛА отключён.
+# Автоматически проверяются только официальные сайты на заголовки публикаций
+# о предупреждениях/отбое. Неофициальные каналы наблюдения за БПЛА не сканируются.
+SOURCES = {}
+OFFICIAL_MONITOR_SOURCES = [
+    ("Администрация Костромской области", "https://adm44.ru/"),
+    ("ГУ МЧС России по Костромской области", "https://44.mchs.gov.ru/"),
+]
+OFFICIAL_ALERT_TERMS = re.compile(
+    r"(?:бпла|беспилот\w*|беспилотн\w*)", re.I
+)
+OFFICIAL_STATUS_TERMS = re.compile(
+    r"(?:опасност\w*|угроз\w*|отбо\w*|внимани\w*|тревог\w*|отмен\w*|снят\w*)", re.I
+)
 
 # ============================================================
 # TEXT / TERRITORY FILTER
@@ -865,7 +877,7 @@ async def send_current_status_to_user(application, user_id):
     try:
         await application.bot.send_message(
             chat_id=user_id,
-            text=("🛰 <b>UAV ALERT</b>\n\nПодписка активирована. В боте доступны погодные сведения, памятки безопасности, полезные контакты и проверенные сообщения, которые администратор вручную проверяет перед рассылкой.\n\nАвтоматический сбор сведений о местах фиксации и маршрутах БПЛА отключён. Официальные сообщения рассылаются после проверки администратором."),
+            text=("🛰 <b>UAV ALERT</b>\n\nПодписка активирована. В боте доступны погодные сведения, памятки безопасности, полезные контакты и проверенные сообщения, которые администратор вручную проверяет перед рассылкой.\n\nАвтоматическая проверка официальных сайтов на заголовки предупреждений/отбоя включена; сбор сведений о местах фиксации и маршрутах БПЛА отключён. Публикация в канал — после проверки администратором."),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -1098,22 +1110,118 @@ def get_post_event(post, inherited_locations=None):
     return {"locations": locations, "uav_event": uav_event, "uav_level": uav_level, "rocket_event": rocket_event}
 
 # ============================================================
-# MONITORING — PROCESS ONLY NEW POSTS; NO REPEATED SPAM
+# MONITORING — OFFICIAL WARNING HEADLINES ONLY
 # ============================================================
-async def check_sources(application):
-    """Безопасный режим: не собирает и не перепубликует сообщения о фиксации БПЛА.
+def _fetch_official_alert_headlines(source_name, source_url):
+    """Reads headline links from an official regional site; never extracts routes/locations."""
+    response = requests.get(
+        source_url,
+        timeout=REQUEST_TIMEOUT,
+        headers={"User-Agent": "UAV-ALERT-Civil-Info/1.0 (+official-publication-check)"},
+    )
+    response.raise_for_status()
+    response.encoding = response.apparent_encoding or response.encoding
+    soup = BeautifulSoup(response.text, "html.parser")
+    results = []
+    seen = set()
+    for anchor in soup.select("a[href]"):
+        title = normalize_text(anchor.get_text(" ", strip=True))
+        if not title or len(title) < 8:
+            continue
+        # Only official-warning/cancellation headlines, not sighting or movement reports.
+        if not OFFICIAL_ALERT_TERMS.search(title) or not OFFICIAL_STATUS_TERMS.search(title):
+            continue
+        url = requests.compat.urljoin(response.url, anchor.get("href", ""))
+        parsed = urlparse(url)
+        root_host = (urlparse(source_url).hostname or "").lower()
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or not (host == root_host or host.endswith("." + root_host)):
+            continue
+        key = hashlib.sha256((url + "|" + title).encode("utf-8")).hexdigest()
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append({"key": key, "title": anchor.get_text(" ", strip=True)[:220],
+                        "url": url, "source": source_name})
+    return results[:20]
 
-    Проверенные официальные сообщения администратор может отправить подписчикам
-    командой /broadcast после ручной проверки допустимости публикации.
+
+async def _check_official_source(application, source_name, source_url):
+    try:
+        headlines = await asyncio.to_thread(
+            _fetch_official_alert_headlines, source_name, source_url
+        )
+        record = source_state.setdefault("official_monitor", {})
+        source_record = record.setdefault(source_url, {"initialized": False, "seen": []})
+        old_seen = set(source_record.get("seen", []))
+        new_items = [item for item in headlines if item["key"] not in old_seen]
+
+        # На первом запуске уведомляем администратора о найденных заголовках для проверки.
+        # Далее сообщаем только о новых заголовках; автоматической публикации в канал нет.
+        if not source_record.get("initialized"):
+            candidates = headlines[:5]
+            source_record["initialized"] = True
+        else:
+            candidates = new_items
+
+        for item in candidates:
+            message = (
+                "📡 <b>Новая публикация на официальном ресурсе</b>\n\n"
+                f"Источник: {html.escape(item['source'])}\n"
+                f"Заголовок: {html.escape(item['title'])}\n\n"
+                f"<a href=\"{html.escape(item['url'], quote=True)}\">Открыть официальную публикацию</a>\n\n"
+                "Проверь актуальность и содержание вручную. Это уведомление не подтверждает наличие угрозы; в канал автоматически не публикуется."
+            )
+            try:
+                await application.bot.send_message(
+                    chat_id=ADMIN_ID, text=message, parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except TelegramError:
+                logger.exception("Не удалось отправить администратору ссылку на официальную публикацию.")
+
+        source_record["seen"] = list(dict.fromkeys(
+            list(source_record.get("seen", [])) + [item["key"] for item in headlines]
+        ))[-500:]
+        source_record["last_check"] = now_msk().isoformat(timespec="seconds")
+        source_record["last_error"] = None
+        save_source_state()
+        return len(headlines), None
+    except Exception as exc:
+        record = source_state.setdefault("official_monitor", {}).setdefault(
+            source_url, {"initialized": False, "seen": []}
+        )
+        record["last_check"] = now_msk().isoformat(timespec="seconds")
+        record["last_error"] = str(exc)[:300]
+        save_source_state()
+        logger.warning("Официальный источник недоступен (%s): %s", source_name, exc)
+        return 0, str(exc)
+
+
+async def check_sources(application):
+    """Проверяет официальные региональные сайты на предупреждающие заголовки.
+
+    Никаких каналов фиксации БПЛА не сканирует, сведения о маршрутах/местах не собирает,
+    подписчикам и в канал ничего автоматически не публикует. Уведомляет только админа.
     """
+    results = await asyncio.gather(*(
+        _check_official_source(application, name, url)
+        for name, url in OFFICIAL_MONITOR_SOURCES
+    ), return_exceptions=True)
     state["last_scan_time"] = now_msk().isoformat(timespec="seconds")
-    state["last_scan_count"] = 0
+    state["last_scan_count"] = sum(
+        result[0] for result in results if isinstance(result, tuple)
+    )
+    state["official_sources_available"] = sum(
+        1 for result in results if isinstance(result, tuple) and result[1] is None
+    )
+    state["official_sources_total"] = len(OFFICIAL_MONITOR_SOURCES)
     save_state()
     await retry_pending_notifications(application)
 
 
 async def monitor_loop(application):
-    logger.info("Информационный сервис запущен. Автоматическая обработка фиксаций БПЛА отключена.")
+    logger.info("Запущена проверка официальных сайтов на заголовки предупреждений/отбоя; автопубликация отключена.")
     while True:
         try:
             await check_sources(application)
@@ -1140,9 +1248,10 @@ def main_keyboard():
 
 def format_status():
     return ("<b>🛰 UAV ALERT — информационный сервис</b>\n\n"
-            "Автоматический сбор сведений о местах фиксации и маршрутах БПЛА отключён. Официальные сообщения рассылаются после проверки администратором.\n"
+            "Автоматическая проверка официальных сайтов на заголовки предупреждений/отбоя включена; сбор сведений о местах фиксации и маршрутах БПЛА отключён. Публикация в канал — после проверки администратором.\n"
             "Сервис предназначен для полезной информации, погодных сведений и проверенных официальных сообщений.\n\n"
-            f"Последняя проверка сервиса: {format_time(state.get('last_scan_time'))}\n\n"
+            f"Последняя проверка сервиса: {format_time(state.get('last_scan_time'))}\n"
+            f"Доступность официальных сайтов: {state.get('official_sources_available', 0)}/{state.get('official_sources_total', len(OFFICIAL_MONITOR_SOURCES))}\n\n"
             "<i>Бот не является официальной системой оповещения. В экстренной ситуации следуйте указаниям уполномоченных служб.</i>")
 
 
@@ -1177,7 +1286,7 @@ def format_stats():
     return ("<b>📊 Статистика UAV ALERT</b>\n\n" +
             f"Подписчиков: {len(subscribers)}\nЗаписей истории: {len(history)}\n" +
             f"Проверенных публикаций в базе: {len(sent_posts)}\nСобытий уведомлений: {len(notification_events)}\n" +
-            "Автоматический сбор сведений о местах фиксации и маршрутах БПЛА: отключён; рассылка официальных сообщений — после проверки администратором.")
+            "Официальные сайты проверяются автоматически на заголовки предупреждений/отбоя; сведения о местах фиксации и маршрутах БПЛА не собираются. Публикация — после проверки администратором.")
 
 
 # ============================================================
@@ -1209,21 +1318,25 @@ async def review_sources_command(update, context):
     lines = [
         "📡 Дополнительные источники UAV ALERT",
         "",
-        "Ссылки для ручной проверки публикаций:",
+        "Официальные сайты проверяются ботом на заголовки предупреждений/отбоя:",
+        "https://adm44.ru/",
+        "https://44.mchs.gov.ru/",
+        "",
+        "Эти дополнительные ссылки доступны только для ручного ознакомления:",
         "",
     ]
     lines.extend(f"{name}: {url}" for name, url in REVIEW_SOURCES)
     lines.extend([
         "",
-        "Автоматический сбор и пересылка сообщений из этих источников не выполняются.",
-        "Перед публикацией проверяй официальные предупреждения.",
+        "Эти дополнительные каналы не сканируются автоматически.",
+        "Уведомления с официальных сайтов приходят только администратору; публикация в канал — вручную.",
     ])
     await message.reply_text("\n".join(lines), disable_web_page_preview=True)
 
 
 async def start_command(update, context):
     if update.effective_message:
-        await update.effective_message.reply_text("🛰 <b>UAV ALERT</b>\nГражданский информационный сервис Костромской области. Здесь доступны погодные сведения, памятки безопасности и проверенные официальные сообщения. Автоматический сбор сведений о местах фиксации и маршрутах БПЛА отключён. Официальные сообщения рассылаются после проверки администратором.\n\nВ экстренной ситуации следуйте указаниям уполномоченных служб.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
+        await update.effective_message.reply_text("🛰 <b>UAV ALERT</b>\nГражданский информационный сервис Костромской области. Здесь доступны погодные сведения, памятки безопасности и проверенные официальные сообщения. Автоматическая проверка официальных сайтов на заголовки предупреждений/отбоя включена; сбор сведений о местах фиксации и маршрутах БПЛА отключён. Публикация в канал — после проверки администратором.\n\nВ экстренной ситуации следуйте указаниям уполномоченных служб.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
 
 
 async def subscribe_user(application, user_id):
@@ -1293,7 +1406,7 @@ async def admin_command(update, context):
 
 async def help_command(update, context):
     if update.effective_message:
-        await update.effective_message.reply_text("<b>Команды UAV ALERT</b>\n\n/start — главное меню\n/subscribe — подписаться\n/unsubscribe — отписаться\n/status — информация о сервисе\n/history — история\n/sources — официальные ресурсы\n/stats — статистика\n/test — тест (администратор)\n/admin — админ-информация\n/broadcast категория | текст | официальная ссылка — ручная проверенная рассылка (администратор)\n/review_sources — дополнительные источники (администратор)\n/help — помощь\n\nАвтоматический сбор сведений о местах фиксации и маршрутах БПЛА отключён. Официальные сообщения рассылаются после проверки администратором.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
+        await update.effective_message.reply_text("<b>Команды UAV ALERT</b>\n\n/start — главное меню\n/subscribe — подписаться\n/unsubscribe — отписаться\n/status — информация о сервисе\n/history — история\n/sources — официальные ресурсы\n/stats — статистика\n/test — тест (администратор)\n/admin — админ-информация\n/broadcast категория | текст | официальная ссылка — ручная проверенная рассылка (администратор)\n/review_sources — дополнительные источники (администратор)\n/help — помощь\n\nАвтоматическая проверка официальных сайтов на заголовки предупреждений/отбоя включена; сбор сведений о местах фиксации и маршрутах БПЛА отключён. Публикация в канал — после проверки администратором.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
 
 
 async def weather_text():
@@ -1447,7 +1560,7 @@ async def callback_handler(update, context):
     elif data == "contacts": text = contacts_text()
     elif data == "help": text = ("<b>🛰 UAV ALERT</b>\n\nГражданский информационный сервис Костромской области.\n" +
         "Погода, памятки, контакты, ссылки на официальные ресурсы и проверенные сообщения.\n\n" +
-        "Автоматический сбор сведений о местах фиксации и маршрутах БПЛА отключён. Официальные сообщения рассылаются после проверки администратором. Бот не является официальной системой оповещения.")
+        "Автоматическая проверка официальных сайтов на заголовки предупреждений/отбоя включена; сбор сведений о местах фиксации и маршрутах БПЛА отключён. Публикация в канал — после проверки администратором. Бот не является официальной системой оповещения.")
     else: text = "Неизвестная команда."
     try:
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
