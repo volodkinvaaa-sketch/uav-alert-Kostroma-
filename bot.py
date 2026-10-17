@@ -762,6 +762,17 @@ def build_uav_admin_draft(level, locations, post):
     return "\n".join(lines)
 
 
+def publication_keyboard(draft_key, record):
+    """Кнопки публикации доступны только администратору; отказ не публикует пост."""
+    token = hashlib.sha256(str(draft_key).encode("utf-8")).hexdigest()[:20]
+    record["publish_token"] = token
+    record["publication_decision"] = record.get("publication_decision")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Опубликовать в ТГК", callback_data=f"pub_yes:{token}")],
+        [InlineKeyboardButton("❌ Не публиковать", callback_data=f"pub_no:{token}")],
+    ])
+
+
 async def send_admin_post_draft(application, message, event_type, level=0, cycle=0, post=None, key_override=None):
     """Присылает администратору черновик; сохраняет текст для безопасного повтора."""
     post = post or {}
@@ -778,10 +789,14 @@ async def send_admin_post_draft(application, message, event_type, level=0, cycle
     admin_drafts[key] = record
     save_admin_drafts()
     try:
+        keyboard = publication_keyboard(key, record)
+        admin_drafts[key] = record
+        save_admin_drafts()
         await application.bot.send_message(
             chat_id=ADMIN_ID,
-            text=("📝 ГОТОВЫЙ ПОСТ ДЛЯ ТГК @RADAR_Kostroma\n"
-                  "Скопируй текст ниже и опубликуй после проверки:\n\n" + message),
+            text=("📝 ЧЕРНОВИК ДЛЯ ТГК @RADAR_Kostroma\n"
+                  "Проверь актуальность и выбери действие кнопкой ниже:\n\n" + message),
+            reply_markup=keyboard,
             disable_web_page_preview=True,
         )
         record.update({"sent": True, "error": None,
@@ -811,7 +826,7 @@ async def publish_to_channel(application, message, event_type, level=0, cycle=0,
         return False
     try:
         sent_message = await application.bot.send_message(
-            chat_id=CHANNEL_ID, text=message, parse_mode=ParseMode.HTML,
+            chat_id=CHANNEL_ID, text=message,
             disable_web_page_preview=True,
         )
         channel_posts[key] = {
@@ -1536,17 +1551,23 @@ async def official_sms_review_handler(update, context):
             "Статус автоматически не изменён; в канал не опубликовано."
         )
     draft_key = key + "_public_draft"
-    admin_drafts[draft_key] = {
+    sms_draft_record = {
         "sent": True, "admin_id": ADMIN_ID, "event": "sms112_public_draft",
-        "signal_type": signal_type, "message": public_draft,
+        "signal_type": signal_type, "level": 1 if signal_type == "УГРОЗА" else 0,
+        "cycle": 0, "post_data": {"key": draft_key, "source_name": "SMS, переданное администратором"},
+        "message": public_draft,
         "attempted_at": received_at, "reviewed_at": received_at,
         "key": draft_key, "automatic_status_change": False,
         "automatic_channel_publication": False,
+        "publication_decision": "pending",
     }
+    keyboard = publication_keyboard(draft_key, sms_draft_record)
+    admin_drafts[draft_key] = sms_draft_record
     save_admin_drafts()
     add_admin_audit("sms112_public_draft", f"Черновик для ручной проверки; сигнал {signal_type}; key={draft_key}", user.id)
     await message.reply_text(
-        "📝 ЧЕРНОВИК UAV ALERT — ТОЛЬКО ДЛЯ РУЧНОЙ ПРОВЕРКИ\n\n" + public_draft,
+        "📝 ЧЕРНОВИК UAV ALERT — ПРОВЕРЬ ПЕРЕД ПУБЛИКАЦИЕЙ\n\n" + public_draft,
+        reply_markup=keyboard,
         disable_web_page_preview=True,
     )
     logger.info("Получен ручной сигнал SMS 112 для проверки: %s; статус не менялся; создан черновик без публикации.", signal_type)
@@ -1786,6 +1807,58 @@ async def callback_handler(update, context):
         return
     await query.answer()
     user, data = query.from_user, query.data or ""
+    if data.startswith(("pub_yes:", "pub_no:")):
+        if user.id != ADMIN_ID:
+            await context.application.bot.send_message(chat_id=user.id, text="⛔ Только администратор может принять это решение.")
+            return
+        action, token = data.split(":", 1)
+        found = next(((key, record) for key, record in admin_drafts.items()
+                      if isinstance(record, dict) and record.get("publish_token") == token), None)
+        if not found:
+            await context.application.bot.send_message(chat_id=user.id, text="⚠️ Черновик не найден или устарел.")
+            return
+        draft_key, record = found
+        if record.get("publication_decision") in ("published", "declined"):
+            await context.application.bot.send_message(chat_id=user.id, text="ℹ️ Решение по этому черновику уже принято.")
+            return
+        if action == "pub_no":
+            record["publication_decision"] = "declined"
+            record["declined_at"] = now_msk().isoformat(timespec="seconds")
+            admin_drafts[draft_key] = record
+            save_admin_drafts()
+            add_admin_audit("channel_publication_declined", f"Черновик {draft_key} отклонён; не опубликован.", user.id)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
+            await context.application.bot.send_message(chat_id=ADMIN_ID, text="❌ Черновик отклонён. В канал ничего не опубликовано.")
+            return
+        # Публикация происходит только после нажатия администратором кнопки подтверждения.
+        draft_text = str(record.get("message") or "").strip()
+        if not draft_text:
+            await context.application.bot.send_message(chat_id=user.id, text="⚠️ В черновике нет текста.")
+            return
+        event_type = str(record.get("event") or "manual_review")
+        level = int(record.get("level", 1 if record.get("signal_type") == "УГРОЗА" else 0))
+        cycle = int(record.get("cycle", 0))
+        post = record.get("post_data") or {"key": draft_key}
+        published = await publish_to_channel(context.application, draft_text, event_type, level, cycle, post,
+                                             key_override=draft_key + "_confirmed_publication")
+        if published:
+            record["publication_decision"] = "published"
+            record["published_at"] = now_msk().isoformat(timespec="seconds")
+            record["automatic_channel_publication"] = False
+            admin_drafts[draft_key] = record
+            save_admin_drafts()
+            add_admin_audit("channel_publication_confirmed", f"Черновик {draft_key} опубликован кнопкой администратора.", user.id)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
+            await context.application.bot.send_message(chat_id=ADMIN_ID, text=f"✅ Пост опубликован в {CHANNEL_ID}.")
+        else:
+            await context.application.bot.send_message(chat_id=ADMIN_ID, text="⚠️ Не удалось опубликовать пост. Проверь права бота в канале и журнал ошибок; черновик не помечен опубликованным.")
+        return
     if data == "subscribe":
         await subscribe_user(context.application, user.id)
         text = "🔔 Подписка включена."
