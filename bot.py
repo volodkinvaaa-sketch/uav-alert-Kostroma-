@@ -212,14 +212,12 @@ logger.info("Загружено подписчиков: %s", len(subscribers))
 # ============================================================
 # SOURCES
 # ============================================================
-# Автоматически проверяются только официальные сайты на заголовки публикаций
-# о предупреждениях/отбое. Неофициальные каналы наблюдения за БПЛА не сканируются.
+# Единственная внешняя ссылка для ручной проверки администратором.
+# Канал не сканируется автоматически; сообщения не считаются официальным подтверждением.
 SOURCES = {}
-OFFICIAL_MONITOR_SOURCES = [
-    ("Администрация Костромской области", "https://adm44.ru/"),
-    ("ГУ МЧС России по Костромской области", "https://44.mchs.gov.ru/"),
-    ("Департамент региональной безопасности Костромской области", "https://drb.kostroma.gov.ru/"),
-]
+REVIEW_SOURCE_NAME = "Telegram-канал для ручной проверки"
+REVIEW_SOURCE_URL = "https://t.me/radar_rschs"
+OFFICIAL_MONITOR_SOURCES = []
 OFFICIAL_ALERT_TERMS = re.compile(
     r"(?:бпла|беспилот\w*|беспилотн\w*|ракетн\w*\s+(?:опасност\w*|тревог\w*)|"
     r"угроз\w*\s+ракетн\w*|ракет\w*\s+опасност\w*)", re.I
@@ -1379,11 +1377,10 @@ def main_keyboard():
 def format_status():
     lines = [
         "<b>🛰 UAV ALERT — информационный сервис</b>", "",
-        "Автоматически проверяются только заголовки публикаций официальных сайтов. Сведения о местах фиксации и маршрутах БПЛА не собираются. Публикация в канал — только после проверки администратором.", "",
+        "Канал для ручной проверки: <a href=\"https://t.me/radar_rschs\">radar_rschs</a>. Автоматическое чтение его публикаций отключено; сведения о местах фиксации и маршрутах БПЛА не собираются. Публикация в канал — только после проверки администратором по официальным оповещениям.", "",
         f"Последняя проверка сервиса: {format_time(state.get('last_scan_time'))}",
-        f"Официальных источников настроено: {len(OFFICIAL_MONITOR_SOURCES)}/{len(OFFICIAL_MONITOR_SOURCES)}",
-        f"Доступность при последней проверке: {state.get('official_sources_available', 0)}/{state.get('official_sources_total', len(OFFICIAL_MONITOR_SOURCES))}", "",
-        "<b>Состояние сайтов:</b>"
+        "Автоматический мониторинг внешних источников: отключён", "",
+        "<b>Состояние источников:</b>"
     ]
     records = source_state.get("official_monitor", {})
     for name, url in OFFICIAL_MONITOR_SOURCES:
@@ -1421,12 +1418,9 @@ def format_history(limit=10):
 
 
 def format_sources():
-    return ("<b>📰 Официальные ресурсы</b>\n\n"
-            '<a href="https://adm44.ru/">Администрация Костромской области</a>\n'
-            '<a href="https://44.mchs.gov.ru/">Главное управление МЧС России по Костромской области</a>\n'
-            '<a href="https://drb.kostroma.gov.ru/">Департамент региональной безопасности Костромской области</a>\n'
-            '<a href="https://meteoinfo.ru/">Гидрометцентр России — погодная информация</a>\n\n'
-            "Для сообщений о безопасности ориентируйтесь на официальные публикации уполномоченных органов. Ссылки на сторонние каналы не используются как официальные источники UAV ALERT.")
+    return ("<b>🔎 Источник для ручной проверки</b>\n\n"
+            f'<a href="{REVIEW_SOURCE_URL}">{html.escape(REVIEW_SOURCE_NAME)}</a>\n\n'
+            "Публикации канала не проверяются ботом автоматически и не считаются официальным подтверждением. Перед любым сообщением о безопасности администратор должен сверить информацию с официальными оповещениями региона.")
 
 
 
@@ -1434,7 +1428,7 @@ def format_stats():
     return ("<b>📊 Статистика UAV ALERT</b>\n\n" +
             f"Подписчиков: {len(subscribers)}\nЗаписей истории: {len(history)}\n" +
             f"Проверенных публикаций в базе: {len(sent_posts)}\nСобытий уведомлений: {len(notification_events)}\n" +
-            "Официальные сайты проверяются автоматически на заголовки предупреждений/отбоя; сведения о местах фиксации и маршрутах БПЛА не собираются. Публикация — после проверки администратором.")
+            "Автоматический мониторинг источников отключён. Канал radar_rschs используется только как ссылка для ручной проверки; публикация — после сверки администратором с официальными оповещениями.")
 
 
 # ============================================================
@@ -1587,7 +1581,7 @@ async def health_command(update, context):
         return
     records = source_state.get("official_monitor", {})
     lines = ["🩺 ДИАГНОСТИКА UAV ALERT", "", f"Последний цикл: {format_time(state.get('last_scan_time'))}",
-             f"Доступно сайтов: {state.get('official_sources_available', 0)}/{state.get('official_sources_total', len(OFFICIAL_MONITOR_SOURCES))}",
+             "Автоматическая проверка источников: отключена",
              f"Подписчиков: {len(subscribers)}", f"Недоставленных push-записей: {sum(1 for x in notification_events.values() if isinstance(x, dict) and not x.get('sent'))}",
              f"Неотправленных черновиков: {sum(1 for x in admin_drafts.values() if isinstance(x, dict) and not x.get('sent'))}",
              f"Записей аудита администратора: {len(admin_audit)}", ""]
@@ -1610,7 +1604,7 @@ async def admin_command(update, context):
     await update.effective_message.reply_text("<b>Админ-панель UAV ALERT</b>\n\n" +
         f"Подписчиков: {len(subscribers)}\nАвтоматическая обработка фиксаций БПЛА: отключена\n" +
         f"Последняя проверка: {format_time(state.get('last_scan_time'))}\n" +
-        f"Доступность сайтов: {state.get('official_sources_available', 0)}/{state.get('official_sources_total', len(OFFICIAL_MONITOR_SOURCES))}\n" +
+        "Автоматическая проверка источников: отключена\n" +
         f"Записей аудита: {len(admin_audit)}\n\nКоманда /health показывает подробную диагностику.",
         parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
 
