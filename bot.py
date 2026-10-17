@@ -161,6 +161,10 @@ channel_posts = load_json(CHANNEL_POSTS_FILE, {})
 if not isinstance(channel_posts, dict):
     channel_posts = {}
 ADMIN_DRAFTS_FILE = json_path("admin_drafts.json")
+ADMIN_AUDIT_FILE = json_path("admin_audit.json")
+admin_audit = load_json(ADMIN_AUDIT_FILE, [])
+if not isinstance(admin_audit, list):
+    admin_audit = []
 admin_drafts = load_json(ADMIN_DRAFTS_FILE, {})
 if not isinstance(admin_drafts, dict):
     admin_drafts = {}
@@ -180,6 +184,16 @@ def save_channel_posts():
         for old_key, _ in ordered[:-2500]:
             channel_posts.pop(old_key, None)
     save_json(CHANNEL_POSTS_FILE, channel_posts)
+def save_admin_audit():
+    global admin_audit
+    admin_audit = admin_audit[-1000:]
+    save_json(ADMIN_AUDIT_FILE, admin_audit)
+
+def add_admin_audit(action, details, user_id=None):
+    admin_audit.append({"time": now_msk().isoformat(timespec="seconds"), "action": str(action)[:100],
+                        "details": str(details)[:1500], "user_id": user_id})
+    save_admin_audit()
+
 def save_admin_drafts():
     if len(admin_drafts) > 3000:
         ordered = sorted(admin_drafts.items(), key=lambda x: str(x[1].get("attempted_at", "")))
@@ -627,6 +641,7 @@ async def send_push(application, message, event_type, level=0, cycle=0, post=Non
         "sent": False, "message": message, "event": event_type,
         "level": int(level), "cycle": int(cycle), "post_data": post,
         "post": post.get("key"), "key": key,
+        "created_at": record.get("created_at") or now_msk().isoformat(timespec="seconds"),
         "attempted_at": now_msk().isoformat(timespec="seconds"),
         "delivered_users": sorted(delivered_users),
     })
@@ -692,6 +707,7 @@ async def send_push(application, message, event_type, level=0, cycle=0, post=Non
         "sent_count": len(delivered_users.intersection(recipients)),
         "failed_count": failed_count,
         "delivered_users": sorted(delivered_users),
+        "created_at": record.get("created_at") or now_msk().isoformat(timespec="seconds"),
         "attempted_at": now_msk().isoformat(timespec="seconds"),
         "event": event_type, "level": int(level), "cycle": int(cycle),
         "post": post.get("key"), "post_data": post, "message": message, "key": key,
@@ -759,6 +775,7 @@ async def send_admin_post_draft(application, message, event_type, level=0, cycle
     record.update({"sent": False, "admin_id": ADMIN_ID, "event": event_type,
                    "level": int(level), "cycle": int(cycle), "source_post": post.get("key"),
                    "message": message, "post_data": post, "key": key,
+                   "created_at": record.get("created_at") or now_msk().isoformat(timespec="seconds"),
                    "attempted_at": now_msk().isoformat(timespec="seconds")})
     admin_drafts[key] = record
     save_admin_drafts()
@@ -804,7 +821,8 @@ async def publish_to_channel(application, message, event_type, level=0, cycle=0,
             "message_id": getattr(sent_message, "message_id", None),
             "event": event_type, "level": int(level), "cycle": int(cycle),
             "source_post": post.get("key"), "message": message, "post_data": post,
-            "key": key, "attempted_at": now_msk().isoformat(timespec="seconds"), "error": None,
+            "key": key, "created_at": record.get("created_at") or now_msk().isoformat(timespec="seconds"),
+            "attempted_at": now_msk().isoformat(timespec="seconds"), "error": None,
         }
         save_channel_posts()
         logger.info("Событие %s опубликовано в канале %s.", event_type, CHANNEL_ID)
@@ -814,6 +832,7 @@ async def publish_to_channel(application, message, event_type, level=0, cycle=0,
             "sent": False, "channel": CHANNEL_ID, "event": event_type,
             "level": int(level), "cycle": int(cycle), "source_post": post.get("key"),
             "message": message, "post_data": post, "key": key,
+            "created_at": record.get("created_at") or now_msk().isoformat(timespec="seconds"),
             "attempted_at": now_msk().isoformat(timespec="seconds"), "error": str(exc)[:500],
         }
         save_channel_posts()
@@ -831,8 +850,9 @@ async def retry_pending_notifications(application):
         if not message or not event_type:
             # Старые записи, созданные до сохранения текста, безопасно восстановить нельзя.
             continue
-        if str(event_type).lower().startswith(("uav", "rocket", "bpla")):
-            # Не отправляем отложенные автоматические сообщения старого формата.
+        attempted = parse_datetime(record.get("created_at"))
+        if attempted is None or now_msk() - attempted > timedelta(minutes=30):
+            # Предупреждение может устареть: старые push автоматически не отправляем.
             continue
         post = record.get("post_data") or {"key": record.get("post") or ""}
         total_delivered += await send_push(
@@ -847,7 +867,8 @@ async def retry_pending_notifications(application):
         event_type = record.get("event")
         if not message or not event_type:
             continue
-        if str(event_type).lower().startswith(("uav", "rocket", "bpla")):
+        attempted = parse_datetime(record.get("created_at"))
+        if attempted is None or now_msk() - attempted > timedelta(minutes=30):
             continue
         post = record.get("post_data") or {"key": record.get("source_post") or ""}
         await send_admin_post_draft(
@@ -862,7 +883,8 @@ async def retry_pending_notifications(application):
         event_type = record.get("event")
         if not message or not event_type:
             continue
-        if str(event_type).lower().startswith(("uav", "rocket", "bpla")):
+        attempted = parse_datetime(record.get("created_at"))
+        if attempted is None or now_msk() - attempted > timedelta(minutes=30):
             continue
         post = record.get("post_data") or {"key": record.get("source_post") or ""}
         await publish_to_channel(
@@ -1355,13 +1377,29 @@ def main_keyboard():
 
 
 def format_status():
-    return ("<b>🛰 UAV ALERT — информационный сервис</b>\n\n"
-            "Автоматическая проверка официальных сайтов на заголовки предупреждений/отбоя включена; сбор сведений о местах фиксации и маршрутах БПЛА отключён. Публикация в канал — после проверки администратором.\n"
-            "Сервис предназначен для полезной информации, погодных сведений и проверенных официальных сообщений.\n\n"
-            f"Последняя проверка сервиса: {format_time(state.get('last_scan_time'))}\n"
-            f"Официальных источников настроено: {len(OFFICIAL_MONITOR_SOURCES)}/{len(OFFICIAL_MONITOR_SOURCES)}\n"
-            f"Доступность при последней проверке: {state.get('official_sources_available', 0)}/{state.get('official_sources_total', len(OFFICIAL_MONITOR_SOURCES))}\n\n"
-            "<i>Число настроенных источников не означает, что все сайты доступны прямо сейчас. Бот не является официальной системой оповещения. В экстренной ситуации следуйте указаниям уполномоченных служб.</i>")
+    lines = [
+        "<b>🛰 UAV ALERT — информационный сервис</b>", "",
+        "Автоматически проверяются только заголовки публикаций официальных сайтов. Сведения о местах фиксации и маршрутах БПЛА не собираются. Публикация в канал — только после проверки администратором.", "",
+        f"Последняя проверка сервиса: {format_time(state.get('last_scan_time'))}",
+        f"Официальных источников настроено: {len(OFFICIAL_MONITOR_SOURCES)}/{len(OFFICIAL_MONITOR_SOURCES)}",
+        f"Доступность при последней проверке: {state.get('official_sources_available', 0)}/{state.get('official_sources_total', len(OFFICIAL_MONITOR_SOURCES))}", "",
+        "<b>Состояние сайтов:</b>"
+    ]
+    records = source_state.get("official_monitor", {})
+    for name, url in OFFICIAL_MONITOR_SOURCES:
+        item = records.get(url, {}) if isinstance(records, dict) else {}
+        if item.get("last_error"):
+            status = "🔴 ошибка проверки"
+            detail = str(item.get("last_error"))[:110]
+        elif item.get("last_check"):
+            status = "🟢 проверка прошла"
+            detail = format_time(item.get("last_check"))
+        else:
+            status = "⚪ ещё не проверялся"
+            detail = "нет результата"
+        lines.append(f"• <b>{html.escape(name)}</b>: {status} — {html.escape(detail)}")
+    lines.extend(["", "<i>Успешная загрузка сайта не гарантирует полноту его публикаций. Бот не является официальной системой оповещения. В экстренной ситуации следуйте указаниям уполномоченных служб.</i>"])
+    return "\n".join(lines)
 
 
 
@@ -1434,11 +1472,7 @@ async def review_sources_command(update, context):
     await message.reply_text("\n".join(lines), disable_web_page_preview=True)
 
 async def official_sms_review_handler(update, context):
-    """Принимает от администратора вручную скопированный текст SMS 112 и создаёт внутреннюю заметку.
-
-    SMS не меняет автоматически статус, районы или публикации канала: область действия
-    сообщения не содержит перечисления муниципалитетов и требует отдельной проверки.
-    """
+    """Сохраняет вручную переданный администратором текст SMS 112 для проверки; ничего не публикует автоматически."""
     message = update.effective_message
     user = update.effective_user
     chat = update.effective_chat
@@ -1446,51 +1480,42 @@ async def official_sms_review_handler(update, context):
         return
     if not chat or chat.type != "private" or not message.text:
         return
-
     raw_text = message.text.strip()
     normalized = re.sub(r"\s+", " ", raw_text.casefold()).replace("ё", "е")
     sender_phrase = "служба 112 костромской области"
     threat_phrase = "угроза беспилотной опасности"
     cancel_phrase = "отбой беспилотной опасности"
-
-    if sender_phrase not in normalized:
-        return
-    if threat_phrase in normalized:
+    has_sender = sender_phrase in normalized
+    if threat_phrase in normalized and cancel_phrase not in normalized:
         signal_type = "УГРОЗА"
-        signal_label = "SMS содержит формулировку об угрозе беспилотной опасности"
-    elif cancel_phrase in normalized:
+        signal_label = "распознана формулировка об угрозе беспилотной опасности"
+    elif cancel_phrase in normalized and threat_phrase not in normalized:
         signal_type = "ОТБОЙ"
-        signal_label = "SMS содержит формулировку об отбое беспилотной опасности"
+        signal_label = "распознана формулировка об отбое беспилотной опасности"
     else:
         return
-
     received_at = now_msk().isoformat(timespec="seconds")
-    key_seed = f"sms112|{signal_type}|{normalized}|{received_at}"
-    key = "sms112_" + hashlib.sha256(key_seed.encode("utf-8")).hexdigest()[:20]
+    # Хеш без секундной метки предотвращает случайные дубли при повторной пересылке одного SMS.
+    digest = hashlib.sha256(f"sms112|{signal_type}|{normalized}".encode("utf-8")).hexdigest()[:24]
+    key = "sms112_" + digest
+    existing = admin_drafts.get(key)
+    if isinstance(existing, dict) and existing.get("reviewed_at"):
+        await message.reply_text("ℹ️ Такое SMS уже сохранено для проверки. Статус и публикации не менялись.")
+        return
     review_text = (
         "📩 ВНУТРЕННЯЯ ПРОВЕРКА SMS — СЛУЖБА 112 КОСТРОМСКОЙ ОБЛАСТИ\n\n"
-        f"Сигнал: {signal_type}\n"
-        f"Время получения ботом: {format_time(received_at)}\n\n"
-        f"Распознанная формулировка: {signal_label}.\n\n"
-        "Текст, переданный администратором:\n"
-        f"{raw_text[:1500]}\n\n"
-        "Статус UAV ALERT автоматически НЕ изменён. Районы не определяются по этому SMS, "
-        "так как в тексте они не перечислены. Сообщение не опубликовано в канале. "
-        "Перед любым публичным использованием проверьте актуальность и допустимость публикации."
+        f"Сигнал: {signal_type}\nВремя получения ботом: {format_time(received_at)}\n"
+        f"Отправитель указан в тексте: {'да' if has_sender else 'нет; текст введён/переслан администратором'}\n\n"
+        f"Результат распознавания: {signal_label}.\n\n"
+        "Переданный текст:\n" + raw_text[:1500] + "\n\n"
+        "Это только дополнительный сигнал для ручной проверки. Статус UAV ALERT автоматически НЕ изменён; районы по SMS не определяются; в канал сообщение не опубликовано. Проверьте исходное SMS и актуальные официальные сообщения перед любым публичным использованием."
     )
-    admin_drafts[key] = {
-        "sent": True,
-        "admin_id": ADMIN_ID,
-        "event": "official_sms_review",
-        "signal_type": signal_type,
-        "message": review_text,
-        "raw_sms_text": raw_text[:1500],
-        "attempted_at": received_at,
-        "key": key,
-        "automatic_status_change": False,
-        "automatic_channel_publication": False,
-    }
+    admin_drafts[key] = {"sent": True, "admin_id": ADMIN_ID, "event": "official_sms_review",
+                         "signal_type": signal_type, "message": review_text, "raw_sms_text": raw_text[:1500],
+                         "attempted_at": received_at, "reviewed_at": received_at, "key": key,
+                         "automatic_status_change": False, "automatic_channel_publication": False}
     save_admin_drafts()
+    add_admin_audit("sms112_review", f"Сигнал {signal_type}; sender_in_text={has_sender}; key={key}", user.id)
     await message.reply_text(review_text, disable_web_page_preview=True)
     logger.info("Получен ручной сигнал SMS 112 для проверки: %s; статус не менялся.", signal_type)
 
@@ -1553,6 +1578,29 @@ async def test_command(update, context):
     await update.effective_message.reply_text("✅ Тестовая проверка Telegram-бота прошла успешно.", reply_markup=main_keyboard())
 
 
+async def health_command(update, context):
+    message = update.effective_message
+    if not message:
+        return
+    if not is_admin(update):
+        await message.reply_text("⛔ Команда доступна только администратору.")
+        return
+    records = source_state.get("official_monitor", {})
+    lines = ["🩺 ДИАГНОСТИКА UAV ALERT", "", f"Последний цикл: {format_time(state.get('last_scan_time'))}",
+             f"Доступно сайтов: {state.get('official_sources_available', 0)}/{state.get('official_sources_total', len(OFFICIAL_MONITOR_SOURCES))}",
+             f"Подписчиков: {len(subscribers)}", f"Недоставленных push-записей: {sum(1 for x in notification_events.values() if isinstance(x, dict) and not x.get('sent'))}",
+             f"Неотправленных черновиков: {sum(1 for x in admin_drafts.values() if isinstance(x, dict) and not x.get('sent'))}",
+             f"Записей аудита администратора: {len(admin_audit)}", ""]
+    for name, url in OFFICIAL_MONITOR_SOURCES:
+        item = records.get(url, {}) if isinstance(records, dict) else {}
+        lines.append(name)
+        lines.append("Последняя проверка: " + format_time(item.get("last_check")))
+        lines.append("Ошибка: " + (str(item.get("last_error"))[:250] if item.get("last_error") else "нет"))
+        lines.append("")
+    lines.append("Повторные попытки доставки ограничены 30 минутами, чтобы не рассылать потенциально устаревшие предупреждения.")
+    await message.reply_text("\n".join(lines), disable_web_page_preview=True)
+
+
 async def admin_command(update, context):
     if not update.effective_message:
         return
@@ -1561,13 +1609,15 @@ async def admin_command(update, context):
         return
     await update.effective_message.reply_text("<b>Админ-панель UAV ALERT</b>\n\n" +
         f"Подписчиков: {len(subscribers)}\nАвтоматическая обработка фиксаций БПЛА: отключена\n" +
-        f"Последняя проверка: {format_time(state.get('last_scan_time'))}",
+        f"Последняя проверка: {format_time(state.get('last_scan_time'))}\n" +
+        f"Доступность сайтов: {state.get('official_sources_available', 0)}/{state.get('official_sources_total', len(OFFICIAL_MONITOR_SOURCES))}\n" +
+        f"Записей аудита: {len(admin_audit)}\n\nКоманда /health показывает подробную диагностику.",
         parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
 
 
 async def help_command(update, context):
     if update.effective_message:
-        await update.effective_message.reply_text("<b>Команды UAV ALERT</b>\n\n/start — главное меню\n/subscribe — подписаться\n/unsubscribe — отписаться\n/status — информация о сервисе\n/history — история\n/sources — официальные ресурсы\n/stats — статистика\n/test — тест (администратор)\n/admin — админ-информация\n/broadcast категория | текст | официальная ссылка — ручная проверенная рассылка (администратор)\n/review_sources — дополнительные источники (администратор)\n/help — помощь\n\nАвтоматическая проверка официальных сайтов на заголовки предупреждений/отбоя включена; сбор сведений о местах фиксации и маршрутах БПЛА отключён. Публикация в канал — после проверки администратором.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
+        await update.effective_message.reply_text("<b>Команды UAV ALERT</b>\n\n/start — главное меню\n/subscribe — подписаться\n/unsubscribe — отписаться\n/status — информация о сервисе\n/history — история\n/sources — официальные ресурсы\n/stats — статистика\n/test — тест (администратор)\n/admin — админ-информация\n/health — диагностика (администратор)\n/broadcast категория | текст | официальная ссылка — ручная проверенная рассылка (администратор)\n/review_sources — дополнительные источники (администратор)\n/help — помощь\n\nАвтоматическая проверка официальных сайтов на заголовки предупреждений/отбоя включена; сбор сведений о местах фиксации и маршрутах БПЛА отключён. Публикация в канал — после проверки администратором.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
 
 
 async def weather_text():
@@ -1694,6 +1744,7 @@ async def broadcast_command(update, context):
         except TelegramError:
             failed += 1
             logger.exception("Не удалось отправить ручное уведомление пользователю %s", user_id)
+    add_admin_audit("manual_broadcast", f"Категория={category_label}; sent={sent}; failed={failed}; ссылка={source_url}", update.effective_user.id if update.effective_user else None)
     await message.reply_text(f"Рассылка завершена. Отправлено: {sent}; ошибок: {failed}.")
 
 
@@ -1742,8 +1793,16 @@ def index():
 
 @app.get("/status")
 def health_status():
+    records = source_state.get("official_monitor", {})
+    if not isinstance(records, dict):
+        records = {}
     return jsonify({"status": "ok", "uav_spotting_reposts": "disabled",
-                    "last_scan_time": state.get("last_scan_time"), "last_scan_count": 0}), 200
+                    "last_scan_time": state.get("last_scan_time"),
+                    "official_sources_available": state.get("official_sources_available", 0),
+                    "official_sources_total": state.get("official_sources_total", len(OFFICIAL_MONITOR_SOURCES)),
+                    "source_checks": [{"name": name, "last_check": (records.get(url, {}) or {}).get("last_check"),
+                                       "ok": not bool((records.get(url, {}) or {}).get("last_error")) and bool((records.get(url, {}) or {}).get("last_check"))}
+                                      for name, url in OFFICIAL_MONITOR_SOURCES]}), 200
 
 
 def run_flask():
@@ -1758,7 +1817,7 @@ async def post_init(application):
                 BotCommand("unsubscribe", "Отписаться"), BotCommand("status", "Текущий статус"),
                 BotCommand("history", "История событий"), BotCommand("sources", "Источники"),
                 BotCommand("stats", "Статистика"), BotCommand("test", "Тест уведомления"),
-                BotCommand("admin", "Админ-информация"), BotCommand("broadcast", "Рассылка проверенного сообщения"), BotCommand("review_sources", "Дополнительные источники"), BotCommand("help", "Помощь")]
+                BotCommand("admin", "Админ-информация"), BotCommand("health", "Диагностика (администратор)"), BotCommand("broadcast", "Рассылка проверенного сообщения"), BotCommand("review_sources", "Дополнительные источники"), BotCommand("help", "Помощь")]
     try:
         await application.bot.set_my_commands(commands)
     except TelegramError:
@@ -1795,6 +1854,7 @@ def main():
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("test", test_command))
     application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("health", health_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("review_sources", review_sources_command))
     application.add_handler(CommandHandler("help", help_command))
