@@ -217,7 +217,12 @@ logger.info("Загружено подписчиков: %s", len(subscribers))
 SOURCES = {}
 REVIEW_SOURCE_NAME = "Telegram-канал для ручной проверки"
 REVIEW_SOURCE_URL = "https://t.me/radar_rschs"
-OFFICIAL_MONITOR_SOURCES = []
+# Официальные региональные сайты: проверяются только заголовки публикаций,
+# без извлечения сведений о маршрутах или местах обнаружения БПЛА.
+OFFICIAL_MONITOR_SOURCES = [
+    ("Администрация Костромской области", "https://adm44.ru/news/"),
+    ("Департамент региональной безопасности Костромской области", "https://drb.kostroma.gov.ru/news/"),
+]
 OFFICIAL_ALERT_TERMS = re.compile(
     r"(?:бпла|беспилот\w*|беспилотн\w*|ракетн\w*\s+(?:опасност\w*|тревог\w*)|"
     r"угроз\w*\s+ракетн\w*|ракет\w*\s+опасност\w*)", re.I
@@ -405,10 +410,15 @@ def detect_uav_level(text):
     # Do not interpret an old event mentioned in a cancellation / retrospective report as active.
     if detect_cancel(value):
         return 0
+    # «Угроза беспилотной опасности» — это именно уровень угрозы, а не опасности:
+    # иначе слово «опасности» внутри этой формулировки ошибочно повышает уровень до 3.
+    if re.search(r"\bугроз\w*\s+(?:беспилот\w*\s+)?опасност\w*\b", value):
+        return 2
     # Require an explicit status phrase near the UAV context, not just unrelated words elsewhere.
     patterns = [
         (3, r"\b(?:опасност\w*|объявлен\w*\s+опасност\w*|красн\w*\s+уровен\w*|тревог\w*)\b.{0,100}\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b"),
         (3, r"\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b.{0,100}\b(?:опасност\w*|тревог\w*)\b"),
+        (3, r"\b(?:объявлен\w*|введен\w*|действу\w*)\b.{0,80}\b(?:тревог\w*|опасност\w*)\b.{0,80}\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b"),
         (2, r"\b(?:угроз\w*|оранжев\w*\s+уровен\w*)\b.{0,100}\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b"),
         (2, r"\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b.{0,100}\bугроз\w*\b"),
         (1, r"\b(?:внимание|желт\w*\s+уровен\w*)\b.{0,100}\b(?:бпла|беспилот\w*|дрон\w*|мвш|мрш|мрлс|мрл)\b"),
@@ -1212,14 +1222,18 @@ async def process_official_alert_title(application, item):
         "date": now_msk().isoformat(timespec="seconds"),
         "text": item.get("title", ""),
     }
+    # Use only territory names explicitly written in the official headline.
+    # Never infer a threatened municipality from a generic regional warning.
+    explicit_locations = find_locations(post["text"])
+    territories = explicit_locations or ["Костромская область"]
     if event_type == "rocket_active":
         message = build_rocket_push(True, post)
     elif event_type == "rocket_cancel":
         message = build_rocket_push(False, post)
     elif event_type == "uav_cancel":
-        message = build_uav_cancel_push(post, ["Костромская область"])
+        message = build_uav_cancel_push(post, territories)
     else:
-        message = build_uav_push(level, ["Костромская область"], post)
+        message = build_uav_push(level, territories, post)
 
     # Stable key: same official headline cannot create duplicate pushes after restart.
     daily_title_key = normalize_text(item.get("title", ""))
