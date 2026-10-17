@@ -15,7 +15,7 @@ from flask import Flask, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode
 from telegram.error import TelegramError, Forbidden, BadRequest, RetryAfter
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 
 # ============================================================
 # CONFIG
@@ -1433,6 +1433,68 @@ async def review_sources_command(update, context):
     ])
     await message.reply_text("\n".join(lines), disable_web_page_preview=True)
 
+async def official_sms_review_handler(update, context):
+    """Принимает от администратора вручную скопированный текст SMS 112 и создаёт внутреннюю заметку.
+
+    SMS не меняет автоматически статус, районы или публикации канала: область действия
+    сообщения не содержит перечисления муниципалитетов и требует отдельной проверки.
+    """
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or user.id != ADMIN_ID:
+        return
+    if not chat or chat.type != "private" or not message.text:
+        return
+
+    raw_text = message.text.strip()
+    normalized = re.sub(r"\s+", " ", raw_text.casefold()).replace("ё", "е")
+    sender_phrase = "служба 112 костромской области"
+    threat_phrase = "угроза беспилотной опасности"
+    cancel_phrase = "отбой беспилотной опасности"
+
+    if sender_phrase not in normalized:
+        return
+    if threat_phrase in normalized:
+        signal_type = "УГРОЗА"
+        signal_label = "SMS содержит формулировку об угрозе беспилотной опасности"
+    elif cancel_phrase in normalized:
+        signal_type = "ОТБОЙ"
+        signal_label = "SMS содержит формулировку об отбое беспилотной опасности"
+    else:
+        return
+
+    received_at = now_msk().isoformat(timespec="seconds")
+    key_seed = f"sms112|{signal_type}|{normalized}|{received_at}"
+    key = "sms112_" + hashlib.sha256(key_seed.encode("utf-8")).hexdigest()[:20]
+    review_text = (
+        "📩 ВНУТРЕННЯЯ ПРОВЕРКА SMS — СЛУЖБА 112 КОСТРОМСКОЙ ОБЛАСТИ\n\n"
+        f"Сигнал: {signal_type}\n"
+        f"Время получения ботом: {format_time(received_at)}\n\n"
+        f"Распознанная формулировка: {signal_label}.\n\n"
+        "Текст, переданный администратором:\n"
+        f"{raw_text[:1500]}\n\n"
+        "Статус UAV ALERT автоматически НЕ изменён. Районы не определяются по этому SMS, "
+        "так как в тексте они не перечислены. Сообщение не опубликовано в канале. "
+        "Перед любым публичным использованием проверьте актуальность и допустимость публикации."
+    )
+    admin_drafts[key] = {
+        "sent": True,
+        "admin_id": ADMIN_ID,
+        "event": "official_sms_review",
+        "signal_type": signal_type,
+        "message": review_text,
+        "raw_sms_text": raw_text[:1500],
+        "attempted_at": received_at,
+        "key": key,
+        "automatic_status_change": False,
+        "automatic_channel_publication": False,
+    }
+    save_admin_drafts()
+    await message.reply_text(review_text, disable_web_page_preview=True)
+    logger.info("Получен ручной сигнал SMS 112 для проверки: %s; статус не менялся.", signal_type)
+
+
 async def start_command(update, context):
     if update.effective_message:
         await update.effective_message.reply_text("🛰 <b>UAV ALERT</b>\nГражданский информационный сервис Костромской области. Здесь доступны погодные сведения, памятки безопасности и проверенные официальные сообщения. Автоматическая проверка официальных сайтов на заголовки предупреждений/отбоя включена; сбор сведений о местах фиксации и маршрутах БПЛА отключён. Публикация в канал — после проверки администратором.\n\nВ экстренной ситуации следуйте указаниям уполномоченных служб.", parse_mode=ParseMode.HTML, reply_markup=main_keyboard(), disable_web_page_preview=True)
@@ -1736,6 +1798,7 @@ def main():
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("review_sources", review_sources_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, official_sms_review_handler))
     application.add_handler(CallbackQueryHandler(callback_handler))
     logger.info("Запускаем Telegram polling.")
     application.run_polling(drop_pending_updates=False, allowed_updates=Update.ALL_TYPES)
