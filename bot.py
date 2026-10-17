@@ -1511,7 +1511,45 @@ async def official_sms_review_handler(update, context):
     save_admin_drafts()
     add_admin_audit("sms112_review", f"Сигнал {signal_type}; sender_in_text={has_sender}; key={key}", user.id)
     await message.reply_text(review_text, disable_web_page_preview=True)
-    logger.info("Получен ручной сигнал SMS 112 для проверки: %s; статус не менялся.", signal_type)
+
+    # Второе сообщение — только черновик в формате UAV ALERT для ручной проверки.
+    # Оно не меняет внутренний статус и не публикуется в канал автоматически.
+    if signal_type == "УГРОЗА":
+        public_draft = (
+            "🛰 UAV ALERT\n"
+            "📍 Регион: Костромская область\n\n"
+            "🔴 Опасность по БПЛА\n"
+            "Категория: БПЛА\n"
+            f"Время сообщения: {format_time(received_at)} МСК\n\n"
+            "📍 Территории: Костромская область\n\n"
+            "Информация требует проверки по актуальным официальным оповещениям и не заменяет их. "
+            "Черновик создан по тексту переданного SMS; перед публикацией подтвердите актуальность вручную."
+        )
+    else:
+        public_draft = (
+            "🛰 UAV ALERT\n"
+            "📍 Регион: Костромская область\n\n"
+            "🟢 Сообщение об отбое беспилотной опасности\n"
+            f"Время сообщения: {format_time(received_at)} МСК\n\n"
+            "📍 Территории: Костромская область\n\n"
+            "Черновик создан по тексту переданного SMS и требует ручной сверки с актуальными официальными сообщениями. "
+            "Статус автоматически не изменён; в канал не опубликовано."
+        )
+    draft_key = key + "_public_draft"
+    admin_drafts[draft_key] = {
+        "sent": True, "admin_id": ADMIN_ID, "event": "sms112_public_draft",
+        "signal_type": signal_type, "message": public_draft,
+        "attempted_at": received_at, "reviewed_at": received_at,
+        "key": draft_key, "automatic_status_change": False,
+        "automatic_channel_publication": False,
+    }
+    save_admin_drafts()
+    add_admin_audit("sms112_public_draft", f"Черновик для ручной проверки; сигнал {signal_type}; key={draft_key}", user.id)
+    await message.reply_text(
+        "📝 ЧЕРНОВИК UAV ALERT — ТОЛЬКО ДЛЯ РУЧНОЙ ПРОВЕРКИ\n\n" + public_draft,
+        disable_web_page_preview=True,
+    )
+    logger.info("Получен ручной сигнал SMS 112 для проверки: %s; статус не менялся; создан черновик без публикации.", signal_type)
 
 
 async def start_command(update, context):
