@@ -22,7 +22,7 @@ from telegram.ext import (
 )
 
 # UAV ALERT — гражданский информационный бот.
-# Мониторятся только формулировки предупреждений/отбоя для Костромской области.
+# Мониторятся формулировки предупреждений/отбоя по БПЛА и ракетной опасности для Костромской области.
 # Сведения о маршрутах, координатах и местах обнаружения БПЛА не извлекаются.
 # Сообщения сторонних Telegram-каналов — дополнительный сигнал, не официальное подтверждение.
 
@@ -58,7 +58,8 @@ REGION_RE = re.compile(r"костром\w*\s+(област|регион)", re.I)
 ALERT_RE = re.compile(
     r"беспилотн\w*\s+опасност|опасност\w*\s+по\s+бпла|"
     r"угроз\w*\s+беспилот|угроз\w*\s+бпла|"
-    r"внимани\w*.{0,30}бпла|бпла.{0,40}(?:внимани|угроз|опасност)|"
+    r"внимани\w*.{0,30}бпла|тревог\w*.{0,30}(?:бпла|беспилот)|"
+    r"бпла.{0,40}(?:внимани|угроз|опасност|тревог)|"
     r"опасност\w*.{0,30}(?:беспилот|бпла)|"
     r"беспилотн\w*.{0,30}(?:угроз|опасност|внимани)",
     re.I | re.S
@@ -72,6 +73,106 @@ CANCEL_RE = re.compile(
 DANGER_RE = re.compile(r"(?:опасност\w*\s+по\s+бпла|беспилотн\w*\s+опасност|красн\w*\s+уров)", re.I)
 THREAT_RE = re.compile(r"(?:угроз\w*\s+(?:беспилот|бпла)|бпла.{0,30}угроз)", re.I | re.S)
 ATTENTION_RE = re.compile(r"(?:внимани\w*.{0,30}бпла|бпла.{0,30}внимани)", re.I | re.S)
+
+
+ROCKET_RE = re.compile(
+    r"ракетн\w*.{0,35}(?:опасност|угроз|тревог)|"
+    r"(?:опасност|угроз|тревог).{0,35}ракетн\w*|"
+    r"ракетн\w*.{0,25}тревог",
+    re.I | re.S
+)
+ROCKET_CANCEL_RE = re.compile(
+    r"(?:отбой|отмен[аы]|снят[аоы]?).{0,70}(?:ракетн|ракетной опасности)|"
+    r"(?:ракетн|ракетной опасности).{0,70}(?:отбой|отмен[аы]|снят[аоы]?)",
+    re.I | re.S
+)
+
+WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+KOSTROMA_LAT = 57.7679
+KOSTROMA_LON = 40.9269
+
+def weather_code_text(code):
+    mapping = {
+        0: "ясно", 1: "преимущественно ясно", 2: "переменная облачность",
+        3: "пасмурно", 45: "туман", 48: "изморозевый туман",
+        51: "слабая морось", 53: "морось", 55: "сильная морось",
+        56: "слабая ледяная морось", 57: "сильная ледяная морось",
+        61: "небольшой дождь", 63: "дождь", 65: "сильный дождь",
+        66: "слабый ледяной дождь", 67: "сильный ледяной дождь",
+        71: "небольшой снег", 73: "снег", 75: "сильный снег",
+        77: "снежные зёрна", 80: "ливневый дождь", 81: "ливень",
+        82: "сильный ливень", 85: "снегопад", 86: "сильный снегопад",
+        95: "гроза", 96: "гроза с небольшим градом", 99: "гроза с градом"
+    }
+    return mapping.get(code, "условия не определены")
+
+async def get_weather_text():
+    params = {
+        "latitude": KOSTROMA_LAT, "longitude": KOSTROMA_LON,
+        "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+        "forecast_days": 2, "timezone": "Europe/Moscow"
+    }
+    data = await asyncio.to_thread(
+        lambda: requests.get(WEATHER_URL, params=params, timeout=REQUEST_TIMEOUT).json()
+    )
+    current = data["current"]
+    daily = data["daily"]
+    today = daily["time"][0]
+    tomorrow = daily["time"][1]
+    return (
+        "🌦 <b>Погода — Кострома</b>\n"
+        f"Сейчас: {current['temperature_2m']:+.1f} °C, "
+        f"{weather_code_text(current['weather_code'])}\n"
+        f"Ощущается как: {current['apparent_temperature']:+.1f} °C\n"
+        f"Влажность: {current['relative_humidity_2m']}%, "
+        f"ветер: {current['wind_speed_10m']} км/ч\n\n"
+        f"Сегодня ({today}): {weather_code_text(daily['weather_code'][0])}, "
+        f"{daily['temperature_2m_min'][0]:+.0f}…{daily['temperature_2m_max'][0]:+.0f} °C, "
+        f"вероятность осадков до {daily['precipitation_probability_max'][0]}%\n"
+        f"Завтра ({tomorrow}): {weather_code_text(daily['weather_code'][1])}, "
+        f"{daily['temperature_2m_min'][1]:+.0f}…{daily['temperature_2m_max'][1]:+.0f} °C, "
+        f"вероятность осадков до {daily['precipitation_probability_max'][1]}%\n\n"
+        "Источник: Open-Meteo. Прогноз может обновляться."
+    )
+
+async def regional_alert_status():
+    # Показываем только найденные сообщения и не трактуем отсутствие постов как «безопасно».
+    found = {"uav": None, "rocket": None}
+    errors = []
+    for name, url, _ in SOURCES:
+        try:
+            posts = await asyncio.to_thread(source_posts, url)
+            for post in reversed(posts):
+                text = post["text"]
+                if not mentions_kostroma(text):
+                    continue
+                value = normalize(text)
+                if found["rocket"] is None and ROCKET_RE.search(value):
+                    state_label = "ОТБОЙ ракетной опасности" if ROCKET_CANCEL_RE.search(value) else "упоминание ракетной опасности/тревоги"
+                    found["rocket"] = (state_label, name, post["url"])
+                if found["uav"] is None:
+                    result = classify(text)
+                    if result:
+                        found["uav"] = (result[1], name, post["url"])
+        except Exception as exc:
+            errors.append(name)
+            logger.warning("Не удалось проверить статус по %s: %s", name, exc)
+    lines = ["🛰 <b>Статус оповещений — Костромская область</b>"]
+    if found["uav"]:
+        label, name, url = found["uav"]
+        lines.append(f"БПЛА: <b>{html.escape(label)}</b> — последнее найденное сообщение: <a href=\"{html.escape(url, quote=True)}\">{html.escape(name)}</a>.")
+    else:
+        lines.append("БПЛА: актуальный статус не удалось подтвердить по доступным публикациям.")
+    if found["rocket"]:
+        label, name, url = found["rocket"]
+        lines.append(f"Ракетная опасность: <b>{html.escape(label)}</b> — последнее найденное сообщение: <a href=\"{html.escape(url, quote=True)}\">{html.escape(name)}</a>.")
+    else:
+        lines.append("Ракетная опасность: актуальный статус не удалось подтвердить по доступным публикациям.")
+    if errors:
+        lines.append("Не удалось проверить: " + ", ".join(errors) + ".")
+    lines.append("\n⚠️ Это автоматическая сводка по найденным публикациям Telegram, а не подтверждение текущей официальной обстановки. Отсутствие сообщения не означает отсутствие угрозы. Проверяйте официальные оповещения МЧС и властей.")
+    return "\n".join(lines)
 
 os.makedirs(DATA_DIR, exist_ok=True)
 STATE_FILE = os.path.join(DATA_DIR, "uav_alert_state.json")
@@ -217,6 +318,12 @@ async def monitor_source(application, name, url, is_review_source):
             continue
         result = classify(text)
         if not result:
+            value = normalize(text)
+            if ROCKET_CANCEL_RE.search(value):
+                result = ("cancel", "🟢 ОТБОЙ РАКЕТНОЙ ОПАСНОСТИ")
+            elif ROCKET_RE.search(value):
+                result = ("danger", "🔴 РАКЕТНАЯ ОПАСНОСТЬ / ТРЕВОГА")
+        if not result:
             continue
         kind, label = result
         # Сообщения сторонних каналов отправляются как требующие проверки,
@@ -249,14 +356,26 @@ def keyboard():
     ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_message:
+    if not update.effective_message:
+        return
+    await update.effective_message.reply_text(
+        "🛰 UAV ALERT — информационный сервис Костромской области.\\n\\n"
+        "Бот проверяет публичные сообщения выбранных источников, если процесс запущен. "
+        "Сообщения сторонних каналов требуют сверки с официальными оповещениями. "
+        "Бот не является официальной системой 112.\\n\\n"
+        "Команды: /weather — погода в Костроме на сегодня и завтра; "
+        "/status — состояние мониторинга.\\n\\n"
+        "Нажми «Подписаться», чтобы получать уведомления.",
+        reply_markup=keyboard()
+    )
+    try:
         await update.effective_message.reply_text(
-            "🛰 UAV ALERT — информационный сервис Костромской области.\n\n"
-            "Бот проверяет публичные сообщения выбранных источников круглосуточно, "
-            "если процесс запущен. Сообщения сторонних каналов требуют сверки "
-            "с официальными оповещениями. Бот не является официальной системой 112.\n\n"
-            "Нажми «Подписаться», чтобы получать уведомления.",
-            reply_markup=keyboard()
+            await regional_alert_status(), parse_mode=ParseMode.HTML, disable_web_page_preview=True
+        )
+    except Exception as exc:
+        logger.warning("Не удалось сформировать статус при /start: %s", exc)
+        await update.effective_message.reply_text(
+            "⚠️ Не удалось получить сводку. Проверь официальные оповещения МЧС и органов власти."
         )
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -299,6 +418,16 @@ def status_text():
     for name, url, _ in SOURCES:
         lines.append(f"• {name}: {'ошибка — ' + errors[url] if url in errors else 'без последней ошибки'}")
     return "\n".join(lines)
+
+async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        text = await get_weather_text()
+        await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        logger.warning("Не удалось получить прогноз погоды: %s", exc)
+        await update.effective_message.reply_text(
+            "Не удалось получить прогноз погоды для Костромы. Попробуй позже."
+        )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(status_text())
@@ -360,6 +489,7 @@ async def post_init(application: Application):
         BotCommand("subscribe", "Подписаться"),
         BotCommand("unsubscribe", "Отписаться"),
         BotCommand("status", "Статус мониторинга"),
+        BotCommand("weather", "Погода в Костроме на сегодня и завтра"),
         BotCommand("sources", "Список источников"),
         BotCommand("health", "Диагностика администратора"),
     ])
@@ -397,6 +527,7 @@ def main():
     application.add_handler(CommandHandler("subscribe", subscribe))
     application.add_handler(CommandHandler("unsubscribe", unsubscribe))
     application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("weather", weather_command))
     application.add_handler(CommandHandler("sources", history_sources))
     application.add_handler(CommandHandler("health", admin_health))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, incoming_sms))
