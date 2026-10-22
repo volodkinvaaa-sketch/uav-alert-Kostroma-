@@ -7,11 +7,14 @@ import logging
 import threading
 import html
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+)
 from telegram.constants import ParseMode
 from telegram.error import TelegramError, BadRequest
 from telegram.ext import (
@@ -20,11 +23,12 @@ from telegram.ext import (
 )
 
 # UAV ALERT — гражданский информационный бот.
-# Публикации сторонних источников требуют проверки по официальным оповещениям.
+# Источники — сторонние Telegram-каналы, а не официальные государственные источники.
+# Новые найденные события сначала отправляются администратору на модерацию.
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1421675956"))
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@RADAR_Kostroma")  # резерв для будущей публикации в канал
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@RADAR_Kostroma")
 PORT = int(os.getenv("PORT", "10000"))
 CHECK_INTERVAL = max(30, int(os.getenv("CHECK_INTERVAL", "60")))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
@@ -35,11 +39,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DANGER_IMAGE = os.path.join(BASE_DIR, "danger.jpg")
 ALL_CLEAR_IMAGE = os.path.join(BASE_DIR, "all_clear.jpg")
 
+# Только выбранные владельцем источники. URL /s/ нужен для чтения публичной ленты.
 SOURCES = [
-    ("radar_rschs (проверка публикаций)", "https://t.me/s/radar_rschs", True),
-    ("locatorru (дополнительный источник)", "https://t.me/s/locatorru", False),
-    ("bplarussiaru (дополнительный источник)", "https://t.me/s/bplarussiaru", False),
+    ("locatorru", "https://t.me/s/locatorru", False),
+    ("radarrussiia", "https://t.me/s/radarrussiia", False),
+    ("bplarussiaru", "https://t.me/s/bplarussiaru", False),
 ]
+
 OFFICIAL_SOURCES = [
     ("МЧС по Костромской области", "https://44.mchs.gov.ru/"),
     ("Администрация Костромской области", "https://adm44.ru/"),
@@ -163,12 +169,13 @@ def save_json(path, value):
 
 state = load_json(STATE_FILE, {
     "seen": {}, "subscribers": [], "last_scan": None, "last_errors": {},
-    "last_event": None, "initialized": {}
+    "last_event": None, "initialized": {}, "pending": {}
 })
 if not isinstance(state, dict):
     state = {}
 for key, default in {
-    "seen": {}, "subscribers": [], "last_errors": {}, "initialized": {}
+    "seen": {}, "subscribers": [], "last_errors": {}, "initialized": {},
+    "pending": {}
 }.items():
     state.setdefault(key, default)
 subscribers = set(load_json(SUBSCRIBERS_FILE, state.get("subscribers", [])))
@@ -218,7 +225,6 @@ def extract_territories(text):
 
 def classify_rocket(text):
     value = normalize(text)
-    # Отбой проверяется раньше объявления опасности.
     if ROCKET_CANCEL_RE.search(value):
         return "rocket_cancel", "Отбой ракетной опасности"
     if ROCKET_NEGATION_RE.search(value):
@@ -242,7 +248,6 @@ def classify_uav(text):
     return None
 
 def classify(text):
-    # Совместимость с существующими вызовами.
     return classify_rocket(text) or classify_uav(text)
 
 def weather_code_text(code):
@@ -288,6 +293,21 @@ async def get_weather_text():
         "Источник: Open-Meteo. Прогноз может обновляться."
     )
 
+def parse_published_time(node):
+    """Время публикации из HTML Telegram; при отсутствии метаданных вернёт None."""
+    time_node = node.select_one("a.tgme_widget_message_date time")
+    if time_node:
+        raw = time_node.get("datetime")
+        if raw:
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(MSK)
+            except ValueError:
+                pass
+    return None
+
 def source_posts(source_url):
     response = requests.get(
         source_url, timeout=REQUEST_TIMEOUT,
@@ -304,20 +324,37 @@ def source_posts(source_url):
         link_node = node.select_one("a.tgme_widget_message_date")
         url = link_node.get("href", "") if link_node else source_url
         post_id = node.get("data-post", "") or url
+        published_at = parse_published_time(node)
+        digest = hashlib.sha256((post_id + "|" + text).encode("utf-8")).hexdigest()
         if text:
-            digest = hashlib.sha256((post_id + "|" + text).encode("utf-8")).hexdigest()
-            posts.append({"key": digest, "text": text[:5000], "url": url})
+            posts.append({
+                "key": digest,
+                "text": text[:5000],
+                "url": url,
+                "published_at": published_at.isoformat(timespec="minutes") if published_at else None
+            })
     return posts[-30:]
 
-def event_message(kind, label, source, url, published_text):
-    stamp = now_msk().strftime("%d.%m.%Y, %H:%M МСК")
+def format_event_time(published_at):
+    if published_at:
+        try:
+            parsed = datetime.fromisoformat(published_at)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=MSK)
+            return parsed.astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
+        except (TypeError, ValueError):
+            pass
+    # Если Telegram не отдал время исходного поста, не выдаём время обнаружения за время публикации.
+    return "не указано"
+
+def event_message(kind, label, source, url, published_text, published_at=None):
     territories = extract_territories(published_text) or ["Костромская область"]
-    territory_text = "\n".join(f"• {html.escape(name)}" for name in territories)
+    territory_text = ", ".join(html.escape(name) for name in territories)
     is_rocket = "ракет" in (label or "").lower()
 
     if is_rocket and kind == "rocket_cancel":
         title = "🟢 Отбой ракетной опасности"
-        category = "Ракетная опасность — отбой"
+        category = "Ракетная опасность"
     elif is_rocket:
         title = "🔴 Ракетная опасность"
         category = "Ракетная опасность"
@@ -334,54 +371,117 @@ def event_message(kind, label, source, url, published_text):
         title = "🔴 Опасность по БПЛА"
         category = "БПЛА"
 
+    stamp = html.escape(format_event_time(published_at))
     return (
         "<b>🛰 UAV ALERT</b>\n"
         "📍 <b>Регион:</b> Костромская область\n\n"
         f"<b>{title}</b>\n"
         f"Категория: {category}\n"
-        f"🕒 <b>Время обнаружения ботом:</b> {stamp}\n\n"
-        f"📍 <b>Территории, упомянутые в публикации:</b>\n{territory_text}\n\n"
-        "<i>Это автоматически сформированная сводка по стороннему сообщению. "
-        "Проверьте актуальность по официальным оповещениям; публикация не является "
-        "самостоятельным подтверждением угрозы.</i>\n\n"
-        f"Источник: <a href=\"{html.escape(url, quote=True)}\">{html.escape(source)}</a>"
+        f"Время сообщения: {stamp}\n\n"
+        f"📍 <b>Территории:</b> {territory_text}\n\n"
+        "Информация требует проверки по актуальным официальным оповещениям "
+        "и не заменяет их."
     )
 
-async def send_event(application, kind, label, source, url, text):
-    message = event_message(kind, label, source, url, text)
-    is_cancel = kind in ("cancel", "rocket_cancel")
-    image_path = ALL_CLEAR_IMAGE if is_cancel else DANGER_IMAGE
-    recipients = set(subscribers)
-    recipients.add(ADMIN_ID)
+def moderation_keyboard(pending_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Опубликовать подписчикам", callback_data=f"approve:{pending_id}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{pending_id}")
+    ]])
 
-    for chat_id in sorted(recipients):
-        try:
-            if os.path.isfile(image_path):
-                if len(message) <= 1024:
-                    with open(image_path, "rb") as photo:
-                        await application.bot.send_photo(
-                            chat_id=chat_id, photo=photo, caption=message,
-                            parse_mode=ParseMode.HTML
-                        )
-                else:
-                    with open(image_path, "rb") as photo:
-                        await application.bot.send_photo(
-                            chat_id=chat_id, photo=photo,
-                            caption="🛰 UAV ALERT — Костромская область"
-                        )
-                    await application.bot.send_message(
-                        chat_id=chat_id, text=message, parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True
-                    )
-            else:
-                await application.bot.send_message(
-                    chat_id=chat_id, text=message, parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True
-                )
-        except TelegramError:
-            logger.exception("Не удалось отправить уведомление chat_id=%s", chat_id)
-        except OSError:
-            logger.exception("Не удалось прочитать изображение: %s", image_path)
+async def send_text_or_photo(bot, chat_id, message, is_cancel=False):
+    image_path = ALL_CLEAR_IMAGE if is_cancel else DANGER_IMAGE
+    if os.path.isfile(image_path) and len(message) <= 1024:
+        with open(image_path, "rb") as photo:
+            await bot.send_photo(
+                chat_id=chat_id, photo=photo, caption=message,
+                parse_mode=ParseMode.HTML, disable_notification=False
+            )
+    else:
+        await bot.send_message(
+            chat_id=chat_id, text=message, parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+
+async def send_event(application, kind, label, source, url, text, published_at=None):
+    message = event_message(kind, label, source, url, text, published_at)
+    pending_id = hashlib.sha256(
+        f"{url}|{text}|{published_at or ''}".encode("utf-8")
+    ).hexdigest()[:16]
+    pending = state.setdefault("pending", {})
+    if pending_id in pending:
+        return
+
+    pending[pending_id] = {
+        "kind": kind, "label": label, "source": source, "url": url,
+        "text": text[:5000], "published_at": published_at,
+        "message": message, "created_at": now_msk().isoformat(timespec="seconds")
+    }
+    save_state()
+
+    preview = (
+        "📝 <b>Публикация ожидает проверки</b>\n"
+        f"Источник: <a href=\"{html.escape(url, quote=True)}\">{html.escape(source)}</a>\n\n"
+        f"{message}\n\n"
+        "Проверь исходную публикацию и официальные оповещения перед подтверждением."
+    )
+    try:
+        await send_text_or_photo(application.bot, ADMIN_ID, preview, kind in ("cancel", "rocket_cancel"))
+        # Кнопки отправляются отдельным сообщением, чтобы они всегда были доступны.
+        await application.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"Решение по событию {pending_id}:",
+            reply_markup=moderation_keyboard(pending_id)
+        )
+    except TelegramError:
+        logger.exception("Не удалось отправить событие администратору на модерацию")
+
+async def monitor_source(application, name, url, is_review_source):
+    posts = await asyncio.to_thread(source_posts, url)
+    seen_map = state.setdefault("seen", {})
+    source_seen = set(seen_map.get(url, []))
+    initialized = bool(state.setdefault("initialized", {}).get(url, False))
+
+    # Первый запуск только запоминает текущие публикации, не рассылая архив.
+    if not initialized:
+        seen_map[url] = [p["key"] for p in posts][-300:]
+        state["initialized"][url] = True
+        state["last_errors"].pop(url, None)
+        return
+
+    for post in posts:
+        if post["key"] in source_seen:
+            continue
+        source_seen.add(post["key"])
+        text = post["text"]
+        if not mentions_kostroma(text):
+            continue
+        result = classify_rocket(text) or classify_uav(text)
+        if not result:
+            continue
+        kind, label = result
+        await send_event(
+            application, kind, label, name, post["url"], text,
+            post.get("published_at")
+        )
+
+    seen_map[url] = list(source_seen)[-300:]
+    state["last_errors"].pop(url, None)
+
+async def monitor_loop(application):
+    logger.info("Мониторинг запущен; интервал %s сек.", CHECK_INTERVAL)
+    while True:
+        for name, url, review in SOURCES:
+            try:
+                await monitor_source(application, name, url, review)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                state.setdefault("last_errors", {})[url] = str(exc)[:250]
+                logger.warning("Источник %s недоступен: %s", name, exc)
+        state["last_scan"] = now_msk().isoformat(timespec="seconds")
+        save_state()
+        await asyncio.sleep(CHECK_INTERVAL)
 
 async def regional_alert_status():
     found = {"uav": None, "rocket": None}
@@ -405,7 +505,7 @@ async def regional_alert_status():
             errors.append(name)
             logger.warning("Не удалось проверить статус по %s: %s", name, exc)
 
-    lines = ["🛰 <b>Статус оповещений — Костромская область</b>"]
+    lines = ["🛰 <b>Статус публикаций — Костромская область</b>"]
     if found["uav"]:
         label, name, url = found["uav"]
         lines.append(
@@ -431,53 +531,6 @@ async def regional_alert_status():
     )
     return "\n".join(lines)
 
-async def monitor_source(application, name, url, is_review_source):
-    posts = await asyncio.to_thread(source_posts, url)
-    seen_map = state.setdefault("seen", {})
-    source_seen = set(seen_map.get(url, []))
-    initialized = bool(state.setdefault("initialized", {}).get(url, False))
-
-    # Первый запуск только запоминает имеющиеся публикации, не рассылая архив.
-    if not initialized:
-        seen_map[url] = [p["key"] for p in posts][-300:]
-        state["initialized"][url] = True
-        state["last_errors"].pop(url, None)
-        return
-
-    for post in posts:
-        if post["key"] in source_seen:
-            continue
-        source_seen.add(post["key"])
-        text = post["text"]
-        if not mentions_kostroma(text):
-            continue
-
-        result = classify_rocket(text) or classify_uav(text)
-        if not result:
-            continue
-
-        kind, label = result
-        await send_event(application, kind, label, name, post["url"], text)
-
-    # Сортируем ключи для сохранения предсказуемого состояния.
-    seen_map[url] = list(source_seen)[-300:]
-    state["last_errors"].pop(url, None)
-
-async def monitor_loop(application):
-    logger.info("Круглосуточный мониторинг запущен; интервал %s сек.", CHECK_INTERVAL)
-    while True:
-        for name, url, review in SOURCES:
-            try:
-                await monitor_source(application, name, url, review)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                state.setdefault("last_errors", {})[url] = str(exc)[:250]
-                logger.warning("Источник %s недоступен: %s", name, exc)
-        state["last_scan"] = now_msk().isoformat(timespec="seconds")
-        save_state()
-        await asyncio.sleep(CHECK_INTERVAL)
-
 def keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔔 Подписаться", callback_data="subscribe"),
@@ -491,12 +544,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.effective_message.reply_text(
         "🛰 UAV ALERT — информационный сервис Костромской области.\n\n"
-        "Бот проверяет публичные сообщения выбранных источников, если процесс запущен. "
-        "Сообщения сторонних каналов требуют сверки с официальными оповещениями. "
-        "Бот не является официальной системой 112.\n\n"
+        "Бот проверяет публичные сообщения выбранных сторонних Telegram-каналов. "
+        "Новые события сначала отправляются администратору на проверку и рассылаются "
+        "подписчикам только после подтверждения. Бот не является официальной системой 112.\n\n"
         "Команды: /weather — погода; /status — состояние мониторинга; "
         "/sources — источники; /health — диагностика администратора.\n\n"
-        "Нажми «Подписаться», чтобы получать уведомления.",
+        "Нажми «Подписаться», чтобы получать подтверждённые администратором уведомления.",
         reply_markup=keyboard()
     )
     try:
@@ -527,12 +580,18 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("🔕 Подписка отключена.", reply_markup=keyboard())
 
 def sources_text():
-    lines = ["📡 Источники мониторинга", ""]
-    lines.extend(f"• {name}: {url.replace('/s/', '/')}" for name, url, _ in SOURCES)
-    lines.extend(["", "Официальные ресурсы для сверки:",
-                  *[f"• {name}: {url}" for name, url in OFFICIAL_SOURCES],
-                  "", "При первом запуске бот запоминает старые посты и не рассылает архив.",
-                  "Сообщения из Telegram-каналов не подтверждают официальный статус тревоги."])
+    lines = [
+        "📡 Одобренные источники мониторинга",
+        "",
+        *[f"• {name}: {url.replace('/s/', '/')}" for name, url, _ in SOURCES],
+        "",
+        "Это выбранные администратором сторонние Telegram-каналы, а не официальные "
+        "государственные источники.",
+        "Каждое найденное событие отправляется администратору на проверку.",
+        "",
+        "Официальные ресурсы для сверки:",
+        *[f"• {name}: {url}" for name, url in OFFICIAL_SOURCES],
+    ]
     return "\n".join(lines)
 
 def status_text():
@@ -542,7 +601,8 @@ def status_text():
         f"Последний цикл: {state.get('last_scan') or 'ещё не завершён'}",
         f"Интервал проверки: {CHECK_INTERVAL} сек.",
         f"Подписчиков: {len(subscribers)}",
-        f"Источников: {len(SOURCES)}", ""
+        f"Источников: {len(SOURCES)}",
+        f"Ожидают модерации: {len(state.get('pending', {}))}", ""
     ]
     for name, url, _ in SOURCES:
         lines.append(f"• {name}: {'ошибка — ' + errors[url] if url in errors else 'без последней ошибки'}")
@@ -572,7 +632,7 @@ async def admin_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(status_text())
 
 async def incoming_sms(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Бот не читает SMS с телефона. Администратор может передать текст вручную.
+    # Администратор может передать текст вручную; он также поступит на модерацию.
     message, user = update.effective_message, update.effective_user
     if not message or not user or user.id != ADMIN_ID or not message.text:
         return
@@ -581,29 +641,70 @@ async def incoming_sms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not result or not mentions_kostroma(text):
         return
     await message.reply_text(
-        "📩 Текст распознан как возможное предупреждение/отбой. "
-        "Это не подтверждает подлинность отправителя или актуальность сообщения. "
+        "📩 Текст распознан как возможное предупреждение и отправлен на модерацию. "
         "Проверь официальный первоисточник."
     )
     kind, label = result
     await send_event(
         context.application, kind, label,
         "Текст, переданный администратором",
-        "https://44.mchs.gov.ru/", text
+        "https://44.mchs.gov.ru/", text, now_msk().isoformat(timespec="minutes")
     )
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query:
+        return
     await query.answer()
-    if query.data == "subscribe":
+    data = query.data or ""
+
+    if data.startswith("approve:") or data.startswith("reject:"):
+        if query.from_user.id != ADMIN_ID:
+            await query.answer("Только администратор может принять это решение.", show_alert=True)
+            return
+        action, pending_id = data.split(":", 1)
+        item = state.setdefault("pending", {}).get(pending_id)
+        if not item:
+            await query.edit_message_text("Это событие уже обработано или отсутствует.")
+            return
+
+        if action == "reject":
+            state["pending"].pop(pending_id, None)
+            save_state()
+            await query.edit_message_text(f"❌ Событие {pending_id} отклонено.")
+            return
+
+        # Сначала сохраняем результат модерации, затем рассылаем подписчикам.
+        state["pending"].pop(pending_id, None)
+        state.setdefault("approved", {})[pending_id] = now_msk().isoformat(timespec="seconds")
+        save_state()
+        is_cancel = item["kind"] in ("cancel", "rocket_cancel")
+        recipients = set(subscribers)
+        if CHANNEL_ID:
+            recipients.add(CHANNEL_ID)
+        sent = 0
+        for recipient in sorted(recipients, key=str):
+            try:
+                await send_text_or_photo(
+                    context.bot, recipient, item["message"], is_cancel=is_cancel
+                )
+                sent += 1
+            except TelegramError:
+                logger.exception("Не удалось отправить подтверждённое событие получателю %s", recipient)
+        await query.edit_message_text(
+            f"✅ Событие подтверждено и отправлено. Успешных отправок: {sent}."
+        )
+        return
+
+    if data == "subscribe":
         subscribers.add(query.from_user.id)
         save_state()
         text = "🔔 Подписка включена."
-    elif query.data == "unsubscribe":
+    elif data == "unsubscribe":
         subscribers.discard(query.from_user.id)
         save_state()
         text = "🔕 Подписка отключена."
-    elif query.data == "sources":
+    elif data == "sources":
         text = sources_text()
     else:
         text = status_text()
