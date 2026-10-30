@@ -59,6 +59,17 @@ SOURCES = [
     ("bplarussiaru", "https://t.me/s/bplarussiaru"),
 ]
 
+# Отдельная лента обычных региональных новостей; не влияет на статусы.
+NEWS_SOURCES = [
+    ("В курсе Кострома", "https://t.me/s/v_kurse_kostroma"),
+]
+NEWS_SENSITIVE_RE = re.compile(
+    r"бпла|беспилот|дрон|мвш|мрш|пво|зенитн|перехват|сбит|"
+    r"облом|координат|маршрут|траектор|военн\w*\s+объект|"
+    r"ракетн\w*\s+опасност|авиаудар|позици\w*\s+(?:военн|пво)",
+    re.I
+)
+
 OFFICIAL_SOURCES = [
     ("МЧС по Костромской области", "https://44.mchs.gov.ru/"),
     ("Администрация Костромской области", "https://adm44.ru/"),
@@ -276,6 +287,9 @@ for key, default in {
     "pending": {},
     "approved": {},
     "active_alerts": {},
+    "news_seen": {},
+    "news_initialized": {},
+    "news_last_errors": {},
 }.items():
     state.setdefault(key, default)
 
@@ -713,6 +727,58 @@ async def monitor_source(application, name, url):
     save_state()
 
 
+def is_safe_regional_news(text):
+    """Только общие новости региона, без оперативной тематики."""
+    return bool(text and mentions_kostroma(text) and not NEWS_SENSITIVE_RE.search(text))
+
+
+async def monitor_news_source(application, name, url):
+    """Новостная лента отдельно от сигналов: только админу на ручную проверку."""
+    posts = await asyncio.to_thread(source_posts, url)
+    seen_map = state.setdefault("news_seen", {})
+    source_seen = set(seen_map.get(url, []))
+    initialized = bool(state.setdefault("news_initialized", {}).get(url))
+
+    if not initialized:
+        seen_map[url] = [post["key"] for post in posts][-300:]
+        state["news_initialized"][url] = True
+        state.setdefault("news_last_errors", {}).pop(url, None)
+        save_state()
+        logger.info("Новостной источник %s инициализирован (%s постов)", name, len(posts))
+        return
+
+    for post in posts:
+        if post["key"] in source_seen:
+            continue
+        source_seen.add(post["key"])
+        if not is_safe_regional_news(post["text"]):
+            continue
+
+        published = format_event_time(post.get("published_at"))
+        message = (
+            "📰 <b>Региональная новость — на проверку</b>\n"
+            f"Источник: {html.escape(name)}\n"
+            f"Время публикации: {html.escape(published)}\n\n"
+            f"{html.escape(post['text'][:2500])}\n\n"
+            "Информация взята из источника. Проверьте её самостоятельно. "
+            "Это не официальное оповещение; автоматической публикации в канал нет.\n"
+            f"<a href=\"{html.escape(post['url'], quote=True)}\">"
+            "Открыть исходную публикацию</a>"
+        )
+        try:
+            await application.bot.send_message(
+                chat_id=ADMIN_ID, text=message,
+                parse_mode=ParseMode.HTML, disable_web_page_preview=True
+            )
+        except TelegramError:
+            logger.exception("Не удалось отправить новость админу: %s", name)
+
+    seen_map[url] = list(source_seen)[-300:]
+    state.setdefault("news_last_errors", {}).pop(url, None)
+    save_state()
+
+
+
 def expire_active_alerts():
     """Помечает истёкшие состояния устаревшими; отбой не публикуется."""
     active = state.setdefault("active_alerts", {})
@@ -764,6 +830,16 @@ async def monitor_loop(application):
                 logger.warning(
                     "Источник %s недоступен: %s", name, exc
                 )
+
+        # Новости обрабатываются отдельно и не участвуют в классификации сигналов.
+        for name, url in NEWS_SOURCES:
+            try:
+                await monitor_news_source(application, name, url)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                state.setdefault("news_last_errors", {})[url] = str(exc)[:250]
+                logger.warning("Новостной источник %s недоступен: %s", name, exc)
 
         expire_active_alerts()
         state["last_scan"] = now_msk().isoformat(timespec="seconds")
@@ -919,6 +995,12 @@ def sources_text():
             for name, _ in SOURCES
         ],
         "",
+        "Новостная лента (только админу на проверку):",
+        *[
+            f"• {name}: https://t.me/v_kurse_kostroma"
+            for name, _ in NEWS_SOURCES
+        ],
+        "",
         "Указанные Telegram-каналы — сторонние источники, "
         "не подтверждённые как официальные государственные каналы.",
         "Официальные ресурсы для сверки:",
@@ -940,8 +1022,10 @@ def status_text():
         f"Интервал проверки: {CHECK_INTERVAL} сек.",
         f"Срок актуальности: {ALERT_TTL_HOURS} ч.",
         f"Подписчиков: {len(subscribers)}",
-        f"Источников: {len(SOURCES)}",
-        "Режим: автоматическая отправка админу без модерации",
+        f"Источников сигналов: {len(SOURCES)}",
+        f"Новостных источников: {len(NEWS_SOURCES)}",
+        "Новости: только админу на ручную проверку; без автопубликации",
+        "Режим сигналов: автоматическая отправка админу",
         f"Ожидают модерации (старые записи): {len(state.get('pending', {}))}",
         f"Записей активных событий: {len(state.get('active_alerts', {}))}",
         "",
@@ -1241,6 +1325,8 @@ def health():
         "status": "ok",
         "last_scan": state.get("last_scan"),
         "sources": len(SOURCES),
+        "news_sources": len(NEWS_SOURCES),
+        "news_errors": state.get("news_last_errors", {}),
         "errors": state.get("last_errors", {}),
         "ttl_hours": ALERT_TTL_HOURS,
     })
