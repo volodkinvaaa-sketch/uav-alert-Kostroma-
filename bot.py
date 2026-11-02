@@ -7,6 +7,7 @@ import logging
 import threading
 import html
 from datetime import datetime, timezone, timedelta
+from collections import Counter
 
 import requests
 from bs4 import BeautifulSoup
@@ -24,18 +25,31 @@ from telegram.ext import (
 """
 UAV ALERT — гражданский информационный бот.
 
-Возможности:
+Сохранённые возможности:
 - мониторинг публичных Telegram-лент;
 - фильтры БПЛА, МВШ и ракетной опасности/отбоя;
-- немедленная отправка готового поста администратору без модерации;
-- время исходной публикации в МСК;
-- хранение состояния опасности с TTL 5 часов;
-- TTL не создаёт автоматический отбой: он лишь помечает состояние устаревшим;
-- подписки, погода, диагностика и HTTP health endpoint.
+- исходное время публикации в МСК;
+- срок актуальности записи (TTL 5 часов), без автоматического отбоя;
+- подписки, погода, диагностика и HTTP health endpoint;
+- отдельная обработка региональных новостей.
 
-Источники в SOURCES — сторонние каналы, а не подтверждённые официальные
-государственные источники. Перед распространением проверяйте официальные
-оповещения.
+Добавлено:
+- центр событий;
+- статистика за последние 24 часа;
+- архив подтверждённых администратором сообщений;
+- ручная модерация перед публикацией;
+- публикация в канал только после подтверждения администратора;
+- уведомления подписчикам после подтверждённой публикации;
+- проверка повторов и предупреждение о противоречивых сообщениях;
+- явное различение сторонних и официальных источников;
+- безопасная фильтрация новостей: оперативные сведения о БПЛА,
+  координаты, маршруты, позиции и подобные детали не пересылаются.
+
+ВАЖНО:
+Бот не прогнозирует цели, маршруты, траектории или зоны возможного удара.
+Он не подтверждает угрозу самостоятельно. Все сигналы требуют сверки
+с официальными оповещениями. Публикация в канал выполняется только
+после ручного решения администратора.
 """
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -59,10 +73,13 @@ SOURCES = [
     ("bplarussiaru", "https://t.me/s/bplarussiaru"),
 ]
 
-# Отдельная лента обычных региональных новостей; не влияет на статусы.
+# Отдельная лента региональных новостей; не влияет на статусы.
 NEWS_SOURCES = [
     ("В курсе Кострома", "https://t.me/s/v_kurse_kostroma"),
 ]
+
+# Такие публикации не пересылаются как обычные новости.
+# Это защищает от распространения оперативных деталей.
 NEWS_SENSITIVE_RE = re.compile(
     r"бпла|беспилот|дрон|мвш|мрш|пво|зенитн|перехват|сбит|"
     r"облом|координат|маршрут|траектор|военн\w*\s+объект|"
@@ -83,9 +100,7 @@ TERRITORY_TERMS = [
     "пышуг", "сусанин", "судислав", "вохом", "варнав", "ветлуг"
 ]
 
-REGION_RE = re.compile(
-    r"костром\w*\s+(?:област|регион)", re.I
-)
+REGION_RE = re.compile(r"костром\w*\s+(?:област|регион)", re.I)
 
 # БПЛА
 UAV_ALERT_RE = re.compile(
@@ -160,84 +175,42 @@ ROCKET_NEGATION_RE = re.compile(
 )
 
 TERRITORY_ALIASES = {
-    "г. Кострома": [
-        "город кострома", "г. кострома", "кострома"
-    ],
+    "г. Кострома": ["город кострома", "г. кострома", "кострома"],
     "г. Буй": ["город буй", "г. буй"],
-    "г. Волгореченск": [
-        "город волгореченск", "г. волгореченск", "волгореченск"
-    ],
+    "г. Волгореченск": ["город волгореченск", "г. волгореченск", "волгореченск"],
     "г. Галич": ["город галич", "г. галич"],
     "г. Кологрив": ["город кологрив", "г. кологрив"],
     "г. Макарьев": ["город макарьев", "г. макарьев"],
-    "г. Мантурово": [
-        "город мантурово", "г. мантурово", "мантурово"
-    ],
+    "г. Мантурово": ["город мантурово", "г. мантурово", "мантурово"],
     "г. Нея": ["город нея", "г. нея", "нея"],
     "г. Нерехта": ["город нерехта", "г. нерехта", "нерехта"],
     "г. Солигалич": ["город солигалич", "г. солигалич"],
     "г. Шарья": ["город шарья", "г. шарья", "шарья"],
-    "Антроповский округ": [
-        "антроповский район", "антроповский округ"
-    ],
-    "Боговаровский округ": [
-        "боговаровский район", "боговаровский округ", "боговаров"
-    ],
-    "Варнавинский округ": [
-        "варнавинский район", "варнавинский округ", "варнав"
-    ],
+    "Антроповский округ": ["антроповский район", "антроповский округ"],
+    "Боговаровский округ": ["боговаровский район", "боговаровский округ", "боговаров"],
+    "Варнавинский округ": ["варнавинский район", "варнавинский округ", "варнав"],
     "Вохомский округ": ["вохомский район", "вохомский округ"],
     "Галичский район": ["галичский район", "галичский округ"],
     "Кадыйский округ": ["кадыйский район", "кадыйский округ"],
-    "Кологривский округ": [
-        "кологривский район", "кологривский округ"
-    ],
-    "Костромской район": [
-        "костромской район", "костромской округ"
-    ],
-    "Красносельский район": [
-        "красносельский район", "красносельский округ"
-    ],
-    "Макарьевский округ": [
-        "макарьевский район", "макарьевский округ"
-    ],
-    "Мантуровский округ": [
-        "мантуровский район", "мантуровский округ"
-    ],
+    "Кологривский округ": ["кологривский район", "кологривский округ"],
+    "Костромской район": ["костромской район", "костромской округ"],
+    "Красносельский район": ["красносельский район", "красносельский округ"],
+    "Макарьевский округ": ["макарьевский район", "макарьевский округ"],
+    "Мантуровский округ": ["мантуровский район", "мантуровский округ"],
     "Межевской округ": ["межевской район", "межевской округ"],
     "Нейский округ": ["нейский район", "нейский округ"],
-    "Нерехтский район": [
-        "нерехтский район", "нерехтский округ"
-    ],
-    "Октябрьский округ": [
-        "октябрьский район", "октябрьский округ"
-    ],
-    "Островский район": [
-        "островский район", "островский округ"
-    ],
+    "Нерехтский район": ["нерехтский район", "нерехтский округ"],
+    "Октябрьский округ": ["октябрьский район", "октябрьский округ"],
+    "Островский район": ["островский район", "островский округ"],
     "Павинский округ": ["павинский район", "павинский округ"],
-    "Парфеньевский округ": [
-        "парфеньевский район", "парфеньевский округ"
-    ],
-    "Поназыревский округ": [
-        "поназыревский район", "поназыревский округ"
-    ],
+    "Парфеньевский округ": ["парфеньевский район", "парфеньевский округ"],
+    "Поназыревский округ": ["поназыревский район", "поназыревский округ"],
     "Пыщугский округ": ["пыщугский район", "пыщугский округ"],
-    "Солигаличский район": [
-        "солигаличский район", "солигаличский округ"
-    ],
-    "Судиславский округ": [
-        "судиславский район", "судиславский округ"
-    ],
-    "Сусанинский район": [
-        "сусанинский район", "сусанинский округ"
-    ],
-    "Чухломский район": [
-        "чухломский район", "чухломский округ"
-    ],
-    "Шарьинский район": [
-        "шарьинский район", "шарьинский округ"
-    ],
+    "Солигаличский район": ["солигаличский район", "солигаличский округ"],
+    "Судиславский округ": ["судиславский район", "судиславский округ"],
+    "Сусанинский район": ["сусанинский район", "сусанинский округ"],
+    "Чухломский район": ["чухломский район", "чухломский округ"],
+    "Шарьинский район": ["шарьинский район", "шарьинский округ"],
 }
 
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
@@ -286,16 +259,23 @@ for key, default in {
     "initialized": {},
     "pending": {},
     "approved": {},
+    "rejected": {},
     "active_alerts": {},
     "news_seen": {},
     "news_initialized": {},
     "news_last_errors": {},
+    "event_history": [],
+    "news_history": [],
 }.items():
     state.setdefault(key, default)
 
-subscribers = set(load_json(
-    SUBSCRIBERS_FILE, state.get("subscribers", [])
-))
+subscribers = set()
+for value in load_json(SUBSCRIBERS_FILE, state.get("subscribers", [])):
+    try:
+        subscribers.add(int(value))
+    except (TypeError, ValueError):
+        continue
+
 monitor_task = None
 
 
@@ -320,6 +300,7 @@ def mentions_kostroma(text):
 
 
 def extract_territories(text):
+    """Извлекает упоминания территорий для внутренней проверки текста."""
     value = normalize(text)
 
     if re.search(
@@ -333,9 +314,7 @@ def extract_territories(text):
     found = []
     entries = sorted(
         TERRITORY_ALIASES.items(),
-        key=lambda item: max(
-            (len(alias) for alias in item[1]), default=0
-        ),
+        key=lambda item: max((len(alias) for alias in item[1]), default=0),
         reverse=True
     )
 
@@ -356,7 +335,6 @@ def extract_territories(text):
 
 def classify_mwsh(text):
     value = normalize(text)
-
     if MWSH_CANCEL_RE.search(value):
         return "mwsh_cancel", "Отбой опасности по МВШ"
     if MWSH_DANGER_RE.search(value):
@@ -366,7 +344,6 @@ def classify_mwsh(text):
 
 def classify_rocket(text):
     value = normalize(text)
-
     if ROCKET_CANCEL_RE.search(value):
         return "rocket_cancel", "Отбой ракетной опасности"
     if ROCKET_NEGATION_RE.search(value):
@@ -378,22 +355,16 @@ def classify_rocket(text):
 
 def classify_uav(text):
     value = normalize(text)
-
     if UAV_CANCEL_RE.search(value) or "отбой беспилотной опасности" in value:
         return "cancel", "Отбой опасности по БПЛА"
-
     if not UAV_ALERT_RE.search(value):
         return None
-
     if UAV_DANGER_RE.search(value) or "беспилотной опасности" in value:
         return "danger", "Опасность по БПЛА"
-
     if UAV_THREAT_RE.search(value):
         return "threat", "Угроза по БПЛА"
-
     if UAV_ATTENTION_RE.search(value):
         return "attention", "Внимание: БПЛА"
-
     return None
 
 
@@ -404,7 +375,6 @@ def classify(text):
 def parse_published_time(node):
     """Извлекает время исходного поста Telegram и переводит в МСК."""
     time_node = node.select_one("a.tgme_widget_message_date time")
-
     if time_node:
         raw = time_node.get("datetime")
         if raw:
@@ -414,10 +384,7 @@ def parse_published_time(node):
                     parsed = parsed.replace(tzinfo=timezone.utc)
                 return parsed.astimezone(MSK)
             except ValueError:
-                logger.debug(
-                    "Не удалось разобрать время публикации: %r", raw
-                )
-
+                logger.debug("Не удалось разобрать время публикации: %r", raw)
     return None
 
 
@@ -425,12 +392,9 @@ def source_posts(source_url):
     response = requests.get(
         source_url,
         timeout=REQUEST_TIMEOUT,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; UAV-ALERT/1.0)"
-        }
+        headers={"User-Agent": "Mozilla/5.0 (compatible; UAV-ALERT/1.0)"}
     )
     response.raise_for_status()
-
     soup = BeautifulSoup(response.text, "html.parser")
     posts = []
 
@@ -444,7 +408,6 @@ def source_posts(source_url):
         url = link_node.get("href", "") if link_node else source_url
         post_id = node.get("data-post", "") or url
         published_at = parse_published_time(node)
-
         digest = hashlib.sha256(
             (post_id + "|" + text).encode("utf-8")
         ).hexdigest()
@@ -459,7 +422,6 @@ def source_posts(source_url):
                     if published_at else None
                 ),
             })
-
     return posts[-30:]
 
 
@@ -469,88 +431,10 @@ def format_event_time(published_at):
             parsed = datetime.fromisoformat(published_at)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=MSK)
-
-            return parsed.astimezone(MSK).strftime(
-                "%d.%m.%Y %H:%M МСК"
-            )
+            return parsed.astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
         except (TypeError, ValueError):
             pass
-
     return "не указано"
-
-
-def event_message(kind, label, source, url, source_text, published_at=None):
-    territories = extract_territories(source_text) or ["Костромская область"]
-    territory_text = ", ".join(
-        html.escape(name) for name in territories
-    )
-    stamp = html.escape(format_event_time(published_at))
-
-    if kind == "mwsh_cancel":
-        title, category = "🟢 Отбой опасности по МВШ", "МВШ"
-    elif kind == "mwsh_danger":
-        title, category = "🔴 Опасность по МВШ", "МВШ"
-    elif kind == "rocket_cancel":
-        title, category = "🟢 Отбой ракетной опасности", "Ракетная опасность"
-    elif kind == "rocket_danger":
-        title, category = "🔴 Ракетная опасность", "Ракетная опасность"
-    elif kind == "cancel":
-        title, category = "🟢 Отбой опасности по БПЛА", "БПЛА"
-    elif kind == "threat":
-        title, category = "🟠 Угроза по БПЛА", "БПЛА"
-    elif kind == "attention":
-        title, category = "🟡 Внимание: БПЛА", "БПЛА"
-    else:
-        title, category = "🔴 Опасность по БПЛА", "БПЛА"
-
-    safe_url = html.escape(url, quote=True)
-    safe_source = html.escape(source)
-
-    return (
-        "<b>🛰 UAV ALERT</b>\n"
-        "📍 <b>Регион:</b> Костромская область\n\n"
-        f"<b>{title}</b>\n"
-        f"Категория: {category}\n"
-        f"Время исходного сообщения: {stamp}\n\n"
-        f"📍 <b>Территории:</b> {territory_text}\n\n"
-        f'📡 <b>Источник:</b> <a href="{safe_url}">{safe_source}</a>\n\n'
-        "⚠️ Информация получена из стороннего источника. "
-        "Сверяйте её с актуальными официальными оповещениями МЧС "
-        "и органов власти."
-    )
-
-
-def moderation_keyboard(pending_id):
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "✅ Опубликовать", callback_data=f"approve:{pending_id}"
-        ),
-        InlineKeyboardButton(
-            "❌ Отклонить", callback_data=f"reject:{pending_id}"
-        )
-    ]])
-
-
-async def send_text_or_photo(bot, chat_id, message, is_cancel=False):
-    image_path = ALL_CLEAR_IMAGE if is_cancel else DANGER_IMAGE
-
-    # Telegram ограничивает подпись к фотографии 1024 символами.
-    if os.path.isfile(image_path) and len(message) <= 1024:
-        with open(image_path, "rb") as photo:
-            await bot.send_photo(
-                chat_id=chat_id,
-                photo=photo,
-                caption=message,
-                parse_mode=ParseMode.HTML,
-                disable_notification=False
-            )
-    else:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=message,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True
-        )
 
 
 def event_family(kind):
@@ -572,8 +456,132 @@ def event_is_danger(kind):
     )
 
 
+def event_title(kind):
+    return {
+        "mwsh_cancel": ("🟢 Отбой опасности по МВШ", "МВШ"),
+        "mwsh_danger": ("🔴 Опасность по МВШ", "МВШ"),
+        "rocket_cancel": ("🟢 Отбой ракетной опасности", "Ракетная опасность"),
+        "rocket_danger": ("🔴 Ракетная опасность", "Ракетная опасность"),
+        "cancel": ("🟢 Отбой опасности по БПЛА", "БПЛА"),
+        "threat": ("🟠 Угроза по БПЛА", "БПЛА"),
+        "attention": ("🟡 Внимание: БПЛА", "БПЛА"),
+        "danger": ("🔴 Опасность по БПЛА", "БПЛА"),
+    }.get(kind, ("ℹ️ Сообщение", "Информация"))
+
+
+def event_message(kind, label, source, url, source_text, published_at=None):
+    """
+    Готовит нейтральный пост.
+    Детальные районы, координаты, маршруты и предполагаемые цели
+    в публичный текст автоматически не переносятся.
+    """
+    title, category = event_title(kind)
+    stamp = html.escape(format_event_time(published_at))
+    safe_url = html.escape(url, quote=True)
+    safe_source = html.escape(source)
+
+    return (
+        "<b>🛰 UAV ALERT</b>\n"
+        "📍 <b>Регион:</b> Костромская область\n\n"
+        f"<b>{title}</b>\n"
+        f"Категория: {html.escape(category)}\n"
+        f"Время исходного сообщения: {stamp}\n\n"
+        "📍 <b>Территории:</b> Костромская область\n\n"
+        f'📡 <b>Источник:</b> <a href="{safe_url}">{safe_source}</a>\n\n'
+        "⚠️ Сообщение получено из стороннего источника и не является "
+        "самостоятельным подтверждением угрозы. Сверяйте информацию "
+        "с официальными оповещениями МЧС и органов власти. "
+        "Следуйте инструкциям экстренных служб."
+    )
+
+
+def conflict_warning(kind):
+    """Ищет недавнее противоположное событие той же категории."""
+    family = event_family(kind)
+    opposite = event_is_cancel(kind)
+    now = now_msk()
+    matches = []
+
+    for item in state.get("pending", {}).values():
+        if event_family(item.get("kind", "")) != family:
+            continue
+        if event_is_cancel(item.get("kind", "")) == opposite:
+            continue
+        try:
+            created = datetime.fromisoformat(item.get("created_at", ""))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=MSK)
+            if now - created.astimezone(MSK) <= timedelta(hours=3):
+                matches.append(item)
+        except (TypeError, ValueError):
+            continue
+
+    if matches:
+        return (
+            "\n\n⚠️ <b>ВНИМАНИЕ: обнаружено возможное противоречие.</b>\n"
+            "В очереди есть недавнее сообщение с другим статусом этой "
+            "категории. Проверьте исходные публикации и официальные "
+            "оповещения перед принятием решения."
+        )
+    return ""
+
+
+def moderation_keyboard(pending_id):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Подтвердить и опубликовать",
+                                 callback_data=f"approve:{pending_id}"),
+        ],
+        [
+            InlineKeyboardButton("❌ Отклонить",
+                                 callback_data=f"reject:{pending_id}"),
+        ],
+        [
+            InlineKeyboardButton("🔎 Центр событий",
+                                 callback_data="admin_center"),
+        ],
+    ])
+
+
+async def send_text_or_photo(bot, chat_id, message, is_cancel=False):
+    image_path = ALL_CLEAR_IMAGE if is_cancel else DANGER_IMAGE
+    if os.path.isfile(image_path) and len(message) <= 1024:
+        with open(image_path, "rb") as photo:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=photo,
+                caption=message,
+                parse_mode=ParseMode.HTML,
+                disable_notification=False
+            )
+    else:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=message,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+
+
+def add_history(item, decision, actor_id=None):
+    history = state.setdefault("event_history", [])
+    record = {
+        "kind": item.get("kind"),
+        "label": item.get("label"),
+        "source": item.get("source"),
+        "url": item.get("url"),
+        "published_at": item.get("published_at"),
+        "created_at": item.get("created_at"),
+        "decision_at": now_msk().isoformat(timespec="seconds"),
+        "decision": decision,
+        "actor_id": actor_id,
+    }
+    history.append(record)
+    state["event_history"] = history[-500:]
+
+
 def record_approved_event(item):
-    """Обновляет состояние после отправки найденного события."""
+    """Обновляет статусную запись только после подтверждения администратором."""
     active = state.setdefault("active_alerts", {})
     family = event_family(item["kind"])
 
@@ -584,9 +592,8 @@ def record_approved_event(item):
         return
 
     if event_is_danger(item["kind"]):
-        published_at = item.get("published_at")
         event_time = now_msk()
-
+        published_at = item.get("published_at")
         if published_at:
             try:
                 parsed = datetime.fromisoformat(published_at)
@@ -599,144 +606,203 @@ def record_approved_event(item):
         active[item["kind"]] = {
             "label": item["label"],
             "published_at": event_time.isoformat(timespec="seconds"),
-            "expires_at": (
-                event_time + ALERT_TTL
-            ).isoformat(timespec="seconds"),
+            "expires_at": (event_time + ALERT_TTL).isoformat(timespec="seconds"),
             "source": item["source"],
             "url": item["url"],
             "stale": False,
         }
 
 
-async def send_event(
-    application, kind, label, source, url, text, published_at=None
-):
+async def notify_subscribers(bot, message):
+    """Рассылает подписчикам только уже одобренную администратором запись."""
+    failed = []
+    for user_id in list(subscribers):
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=message,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+        except TelegramError as exc:
+            logger.info("Не удалось уведомить подписчика %s: %s", user_id, exc)
+            failed.append(user_id)
+
+    # Не удаляем подписчика автоматически: ошибка может быть временной.
+    return failed
+
+
+async def send_event(application, kind, label, source, url, text, published_at=None):
     """
-    Немедленно отправляет готовый пост администратору.
-    Кнопки подтверждения не используются.
-    Повторные события с тем же идентификатором не отправляются повторно.
+    Создаёт карточку на ручную проверку.
+    Ничего не публикует в канал и не рассылает подписчикам до решения админа.
     """
     pending_id = hashlib.sha256(
         f"{url}|{text}|{published_at or ''}".encode("utf-8")
     ).hexdigest()[:16]
 
-    approved = state.setdefault("approved", {})
-    pending = state.setdefault("pending", {})
-
-    if pending_id in approved:
+    if pending_id in state.setdefault("approved", {}):
         return
-
-    # Совместимость с ранее сохранёнными событиями на модерации:
-    # не отправляем дубликат, если запись уже есть в pending.
-    if pending_id in pending:
+    if pending_id in state.setdefault("pending", {}):
         return
-
-    message = event_message(
-        kind, label, source, url, text, published_at
-    )
+    if pending_id in state.setdefault("rejected", {}):
+        return
 
     item = {
+        "id": pending_id,
         "kind": kind,
         "label": label,
         "source": source,
         "url": url,
         "text": text[:5000],
         "published_at": published_at,
-        "message": message,
+        "message": event_message(kind, label, source, url, text, published_at),
         "created_at": now_msk().isoformat(timespec="seconds"),
     }
+    state["pending"][pending_id] = item
+    save_state()
+
+    admin_message = (
+        "🛡 <b>Новое событие — требуется проверка администратора</b>\n\n"
+        f"{item['message']}"
+        f"{conflict_warning(kind)}\n\n"
+        "<b>Исходный текст:</b>\n"
+        f"{html.escape(text[:1800])}\n\n"
+        "Публикация в канал и уведомление подписчиков произойдут "
+        "только после нажатия кнопки подтверждения."
+    )
 
     try:
-        # Отправляем админу именно готовый пост, а не запрос на модерацию.
         await send_text_or_photo(
             application.bot,
             ADMIN_ID,
-            message,
+            admin_message,
             is_cancel=event_is_cancel(kind)
         )
-
-        # Фиксируем событие только после успешной отправки.
-        approved[pending_id] = now_msk().isoformat(timespec="seconds")
-        record_approved_event(item)
-        save_state()
-
-        logger.info(
-            "Готовый пост отправлен администратору: id=%s, source=%s",
-            pending_id,
-            source
-        )
-
+        logger.info("Событие добавлено в очередь проверки: %s", pending_id)
     except TelegramError:
-        logger.exception(
-            "Не удалось отправить готовый пост администратору"
+        logger.exception("Не удалось отправить карточку администратору")
+
+
+async def approve_event(query, context, pending_id):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("Только администратор может подтвердить событие.", show_alert=True)
+        return
+
+    item = state.setdefault("pending", {}).get(pending_id)
+    if not item:
+        await query.answer("Событие уже обработано или не найдено.", show_alert=True)
+        return
+
+    try:
+        # Публикуется только заранее подготовленный нейтральный текст.
+        await send_text_or_photo(
+            context.bot,
+            CHANNEL_ID,
+            item["message"],
+            is_cancel=event_is_cancel(item["kind"])
         )
+    except TelegramError:
+        logger.exception("Не удалось опубликовать событие в канал")
+        await query.answer("Не удалось опубликовать. Проверь права бота и CHANNEL_ID.", show_alert=True)
+        return
+
+    state["pending"].pop(pending_id, None)
+    state.setdefault("approved", {})[pending_id] = now_msk().isoformat(timespec="seconds")
+    record_approved_event(item)
+    add_history(item, "published", query.from_user.id)
+    save_state()
+
+    failed = await notify_subscribers(context.bot, item["message"])
+    try:
+        await query.edit_message_text(
+            "✅ <b>Событие опубликовано</b>\n\n"
+            f"{item['message']}\n\n"
+            f"Уведомлено подписчиков: {len(subscribers) - len(failed)}.",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+    except (BadRequest, TelegramError):
+        pass
+    await query.answer("Опубликовано.")
+
+
+async def reject_event(query, pending_id):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("Только администратор может отклонить событие.", show_alert=True)
+        return
+
+    item = state.setdefault("pending", {}).pop(pending_id, None)
+    if not item:
+        await query.answer("Событие уже обработано или не найдено.", show_alert=True)
+        return
+
+    state.setdefault("rejected", {})[pending_id] = now_msk().isoformat(timespec="seconds")
+    add_history(item, "rejected", query.from_user.id)
+    save_state()
+
+    try:
+        await query.edit_message_text(
+            "❌ <b>Событие отклонено</b>\n\n"
+            "Оно не отправлено в канал и подписчикам.",
+            parse_mode=ParseMode.HTML
+        )
+    except (BadRequest, TelegramError):
+        pass
+    await query.answer("Отклонено.")
 
 
 async def monitor_source(application, name, url):
     posts = await asyncio.to_thread(source_posts, url)
-
     seen_map = state.setdefault("seen", {})
-    source_seen = set(seen_map.get(url, []))
-    initialized = bool(
-        state.setdefault("initialized", {}).get(url, False)
-    )
+    source_seen_list = seen_map.get(url, [])
+    source_seen = set(source_seen_list)
+    initialized = bool(state.setdefault("initialized", {}).get(url, False))
 
-    # При первом запуске фиксируем текущие посты, чтобы не отправлять архив.
     if not initialized:
         seen_map[url] = [p["key"] for p in posts][-300:]
         state["initialized"][url] = True
         state["last_errors"].pop(url, None)
         save_state()
-
-        logger.info(
-            "Источник %s инициализирован (%s постов)",
-            name, len(posts)
-        )
+        logger.info("Источник %s инициализирован (%s постов)", name, len(posts))
         return
 
-    # Идём от старых сообщений к новым, сохраняя порядок обнаружения.
     for post in posts:
         if post["key"] in source_seen:
             continue
-
         source_seen.add(post["key"])
         text = post["text"]
 
         if not mentions_kostroma(text):
             continue
-
         result = classify(text)
         if not result:
             continue
 
         kind, label = result
-
         await send_event(
-            application,
-            kind,
-            label,
-            name,
-            post["url"],
-            text,
-            post.get("published_at")
+            application, kind, label, name, post["url"],
+            text, post.get("published_at")
         )
 
-    # Сохраняем последние ключи, не полагаясь на порядок множества.
-    seen_map[url] = list(source_seen)[-300:]
+    # Храним последние ключи в исходном порядке, а не порядок множества.
+    ordered = [p["key"] for p in posts if p["key"] in source_seen]
+    seen_map[url] = ordered[-300:]
     state["last_errors"].pop(url, None)
     save_state()
 
 
 def is_safe_regional_news(text):
-    """Только общие новости региона, без оперативной тематики."""
+    """Только общие новости региона без оперативной тематики."""
     return bool(text and mentions_kostroma(text) and not NEWS_SENSITIVE_RE.search(text))
 
 
 async def monitor_news_source(application, name, url):
-    """Новостная лента отдельно от сигналов: только админу на ручную проверку."""
+    """Новостная лента отдельно от сигналов: только безопасные новости админу."""
     posts = await asyncio.to_thread(source_posts, url)
     seen_map = state.setdefault("news_seen", {})
-    source_seen = set(seen_map.get(url, []))
+    source_seen_list = seen_map.get(url, [])
+    source_seen = set(source_seen_list)
     initialized = bool(state.setdefault("news_initialized", {}).get(url))
 
     if not initialized:
@@ -755,28 +821,39 @@ async def monitor_news_source(application, name, url):
             continue
 
         published = format_event_time(post.get("published_at"))
+        news_id = post["key"][:16]
         message = (
             "📰 <b>Региональная новость — на проверку</b>\n"
             f"Источник: {html.escape(name)}\n"
             f"Время публикации: {html.escape(published)}\n\n"
             f"{html.escape(post['text'][:2500])}\n\n"
-            "Информация взята из источника. Проверьте её самостоятельно. "
-            "Это не официальное оповещение; автоматической публикации в канал нет.\n"
-            f"<a href=\"{html.escape(post['url'], quote=True)}\">"
-            "Открыть исходную публикацию</a>"
+            "Информация взята из стороннего источника. Проверьте её "
+            "самостоятельно. Это не официальное оповещение; "
+            "автоматической публикации в канал нет.\n"
+            f'<a href="{html.escape(post["url"], quote=True)}">Открыть исходную публикацию</a>'
         )
         try:
             await application.bot.send_message(
                 chat_id=ADMIN_ID, text=message,
                 parse_mode=ParseMode.HTML, disable_web_page_preview=True
             )
+            news_history = state.setdefault("news_history", [])
+            news_history.append({
+                "id": news_id,
+                "source": name,
+                "url": post["url"],
+                "text": post["text"][:1500],
+                "published_at": post.get("published_at"),
+                "received_at": now_msk().isoformat(timespec="seconds"),
+            })
+            state["news_history"] = news_history[-300:]
         except TelegramError:
             logger.exception("Не удалось отправить новость админу: %s", name)
 
-    seen_map[url] = list(source_seen)[-300:]
+    ordered = [p["key"] for p in posts if p["key"] in source_seen]
+    seen_map[url] = ordered[-300:]
     state.setdefault("news_last_errors", {}).pop(url, None)
     save_state()
-
 
 
 def expire_active_alerts():
@@ -788,20 +865,12 @@ def expire_active_alerts():
     for key, item in list(active.items()):
         try:
             expires = datetime.fromisoformat(item["expires_at"])
-
             if expires.tzinfo is None:
                 expires = expires.replace(tzinfo=MSK)
-
-            if (
-                now >= expires.astimezone(MSK)
-                and not item.get("stale", False)
-            ):
+            if now >= expires.astimezone(MSK) and not item.get("stale", False):
                 item["stale"] = True
-                item["stale_marked_at"] = now.isoformat(
-                    timespec="seconds"
-                )
+                item["stale_marked_at"] = now.isoformat(timespec="seconds")
                 changed = True
-
         except (KeyError, TypeError, ValueError):
             item["stale"] = True
             changed = True
@@ -813,25 +882,18 @@ def expire_active_alerts():
 async def monitor_loop(application):
     logger.info(
         "Мониторинг запущен; интервал=%s сек.; TTL=%s ч.",
-        CHECK_INTERVAL,
-        ALERT_TTL_HOURS
+        CHECK_INTERVAL, ALERT_TTL_HOURS
     )
-
     while True:
         for name, url in SOURCES:
             try:
                 await monitor_source(application, name, url)
-
             except asyncio.CancelledError:
                 raise
-
             except Exception as exc:
                 state.setdefault("last_errors", {})[url] = str(exc)[:250]
-                logger.warning(
-                    "Источник %s недоступен: %s", name, exc
-                )
+                logger.warning("Источник %s недоступен: %s", name, exc)
 
-        # Новости обрабатываются отдельно и не участвуют в классификации сигналов.
         for name, url in NEWS_SOURCES:
             try:
                 await monitor_news_source(application, name, url)
@@ -844,19 +906,76 @@ async def monitor_loop(application):
         expire_active_alerts()
         state["last_scan"] = now_msk().isoformat(timespec="seconds")
         save_state()
-
         await asyncio.sleep(CHECK_INTERVAL)
+
+
+def parse_iso(value):
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=MSK)
+        return parsed.astimezone(MSK)
+    except (TypeError, ValueError):
+        return None
+
+
+def recent_history(hours=24):
+    cutoff = now_msk() - timedelta(hours=hours)
+    result = []
+    for item in state.get("event_history", []):
+        stamp = parse_iso(item.get("decision_at") or item.get("created_at"))
+        if stamp and stamp >= cutoff:
+            result.append(item)
+    return result
+
+
+def stats_text():
+    records = recent_history(24)
+    published = [x for x in records if x.get("decision") == "published"]
+    rejected = [x for x in records if x.get("decision") == "rejected"]
+    counts = Counter(x.get("kind", "other") for x in published)
+
+    lines = [
+        "📊 <b>UAV ALERT — статистика за 24 часа</b>",
+        f"Проверено администратором: {len(records)}",
+        f"Опубликовано: {len(published)}",
+        f"Отклонено: {len(rejected)}",
+        "",
+        "<b>Опубликованные категории:</b>",
+    ]
+
+    labels = [
+        ("danger", "Опасность по БПЛА"),
+        ("threat", "Угроза по БПЛА"),
+        ("attention", "Внимание: БПЛА"),
+        ("cancel", "Отбой по БПЛА"),
+        ("mwsh_danger", "Опасность по МВШ"),
+        ("mwsh_cancel", "Отбой по МВШ"),
+        ("rocket_danger", "Ракетная опасность"),
+        ("rocket_cancel", "Отбой ракетной опасности"),
+    ]
+    for key, label in labels:
+        lines.append(f"• {label}: {counts.get(key, 0)}")
+
+    lines.extend([
+        "",
+        f"В очереди проверки: {len(state.get('pending', {}))}",
+        f"Подписчиков: {len(subscribers)}",
+        "",
+        "Статистика отражает только сообщения, которые бот обнаружил "
+        "и администратор обработал. Это не подсчёт реальных объектов "
+        "или атак и не оценка военной обстановки."
+    ])
+    return "\n".join(lines)
 
 
 async def regional_alert_status():
     expire_active_alerts()
-
     lines = [
         "🛰 <b>UAV ALERT — Костромская область</b>",
         f"Срок актуальности записи: {ALERT_TTL_HOURS} ч.",
         ""
     ]
-
     active = state.get("active_alerts", {})
     families = [
         ("БПЛА", {"danger", "threat", "attention"}),
@@ -865,23 +984,12 @@ async def regional_alert_status():
     ]
 
     for label, keys in families:
-        entries = [
-            (key, item)
-            for key, item in active.items()
-            if key in keys
-        ]
-
+        entries = [(key, item) for key, item in active.items() if key in keys]
         if not entries:
-            lines.append(
-                f"{label}: подтверждённое активное состояние не установлено."
-            )
+            lines.append(f"{label}: подтверждённое активное состояние не установлено.")
             continue
 
-        key, item = max(
-            entries,
-            key=lambda pair: pair[1].get("published_at", "")
-        )
-
+        key, item = max(entries, key=lambda pair: pair[1].get("published_at", ""))
         if item.get("stale"):
             lines.append(
                 f"{label}: <b>запись устарела</b> — срок хранения истёк; "
@@ -890,60 +998,108 @@ async def regional_alert_status():
         else:
             url = html.escape(item.get("url", ""), quote=True)
             source = html.escape(item.get("source", "источник"))
-
             lines.append(
                 f'{label}: <b>{html.escape(item.get("label", "событие"))}</b>. '
                 f'<a href="{url}">Источник: {source}</a>'
             )
 
     lines.append(
-        "\n⚠️ Это автоматическая сводка по выбранным Telegram-источникам. "
+        "\n⚠️ Это автоматическая сводка по выбранным сторонним Telegram-источникам "
+        "и событиям, подтверждённым администратором для публикации. "
         "Истечение срока хранения не означает отбоя. Проверяйте официальные "
         "оповещения МЧС и органов власти."
     )
-
     return "\n".join(lines)
 
 
-def keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🔔 Подписаться", callback_data="subscribe"
-            ),
-            InlineKeyboardButton(
-                "🔕 Отписаться", callback_data="unsubscribe"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "📡 Источники", callback_data="sources"
-            ),
-            InlineKeyboardButton(
-                "ℹ️ Статус", callback_data="status"
-            ),
-        ],
+def admin_center_text():
+    pending = state.get("pending", {})
+    lines = [
+        "🛡 <b>Центр событий UAV ALERT</b>",
+        f"Ожидают проверки: {len(pending)}",
+        f"Опубликовано за 24 часа: {sum(1 for x in recent_history(24) if x.get('decision') == 'published')}",
+        f"Отклонено за 24 часа: {sum(1 for x in recent_history(24) if x.get('decision') == 'rejected')}",
+        f"Последний цикл мониторинга: {html.escape(state.get('last_scan') or 'ещё не завершён')}",
+        "",
+    ]
+    if pending:
+        lines.append("<b>Последние события на проверку:</b>")
+        for item in list(pending.values())[-8:]:
+            lines.append(
+                f"• {html.escape(item.get('label', 'Сообщение'))} — "
+                f"{html.escape(item.get('source', 'источник'))} — "
+                f"{html.escape(format_event_time(item.get('published_at')))}"
+            )
+    else:
+        lines.append("Новых событий, ожидающих проверки, нет.")
+    lines.extend([
+        "",
+        "Проверяйте исходный источник и официальные оповещения. "
+        "Не публикуйте координаты, маршруты, предполагаемые цели, "
+        "места падения или непроверенные сведения."
     ])
+    return "\n".join(lines)
+
+
+def archive_text(limit=15):
+    history = state.get("event_history", [])
+    if not history:
+        return "🗂 Архив пока пуст. В нём появятся события после решения администратора."
+
+    lines = ["🗂 <b>Архив событий UAV ALERT</b>", ""]
+    for item in reversed(history[-limit:]):
+        decision = "опубликовано" if item.get("decision") == "published" else "отклонено"
+        lines.append(
+            f"• {html.escape(item.get('label') or 'Событие')} — {decision}\n"
+            f"  {html.escape(format_event_time(item.get('published_at')))}; "
+            f"{html.escape(item.get('source') or 'источник')}"
+        )
+    lines.append("\nАрхив содержит только записи, обработанные администратором.")
+    return "\n".join(lines)
+
+
+def keyboard(user_id=None):
+    rows = [
+        [
+            InlineKeyboardButton("🔔 Подписаться", callback_data="subscribe"),
+            InlineKeyboardButton("🔕 Отписаться", callback_data="unsubscribe"),
+        ],
+        [
+            InlineKeyboardButton("📡 Источники", callback_data="sources"),
+            InlineKeyboardButton("ℹ️ Статус", callback_data="status"),
+        ],
+        [
+            InlineKeyboardButton("📰 Новости", callback_data="news"),
+            InlineKeyboardButton("📊 Статистика", callback_data="stats"),
+        ],
+        [
+            InlineKeyboardButton("🗂 Архив", callback_data="archive"),
+            InlineKeyboardButton("🌦 Погода", callback_data="weather"),
+        ],
+    ]
+    if user_id == ADMIN_ID:
+        rows.append([InlineKeyboardButton("🛡 Центр событий", callback_data="admin_center")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
-
+    user = update.effective_user
     if not message:
         return
 
     await message.reply_text(
         "🛰 UAV ALERT — информационный сервис Костромской области.\n\n"
-        "Бот проверяет публичные сообщения выбранных Telegram-каналов. "
-        "Найденные подходящие события автоматически отправляются "
-        "администратору в виде готового поста без модерации.\n\n"
+        "Бот проверяет публичные сообщения выбранных Telegram-источников. "
+        "Найденные события поступают администратору на ручную проверку. "
+        "Публикация в канал и уведомления подписчикам выполняются только "
+        "после подтверждения.\n\n"
         f"Интервал проверки: {CHECK_INTERVAL} сек.\n"
         f"Срок актуальности записи: {ALERT_TTL_HOURS} ч. "
         "Истечение срока не означает отбоя.\n\n"
-        "Команды: /weather, /status, /sources, /health.",
-        reply_markup=keyboard()
+        "Команды: /weather, /status, /sources, /stats, /archive, /health.",
+        reply_markup=keyboard(user.id if user else None)
     )
-
     try:
         await message.reply_text(
             await regional_alert_status(),
@@ -957,65 +1113,47 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
-
     if not user or not message:
         return
-
     subscribers.add(user.id)
     save_state()
-
     await message.reply_text(
-        "🔔 Подписка включена.",
-        reply_markup=keyboard()
+        "🔔 Подписка включена. Уведомления будут приходить после проверки "
+        "и подтверждения сообщения администратором.",
+        reply_markup=keyboard(user.id)
     )
 
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
-
     if not user or not message:
         return
-
     subscribers.discard(user.id)
     save_state()
-
-    await message.reply_text(
-        "🔕 Подписка отключена.",
-        reply_markup=keyboard()
-    )
+    await message.reply_text("🔕 Подписка отключена.", reply_markup=keyboard(user.id))
 
 
 def sources_text():
     lines = [
         "📡 Источники мониторинга",
         "",
-        *[
-            f"• {name}: https://t.me/{name}"
-            for name, _ in SOURCES
-        ],
+        *[f"• {name}: https://t.me/{name}" for name, _ in SOURCES],
         "",
-        "Новостная лента (только админу на проверку):",
-        *[
-            f"• {name}: https://t.me/v_kurse_kostroma"
-            for name, _ in NEWS_SOURCES
-        ],
+        "Новостная лента (без автопубликации):",
+        *[f"• {name}: https://t.me/v_kurse_kostroma" for name, _ in NEWS_SOURCES],
         "",
-        "Указанные Telegram-каналы — сторонние источники, "
-        "не подтверждённые как официальные государственные каналы.",
-        "Официальные ресурсы для сверки:",
-        *[
-            f"• {name}: {url}"
-            for name, url in OFFICIAL_SOURCES
-        ],
+        "Telegram-каналы в списке — сторонние источники; бот не считает "
+        "их официальными государственными ресурсами.",
+        "Официальные ресурсы для самостоятельной сверки:",
+        *[f"• {name}: {url}" for name, url in OFFICIAL_SOURCES],
     ]
-
     return "\n".join(lines)
 
 
 def status_text():
     errors = state.get("last_errors", {})
-
+    news_errors = state.get("news_last_errors", {})
     lines = [
         "🩺 UAV ALERT — диагностика",
         f"Последний цикл: {state.get('last_scan') or 'ещё не завершён'}",
@@ -1024,56 +1162,34 @@ def status_text():
         f"Подписчиков: {len(subscribers)}",
         f"Источников сигналов: {len(SOURCES)}",
         f"Новостных источников: {len(NEWS_SOURCES)}",
-        "Новости: только админу на ручную проверку; без автопубликации",
-        "Режим сигналов: автоматическая отправка админу",
-        f"Ожидают модерации (старые записи): {len(state.get('pending', {}))}",
+        "Режим сигналов: ручное подтверждение администратором",
+        f"Ожидают проверки: {len(state.get('pending', {}))}",
+        f"Записей в архиве: {len(state.get('event_history', []))}",
         f"Записей активных событий: {len(state.get('active_alerts', {}))}",
         "",
     ]
-
     for name, url in SOURCES:
         error = errors.get(url)
-
-        lines.append(
-            f"• {name}: "
-            f"{'ошибка — ' + error if error else 'нет последней ошибки'}"
-        )
-
+        lines.append(f"• {name}: {'ошибка — ' + error if error else 'нет последней ошибки'}")
+    for name, url in NEWS_SOURCES:
+        error = news_errors.get(url)
+        lines.append(f"• Новости {name}: {'ошибка — ' + error if error else 'нет последней ошибки'}")
     return "\n".join(lines)
 
 
 def weather_code_text(code):
     mapping = {
-        0: "ясно",
-        1: "преимущественно ясно",
-        2: "переменная облачность",
-        3: "пасмурно",
-        45: "туман",
-        48: "изморозевый туман",
-        51: "слабая морось",
-        53: "морось",
-        55: "сильная морось",
-        56: "слабая ледяная морось",
-        57: "сильная ледяная морось",
-        61: "небольшой дождь",
-        63: "дождь",
-        65: "сильный дождь",
-        66: "слабый ледяной дождь",
-        67: "сильный ледяной дождь",
-        71: "небольшой снег",
-        73: "снег",
-        75: "сильный снег",
-        77: "снежные зёрна",
-        80: "ливневый дождь",
-        81: "ливень",
-        82: "сильный ливень",
-        85: "снегопад",
-        86: "сильный снегопад",
-        95: "гроза",
-        96: "гроза с небольшим градом",
-        99: "гроза с градом",
+        0: "ясно", 1: "преимущественно ясно", 2: "переменная облачность",
+        3: "пасмурно", 45: "туман", 48: "изморозевый туман",
+        51: "слабая морось", 53: "морось", 55: "сильная морось",
+        56: "слабая ледяная морось", 57: "сильная ледяная морось",
+        61: "небольшой дождь", 63: "дождь", 65: "сильный дождь",
+        66: "слабый ледяной дождь", 67: "сильный ледяной дождь",
+        71: "небольшой снег", 73: "снег", 75: "сильный снег",
+        77: "снежные зёрна", 80: "ливневый дождь", 81: "ливень",
+        82: "сильный ливень", 85: "снегопад", 86: "сильный снегопад",
+        95: "гроза", 96: "гроза с небольшим градом", 99: "гроза с градом",
     }
-
     return mapping.get(code, "условия не определены")
 
 
@@ -1092,17 +1208,10 @@ async def get_weather_text():
         "forecast_days": 2,
         "timezone": "Europe/Moscow",
     }
-
     response = await asyncio.to_thread(
-        lambda: requests.get(
-            WEATHER_URL,
-            params=params,
-            timeout=REQUEST_TIMEOUT
-        )
+        lambda: requests.get(WEATHER_URL, params=params, timeout=REQUEST_TIMEOUT)
     )
-
     response.raise_for_status()
-
     data = response.json()
     current, daily = data["current"], data["daily"]
     today, tomorrow = daily["time"][0], daily["time"][1]
@@ -1114,18 +1223,12 @@ async def get_weather_text():
         f"Ощущается как: {current['apparent_temperature']:+.1f} °C\n"
         f"Влажность: {current['relative_humidity_2m']}%, "
         f"ветер: {current['wind_speed_10m']} км/ч\n\n"
-        f"Сегодня ({today}): "
-        f"{weather_code_text(daily['weather_code'][0])}, "
-        f"{daily['temperature_2m_min'][0]:+.0f}…"
-        f"{daily['temperature_2m_max'][0]:+.0f} °C, "
-        f"вероятность осадков до "
-        f"{daily['precipitation_probability_max'][0]}%\n"
-        f"Завтра ({tomorrow}): "
-        f"{weather_code_text(daily['weather_code'][1])}, "
-        f"{daily['temperature_2m_min'][1]:+.0f}…"
-        f"{daily['temperature_2m_max'][1]:+.0f} °C, "
-        f"вероятность осадков до "
-        f"{daily['precipitation_probability_max'][1]}%\n\n"
+        f"Сегодня ({today}): {weather_code_text(daily['weather_code'][0])}, "
+        f"{daily['temperature_2m_min'][0]:+.0f}…{daily['temperature_2m_max'][0]:+.0f} °C, "
+        f"вероятность осадков до {daily['precipitation_probability_max'][0]}%\n"
+        f"Завтра ({tomorrow}): {weather_code_text(daily['weather_code'][1])}, "
+        f"{daily['temperature_2m_min'][1]:+.0f}…{daily['temperature_2m_max'][1]:+.0f} °C, "
+        f"вероятность осадков до {daily['precipitation_probability_max'][1]}%\n\n"
         "Источник: Open-Meteo. Прогноз может обновляться."
     )
 
@@ -1133,8 +1236,7 @@ async def get_weather_text():
 async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.effective_message.reply_text(
-            await get_weather_text(),
-            parse_mode=ParseMode.HTML
+            await get_weather_text(), parse_mode=ParseMode.HTML
         )
     except Exception:
         logger.exception("Ошибка получения погоды")
@@ -1151,113 +1253,160 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sources_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_message:
         await update.effective_message.reply_text(
-            sources_text(),
-            disable_web_page_preview=True
+            sources_text(), disable_web_page_preview=True
         )
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            stats_text(), parse_mode=ParseMode.HTML
+        )
+
+
+async def archive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            archive_text(), parse_mode=ParseMode.HTML
+        )
+
+
+async def news_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_message:
+        return
+    items = state.get("news_history", [])[-10:]
+    if not items:
+        await update.effective_message.reply_text(
+            "📰 Пока нет сохранённых региональных новостей. "
+            "Оперативные сообщения о БПЛА не пересылаются в эту ленту."
+        )
+        return
+    lines = ["📰 <b>Последние региональные новости</b>", ""]
+    for item in reversed(items):
+        lines.append(
+            f"• {html.escape(item.get('source', 'источник'))}: "
+            f"{html.escape((item.get('text') or '')[:250])}\n"
+            f'<a href="{html.escape(item.get("url", ""), quote=True)}">Открыть источник</a>'
+        )
+    await update.effective_message.reply_text(
+        "\n\n".join(lines), parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
 
 
 async def admin_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
         if update.effective_message:
-            await update.effective_message.reply_text(
-                "⛔ Команда только для администратора."
-            )
+            await update.effective_message.reply_text("⛔ Команда только для администратора.")
         return
-
     await update.effective_message.reply_text(status_text())
 
 
+async def admin_center_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        await update.effective_message.reply_text("⛔ Команда только для администратора.")
+        return
+    await update.effective_message.reply_text(
+        admin_center_text(), parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("📊 Статистика", callback_data="stats"),
+            InlineKeyboardButton("🗂 Архив", callback_data="archive"),
+        ]])
+    )
+
+
 async def incoming_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Ручная передача текста администратором.
-    Подходящий текст отправляется админу в виде готового поста.
-    """
+    """Ручная передача текста администратором для классификации и проверки."""
     message = update.effective_message
     user = update.effective_user
-
-    if (
-        not message
-        or not user
-        or user.id != ADMIN_ID
-        or not message.text
-    ):
+    if not message or not user or user.id != ADMIN_ID or not message.text:
         return
 
     text = message.text.strip()
-
     if not mentions_kostroma(text):
         return
-
     result = classify(text)
-
     if not result:
         return
-
     kind, label = result
-
     await send_event(
-        context.application,
-        kind,
-        label,
+        context.application, kind, label,
         "Текст, переданный администратором",
         "https://44.mchs.gov.ru/",
-        text,
-        now_msk().isoformat(timespec="minutes"),
+        text, now_msk().isoformat(timespec="minutes")
     )
 
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Сохраняем кнопки меню подписки, источников и статуса.
-    Старые кнопки модерации больше не используются.
-    """
     query = update.callback_query
-
     if not query:
         return
-
     data = query.data or ""
 
-    # Старые сообщения модерации могут оставаться в чате.
-    if data.startswith(("approve:", "reject:")):
-        await query.answer(
-            "Модерация отключена: события отправляются автоматически.",
-            show_alert=True
-        )
+    if data.startswith("approve:"):
+        await approve_event(query, context, data.split(":", 1)[1])
+        return
+    if data.startswith("reject:"):
+        await reject_event(query, data.split(":", 1)[1])
+        return
+
+    user_id = query.from_user.id
+    if data == "admin_center" and user_id != ADMIN_ID:
+        await query.answer("Только для администратора.", show_alert=True)
         return
 
     await query.answer()
 
     if data == "subscribe":
-        subscribers.add(query.from_user.id)
+        subscribers.add(user_id)
         save_state()
-        text = "🔔 Подписка включена."
-
+        text = "🔔 Подписка включена. Уведомления приходят после проверки администратором."
     elif data == "unsubscribe":
-        subscribers.discard(query.from_user.id)
+        subscribers.discard(user_id)
         save_state()
         text = "🔕 Подписка отключена."
-
     elif data == "sources":
         text = sources_text()
-
     elif data == "status":
         text = status_text()
-
+    elif data == "stats":
+        text = stats_text()
+    elif data == "archive":
+        text = archive_text()
+    elif data == "news":
+        items = state.get("news_history", [])[-8:]
+        if items:
+            text = "📰 <b>Последние региональные новости</b>\n\n" + "\n\n".join(
+                f"• {html.escape(x.get('source', 'источник'))}: "
+                f"{html.escape((x.get('text') or '')[:220])}\n"
+                f'<a href="{html.escape(x.get("url", ""), quote=True)}">Открыть</a>'
+                for x in reversed(items)
+            )
+        else:
+            text = "📰 Сохранённых новостей пока нет."
+    elif data == "weather":
+        try:
+            text = await get_weather_text()
+        except Exception:
+            logger.exception("Ошибка погоды из меню")
+            text = "Не удалось получить погоду. Попробуйте позже."
+    elif data == "admin_center":
+        text = admin_center_text()
     else:
         text = "Неизвестная команда."
 
     try:
         await query.edit_message_text(
             text,
-            reply_markup=keyboard(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard(user_id),
             disable_web_page_preview=True
         )
     except BadRequest:
         if query.message:
             await query.message.reply_text(
-                text,
-                reply_markup=keyboard(),
+                text, parse_mode=ParseMode.HTML,
+                reply_markup=keyboard(user_id),
                 disable_web_page_preview=True
             )
 
@@ -1272,6 +1421,10 @@ async def post_init(application: Application):
         BotCommand("status", "Статус мониторинга"),
         BotCommand("weather", "Погода в Костроме"),
         BotCommand("sources", "Список источников"),
+        BotCommand("stats", "Статистика за 24 часа"),
+        BotCommand("archive", "Архив событий"),
+        BotCommand("news", "Региональные новости"),
+        BotCommand("center", "Центр событий администратора"),
         BotCommand("health", "Диагностика администратора"),
     ])
 
@@ -1280,27 +1433,23 @@ async def post_init(application: Application):
             chat_id=ADMIN_ID,
             text=(
                 "🟢 UAV ALERT запущен.\n"
-                f"Источников: {len(SOURCES)}\n"
+                f"Источников сигналов: {len(SOURCES)}\n"
                 f"Интервал проверки: {CHECK_INTERVAL} сек.\n"
                 f"Срок актуальности записи: {ALERT_TTL_HOURS} ч.\n"
-                "Режим: готовые посты отправляются администратору "
-                "автоматически, без модерации."
+                "Режим: все найденные события поступают администратору "
+                "на ручное подтверждение; автоматической публикации нет."
             ),
         )
     except TelegramError:
-        logger.exception(
-            "Не удалось отправить сообщение о запуске администратору"
-        )
+        logger.exception("Не удалось отправить сообщение о запуске администратору")
 
     monitor_task = asyncio.create_task(monitor_loop(application))
 
 
 async def post_shutdown(application: Application):
     global monitor_task
-
     if monitor_task and not monitor_task.done():
         monitor_task.cancel()
-
         try:
             await monitor_task
         except asyncio.CancelledError:
@@ -1316,6 +1465,7 @@ def index():
         "service": "UAV ALERT",
         "status": "running",
         "last_scan": state.get("last_scan"),
+        "pending_events": len(state.get("pending", {})),
     })
 
 
@@ -1329,22 +1479,19 @@ def health():
         "news_errors": state.get("news_last_errors", {}),
         "errors": state.get("last_errors", {}),
         "ttl_hours": ALERT_TTL_HOURS,
+        "pending_events": len(state.get("pending", {})),
+        "subscribers": len(subscribers),
+        "archive_records": len(state.get("event_history", [])),
     })
 
 
 def run_flask():
-    web_app.run(
-        host="0.0.0.0",
-        port=PORT,
-        use_reloader=False
-    )
+    web_app.run(host="0.0.0.0", port=PORT, use_reloader=False)
 
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError(
-            "Укажи BOT_TOKEN в переменных окружения хостинга."
-        )
+        raise RuntimeError("Укажи BOT_TOKEN в переменных окружения хостинга.")
 
     threading.Thread(
         target=run_flask,
@@ -1366,15 +1513,15 @@ def main():
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("weather", weather_command))
     application.add_handler(CommandHandler("sources", sources_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("archive", archive_command))
+    application.add_handler(CommandHandler("news", news_command))
+    application.add_handler(CommandHandler("center", admin_center_command))
     application.add_handler(CommandHandler("health", admin_health))
 
     application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            incoming_text
-        )
+        MessageHandler(filters.TEXT & ~filters.COMMAND, incoming_text)
     )
-
     application.add_handler(CallbackQueryHandler(callback))
 
     application.run_polling(
