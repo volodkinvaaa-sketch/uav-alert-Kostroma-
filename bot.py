@@ -60,6 +60,9 @@ CHECK_INTERVAL = max(5, int(os.getenv("CHECK_INTERVAL", "5")))
 REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "15")))
 ALERT_TTL_HOURS = max(1, int(os.getenv("ALERT_TTL_HOURS", "5")))
 ALERT_TTL = timedelta(hours=ALERT_TTL_HOURS)
+# Восстановление пропущенных публикаций после перезапуска.
+HISTORY_BACKFILL_HOURS = max(1, int(os.getenv("HISTORY_BACKFILL_HOURS", "6")))
+HISTORY_MAX_PAGES = max(1, min(10, int(os.getenv("HISTORY_MAX_PAGES", "6"))))
 DATA_DIR = os.getenv("DATA_DIR", ".")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MSK = timezone(timedelta(hours=3))
@@ -277,6 +280,8 @@ for value in load_json(SUBSCRIBERS_FILE, state.get("subscribers", [])):
         continue
 
 monitor_task = None
+# Источники, для которых уже выполнен расширенный поиск после запуска процесса.
+startup_backfill_done = set()
 
 
 def save_state():
@@ -388,41 +393,95 @@ def parse_published_time(node):
     return None
 
 
-def source_posts(source_url):
-    response = requests.get(
-        source_url,
-        timeout=REQUEST_TIMEOUT,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; UAV-ALERT/1.0)"}
-    )
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
-    posts = []
+def source_posts(source_url, max_pages=1, cutoff=None):
+    """
+    Читает публичную веб-ленту Telegram.
+    Для восстановления истории использует ?before=<message_id>.
+    Возвращает сообщения в хронологическом порядке.
+    Публичная лента Telegram ограничена и не гарантирует полную историю.
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; UAV-ALERT/1.0)"}
+    posts_by_key = {}
+    page_url = source_url
+    seen_page_ids = set()
+    stop_paging = False
 
-    for node in soup.select(".tgme_widget_message"):
-        text_node = node.select_one(".tgme_widget_message_text")
-        if not text_node:
-            continue
+    for page_number in range(max(1, int(max_pages))):
+        response = requests.get(
+            page_url,
+            timeout=REQUEST_TIMEOUT,
+            headers=headers
+        )
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        page_posts = []
+        numeric_ids = []
 
-        text = text_node.get_text(" ", strip=True)
-        link_node = node.select_one("a.tgme_widget_message_date")
-        url = link_node.get("href", "") if link_node else source_url
-        post_id = node.get("data-post", "") or url
-        published_at = parse_published_time(node)
-        digest = hashlib.sha256(
-            (post_id + "|" + text).encode("utf-8")
-        ).hexdigest()
+        for node in soup.select(".tgme_widget_message"):
+            text_node = node.select_one(".tgme_widget_message_text")
+            if not text_node:
+                continue
 
-        if text:
-            posts.append({
-                "key": digest,
-                "text": text[:5000],
-                "url": url,
-                "published_at": (
-                    published_at.isoformat(timespec="minutes")
-                    if published_at else None
-                ),
-            })
-    return posts[-30:]
+            text = text_node.get_text(" ", strip=True)
+            link_node = node.select_one("a.tgme_widget_message_date")
+            post_url = link_node.get("href", "") if link_node else source_url
+            post_id = node.get("data-post", "") or post_url
+            published_at = parse_published_time(node)
+
+            # data-post обычно имеет формат channel/message_id.
+            tail = str(post_id).rsplit("/", 1)[-1]
+            if tail.isdigit():
+                numeric_ids.append(int(tail))
+
+            digest = hashlib.sha256(
+                (str(post_id) + "|" + text).encode("utf-8")
+            ).hexdigest()
+
+            if text:
+                post = {
+                    "key": digest,
+                    "text": text[:5000],
+                    "url": post_url,
+                    "published_at": (
+                        published_at.isoformat(timespec="minutes")
+                        if published_at else None
+                    ),
+                }
+                page_posts.append(post)
+                posts_by_key[digest] = post
+
+                if cutoff and published_at and published_at < cutoff:
+                    # Старые сообщения не будут обработаны как восстановленные.
+                    pass
+
+        if not page_posts or page_number + 1 >= max_pages:
+            break
+
+        # При восстановлении прекращаем пагинацию, когда вся страница старше окна.
+        if cutoff:
+            dated = [
+                parse_iso(post.get("published_at"))
+                for post in page_posts
+            ]
+            dated = [stamp for stamp in dated if stamp]
+            if dated and max(dated) < cutoff:
+                stop_paging = True
+        if stop_paging:
+            break
+
+        if not numeric_ids:
+            break
+        before_id = min(numeric_ids)
+        if before_id in seen_page_ids:
+            break
+        seen_page_ids.add(before_id)
+
+        separator = "&" if "?" in source_url else "?"
+        page_url = f"{source_url}{separator}before={before_id}"
+
+    posts = list(posts_by_key.values())
+    posts.sort(key=lambda post: parse_iso(post.get("published_at")) or datetime.min.replace(tzinfo=MSK))
+    return posts
 
 
 def format_event_time(published_at):
@@ -666,10 +725,11 @@ async def send_event(application, kind, label, source, url, text, published_at=N
         "🛡 <b>Новое событие — требуется проверка администратора</b>\n\n"
         f"{item['message']}"
         f"{conflict_warning(kind)}\n\n"
-        "<b>Исходный текст:</b>\n"
-        f"{html.escape(text[:1800])}\n\n"
+        "Откройте исходную публикацию по ссылке выше и сверяйте "
+        "информацию с официальными оповещениями. Не переносите в канал "
+        "координаты, маршруты, места обнаружения или другие оперативные детали.\n\n"
         "Публикация в канал и уведомление подписчиков произойдут "
-        "только после нажатия кнопки подтверждения."
+        "только после отдельного решения администратора."
     )
 
     try:
@@ -752,43 +812,109 @@ async def reject_event(query, pending_id):
     await query.answer("Отклонено.")
 
 
+async def send_backfill_notice(application, name, post, kind, label):
+    """
+    Сообщает админу о найденной в истории публикации.
+    Архивные записи не попадают в очередь публикации и не могут быть
+    подтверждены как текущий статус.
+    """
+    published = format_event_time(post.get("published_at"))
+    safe_name = html.escape(name)
+    safe_label = html.escape(label)
+    safe_url = html.escape(post.get("url", ""), quote=True)
+
+    message = (
+        "🗂 <b>Найдена пропущенная публикация — архив</b>\n\n"
+        f"Категория: <b>{safe_label}</b>\n"
+        f"Источник: {safe_name}\n"
+        f"Время исходной публикации: {html.escape(published)}\n\n"
+        "Это историческое сообщение, а не актуальное оповещение. "
+        "Оно не добавлено в очередь публикации и не может быть "
+        "автоматически опубликовано в канал.\n\n"
+        f'<a href="{safe_url}">Открыть исходную публикацию</a>'
+    )
+    await application.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=message,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
+
+
 async def monitor_source(application, name, url):
-    posts = await asyncio.to_thread(source_posts, url)
+    """
+    При старте делает ограниченный просмотр истории за последние N часов.
+    Найденные архивные сигналы отправляются только админу как справка:
+    они не становятся текущими статусами и не попадают в публикацию.
+    Последующие циклы читают только свежую страницу.
+    """
+    first_scan_after_start = url not in startup_backfill_done
+    startup_backfill_done.add(url)
+
+    cutoff = now_msk() - timedelta(hours=HISTORY_BACKFILL_HOURS)
+    pages = HISTORY_MAX_PAGES if first_scan_after_start else 1
+
+    posts = await asyncio.to_thread(
+        source_posts,
+        url,
+        pages,
+        cutoff if first_scan_after_start else None
+    )
+
     seen_map = state.setdefault("seen", {})
     source_seen_list = seen_map.get(url, [])
     source_seen = set(source_seen_list)
     initialized = bool(state.setdefault("initialized", {}).get(url, False))
 
-    if not initialized:
-        seen_map[url] = [p["key"] for p in posts][-300:]
-        state["initialized"][url] = True
-        state["last_errors"].pop(url, None)
-        save_state()
-        logger.info("Источник %s инициализирован (%s постов)", name, len(posts))
-        return
-
+    # Сначала обрабатываем только ранее неизвестные публикации.
     for post in posts:
-        if post["key"] in source_seen:
+        key = post["key"]
+        if key in source_seen:
             continue
-        source_seen.add(post["key"])
-        text = post["text"]
+        source_seen.add(key)
 
+        published_stamp = parse_iso(post.get("published_at"))
+        if first_scan_after_start:
+            # Без достоверного времени невозможно понять, попадает ли пост
+            # в окно восстановления — такой пост только отмечается как seen.
+            if not published_stamp or published_stamp < cutoff:
+                continue
+
+        text = post["text"]
         if not mentions_kostroma(text):
             continue
+
         result = classify(text)
         if not result:
             continue
 
         kind, label = result
+
+        if first_scan_after_start:
+            # Восстановление — только для трёх запрошенных категорий БПЛА.
+            # Архивные события не предлагаются к публикации.
+            if kind not in ("danger", "attention", "cancel"):
+                continue
+            try:
+                await send_backfill_notice(application, name, post, kind, label)
+            except TelegramError:
+                logger.exception(
+                    "Не удалось отправить архивную карточку админу: %s", name
+                )
+            continue
+
+        # В обычном мониторинге остаётся прежняя ручная модерация.
         await send_event(
             application, kind, label, name, post["url"],
             text, post.get("published_at")
         )
 
-    # Храним последние ключи в исходном порядке, а не порядок множества.
+    # При первом запуске отмечаем также старые/неподходящие сообщения,
+    # чтобы они не всплывали повторно в следующих циклах.
     ordered = [p["key"] for p in posts if p["key"] in source_seen]
-    seen_map[url] = ordered[-300:]
-    state["last_errors"].pop(url, None)
+    seen_map[url] = ordered[-500:]
+    state.setdefault("initialized", {})[url] = True
+    state.setdefault("last_errors", {}).pop(url, None)
     save_state()
 
 
@@ -881,8 +1007,8 @@ def expire_active_alerts():
 
 async def monitor_loop(application):
     logger.info(
-        "Мониторинг запущен; интервал=%s сек.; TTL=%s ч.",
-        CHECK_INTERVAL, ALERT_TTL_HOURS
+        "Мониторинг запущен; интервал=%s сек.; TTL=%s ч.; восстановление=%s ч./до %s страниц.",
+        CHECK_INTERVAL, ALERT_TTL_HOURS, HISTORY_BACKFILL_HOURS, HISTORY_MAX_PAGES
     )
     while True:
         for name, url in SOURCES:
