@@ -22,6 +22,9 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters
 )
 
+from ai_core import analyze_text, ai_status_text, ai_history_text
+from ai_provider import AIProviderError
+
 """
 UAV ALERT — гражданский информационный бот.
 
@@ -1204,6 +1207,7 @@ def keyboard(user_id=None):
     ]
     if user_id == ADMIN_ID:
         rows.append([InlineKeyboardButton("🛡 Центр событий", callback_data="admin_center")])
+        rows.append([InlineKeyboardButton("🧠 UAV ALERT AI", callback_data="ai_menu")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1440,11 +1444,84 @@ async def admin_center_command(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
+async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Включает разовый режим анализа текста для администратора."""
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or user.id != ADMIN_ID:
+        if message:
+            await message.reply_text("⛔ Команда только для администратора.")
+        return
+
+    if context.args:
+        material = " ".join(context.args).strip()
+        await _run_ai_analysis(message, material, user.id)
+        return
+
+    context.user_data["uav_ai_waiting_text"] = True
+    await message.reply_text(
+        "🧠 Режим AI-проверки включён.\n"
+        "Отправьте следующим сообщением текст публикации.\n\n"
+        "Это отдельный режим: сообщение будет передано только на анализ ИИ "
+        "и не запустит обычную классификацию событий. Для отмены отправьте /cancel_ai."
+    )
+
+
+async def _run_ai_analysis(message, material, user_id):
+    if not material or not material.strip():
+        await message.reply_text("Пришлите непустой текст для анализа.")
+        return
+    status_message = await message.reply_text("🧠 Анализирую материал. Это может занять некоторое время...")
+    try:
+        result = await analyze_text(
+            material,
+            source="Ручная отправка администратором",
+            user_id=user_id,
+        )
+        # Оставляем запас до лимита Telegram.
+        result = result[:3800]
+        await status_message.edit_text(
+            "🧠 <b>Предварительный AI-анализ</b>\n\n" + html.escape(result),
+            parse_mode=ParseMode.HTML,
+        )
+    except AIProviderError as exc:
+        await status_message.edit_text("⚠️ " + html.escape(str(exc)), parse_mode=ParseMode.HTML)
+    except Exception:
+        logger.exception("Ошибка AI-анализа")
+        await status_message.edit_text("⚠️ Не удалось выполнить AI-анализ. Подробности сохранены в журнале сервера.")
+
+
+async def ai_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        if update.effective_message:
+            await update.effective_message.reply_text("⛔ Команда только для администратора.")
+        return
+    await update.effective_message.reply_text(ai_status_text(), parse_mode=ParseMode.HTML)
+
+
+async def ai_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        if update.effective_message:
+            await update.effective_message.reply_text("⛔ Команда только для администратора.")
+        return
+    await update.effective_message.reply_text(ai_history_text(), parse_mode=ParseMode.HTML)
+
+
+async def cancel_ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("uav_ai_waiting_text", None)
+    if update.effective_message:
+        await update.effective_message.reply_text("Режим AI-проверки отменён.")
+
+
 async def incoming_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ручная передача текста администратором для классификации и проверки."""
     message = update.effective_message
     user = update.effective_user
     if not message or not user or user.id != ADMIN_ID or not message.text:
+        return
+
+    if context.user_data.pop("uav_ai_waiting_text", False):
+        await _run_ai_analysis(message, message.text.strip(), user.id)
         return
 
     text = message.text.strip()
@@ -1476,6 +1553,39 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = query.from_user.id
+    if data in {"ai_menu", "ai_history", "ai_start"} and user_id != ADMIN_ID:
+        await query.answer("Только для администратора.", show_alert=True)
+        return
+    if data == "ai_menu":
+        await query.answer()
+        await query.edit_message_text(
+            ai_status_text() + "\n\nКоманды: /ai, /ai_status, /ai_history.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔍 Анализировать текст", callback_data="ai_start")],
+                [InlineKeyboardButton("🗂 История анализов", callback_data="ai_history")],
+                [InlineKeyboardButton("↩️ В главное меню", callback_data="admin_center")],
+            ]),
+        )
+        return
+    if data == "ai_history":
+        await query.answer()
+        await query.edit_message_text(
+            ai_history_text(), parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("↩️ К AI", callback_data="ai_menu")
+            ]]),
+        )
+        return
+    if data == "ai_start":
+        await query.answer()
+        # Callback user_data доступен через context; следующий текст уйдёт в AI.
+        context.user_data["uav_ai_waiting_text"] = True
+        await query.message.reply_text(
+            "🧠 Отправьте следующим сообщением текст для предварительного AI-анализа. "
+            "Для отмены используйте /cancel_ai."
+        )
+        return
     if data == "admin_center" and user_id != ADMIN_ID:
         await query.answer("Только для администратора.", show_alert=True)
         return
@@ -1551,6 +1661,10 @@ async def post_init(application: Application):
         BotCommand("news", "Региональные новости"),
         BotCommand("center", "Центр событий администратора"),
         BotCommand("health", "Диагностика администратора"),
+        BotCommand("ai", "AI-анализ текста (администратор)"),
+        BotCommand("ai_status", "Статус AI-модуля (администратор)"),
+        BotCommand("ai_history", "История AI-анализов (администратор)"),
+        BotCommand("cancel_ai", "Отменить режим AI-анализа"),
     ])
 
     try:
@@ -1643,6 +1757,10 @@ def main():
     application.add_handler(CommandHandler("news", news_command))
     application.add_handler(CommandHandler("center", admin_center_command))
     application.add_handler(CommandHandler("health", admin_health))
+    application.add_handler(CommandHandler("ai", ai_command))
+    application.add_handler(CommandHandler("ai_status", ai_status_command))
+    application.add_handler(CommandHandler("ai_history", ai_history_command))
+    application.add_handler(CommandHandler("cancel_ai", cancel_ai_command))
 
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, incoming_text)
