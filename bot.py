@@ -46,7 +46,8 @@ UAV ALERT — гражданский информационный бот.
 - проверка повторов и предупреждение о противоречивых сообщениях;
 - явное различение сторонних и официальных источников;
 - безопасная фильтрация новостей: оперативные сведения о БПЛА,
-  координаты, маршруты, позиции и подобные детали не пересылаются.
+  координаты, маршруты, позиции и подобные детали не пересылаются;
+- отдельные фотографии для каждого типа события.
 
 ВАЖНО:
 Бот не прогнозирует цели, маршруты, траектории или зоны возможного удара.
@@ -63,15 +64,29 @@ CHECK_INTERVAL = max(5, int(os.getenv("CHECK_INTERVAL", "5")))
 REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "15")))
 ALERT_TTL_HOURS = max(1, int(os.getenv("ALERT_TTL_HOURS", "5")))
 ALERT_TTL = timedelta(hours=ALERT_TTL_HOURS)
+
 # Восстановление пропущенных публикаций после перезапуска.
 HISTORY_BACKFILL_HOURS = max(1, int(os.getenv("HISTORY_BACKFILL_HOURS", "6")))
 HISTORY_MAX_PAGES = max(1, min(10, int(os.getenv("HISTORY_MAX_PAGES", "6"))))
+
 DATA_DIR = os.getenv("DATA_DIR", ".")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MSK = timezone(timedelta(hours=3))
 
-DANGER_IMAGE = os.path.join(BASE_DIR, "danger.jpg")
-ALL_CLEAR_IMAGE = os.path.join(BASE_DIR, "all_clear.jpg")
+# Отдельные изображения для каждого типа события.
+UAV_ATTENTION_IMAGE = os.path.join(BASE_DIR, "uav_attention.jpg")
+UAV_DANGER_IMAGE = os.path.join(BASE_DIR, "uav_danger.jpg")
+UAV_CANCEL_IMAGE = os.path.join(BASE_DIR, "uav_cancel.jpg")
+
+MWSH_DANGER_IMAGE = os.path.join(BASE_DIR, "mwsh_danger.jpg")
+MWSH_CANCEL_IMAGE = os.path.join(BASE_DIR, "mwsh_cancel.jpg")
+
+ROCKET_DANGER_IMAGE = os.path.join(BASE_DIR, "rocket_danger.jpg")
+ROCKET_CANCEL_IMAGE = os.path.join(BASE_DIR, "rocket_cancel.jpg")
+
+# Старые изображения используются как запасные.
+LEGACY_DANGER_IMAGE = os.path.join(BASE_DIR, "danger.jpg")
+LEGACY_CLEAR_IMAGE = os.path.join(BASE_DIR, "all_clear.jpg")
 
 SOURCES = [
     ("locatorru", "https://t.me/s/locatorru"),
@@ -233,10 +248,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("uav-alert")
 
-
 def now_msk():
     return datetime.now(MSK)
-
 
 def load_json(path, default):
     try:
@@ -245,13 +258,11 @@ def load_json(path, default):
     except (OSError, ValueError):
         return default
 
-
 def save_json(path, value):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as file:
         json.dump(value, file, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
-
 
 state = load_json(STATE_FILE, {})
 if not isinstance(state, dict):
@@ -286,12 +297,10 @@ monitor_task = None
 # Источники, для которых уже выполнен расширенный поиск после запуска процесса.
 startup_backfill_done = set()
 
-
 def save_state():
     state["subscribers"] = sorted(subscribers)
     save_json(STATE_FILE, state)
     save_json(SUBSCRIBERS_FILE, sorted(subscribers))
-
 
 def normalize(text):
     return re.sub(
@@ -299,13 +308,11 @@ def normalize(text):
         (text or "").casefold().replace("ё", "е")
     ).strip()
 
-
 def mentions_kostroma(text):
     value = normalize(text)
     if REGION_RE.search(value):
         return True
     return any(term in value for term in TERRITORY_TERMS)
-
 
 def extract_territories(text):
     """Извлекает упоминания территорий для внутренней проверки текста."""
@@ -340,7 +347,6 @@ def extract_territories(text):
         return ["Костромская область"]
     return []
 
-
 def classify_mwsh(text):
     value = normalize(text)
     if MWSH_CANCEL_RE.search(value):
@@ -348,7 +354,6 @@ def classify_mwsh(text):
     if MWSH_DANGER_RE.search(value):
         return "mwsh_danger", "Опасность по МВШ"
     return None
-
 
 def classify_rocket(text):
     value = normalize(text)
@@ -359,7 +364,6 @@ def classify_rocket(text):
     if ROCKET_RE.search(value):
         return "rocket_danger", "Ракетная опасность"
     return None
-
 
 def classify_uav(text):
     value = normalize(text)
@@ -375,10 +379,8 @@ def classify_uav(text):
         return "attention", "Внимание: БПЛА"
     return None
 
-
 def classify(text):
     return classify_mwsh(text) or classify_rocket(text) or classify_uav(text)
-
 
 def parse_published_time(node):
     """Извлекает время исходного поста Telegram и переводит в МСК."""
@@ -394,7 +396,6 @@ def parse_published_time(node):
             except ValueError:
                 logger.debug("Не удалось разобрать время публикации: %r", raw)
     return None
-
 
 def source_posts(source_url, max_pages=1, cutoff=None):
     """
@@ -454,13 +455,11 @@ def source_posts(source_url, max_pages=1, cutoff=None):
                 posts_by_key[digest] = post
 
                 if cutoff and published_at and published_at < cutoff:
-                    # Старые сообщения не будут обработаны как восстановленные.
                     pass
 
         if not page_posts or page_number + 1 >= max_pages:
             break
 
-        # При восстановлении прекращаем пагинацию, когда вся страница старше окна.
         if cutoff:
             dated = [
                 parse_iso(post.get("published_at"))
@@ -483,9 +482,11 @@ def source_posts(source_url, max_pages=1, cutoff=None):
         page_url = f"{source_url}{separator}before={before_id}"
 
     posts = list(posts_by_key.values())
-    posts.sort(key=lambda post: parse_iso(post.get("published_at")) or datetime.min.replace(tzinfo=MSK))
+    posts.sort(
+        key=lambda post: parse_iso(post.get("published_at"))
+        or datetime.min.replace(tzinfo=MSK)
+    )
     return posts
-
 
 def format_event_time(published_at):
     if published_at:
@@ -498,7 +499,6 @@ def format_event_time(published_at):
             pass
     return "не указано"
 
-
 def event_family(kind):
     if kind.startswith("mwsh_"):
         return "mwsh"
@@ -506,10 +506,8 @@ def event_family(kind):
         return "rocket"
     return "uav"
 
-
 def event_is_cancel(kind):
     return kind in ("cancel", "rocket_cancel", "mwsh_cancel")
-
 
 def event_is_danger(kind):
     return kind in (
@@ -517,6 +515,31 @@ def event_is_danger(kind):
         "mwsh_danger", "rocket_danger"
     )
 
+def event_image_path(kind):
+    """Возвращает изображение для конкретной категории события."""
+    image_paths = {
+        "attention": UAV_ATTENTION_IMAGE,
+        "threat": UAV_DANGER_IMAGE,
+        "danger": UAV_DANGER_IMAGE,
+        "cancel": UAV_CANCEL_IMAGE,
+        "mwsh_danger": MWSH_DANGER_IMAGE,
+        "mwsh_cancel": MWSH_CANCEL_IMAGE,
+        "rocket_danger": ROCKET_DANGER_IMAGE,
+        "rocket_cancel": ROCKET_CANCEL_IMAGE,
+    }
+
+    image_path = image_paths.get(kind)
+
+    if image_path and os.path.isfile(image_path):
+        return image_path
+
+    # Если отдельного изображения нет, используем старое.
+    fallback = LEGACY_CLEAR_IMAGE if event_is_cancel(kind) else LEGACY_DANGER_IMAGE
+
+    if os.path.isfile(fallback):
+        return fallback
+
+    return None
 
 def event_title(kind):
     return {
@@ -529,7 +552,6 @@ def event_title(kind):
         "attention": ("🟡 Внимание: БПЛА", "БПЛА"),
         "danger": ("🔴 Опасность по БПЛА", "БПЛА"),
     }.get(kind, ("ℹ️ Сообщение", "Информация"))
-
 
 def event_message(kind, label, source, url, source_text, published_at=None):
     """
@@ -555,7 +577,6 @@ def event_message(kind, label, source, url, source_text, published_at=None):
         "с официальными оповещениями МЧС и органов власти. "
         "Следуйте инструкциям экстренных служб."
     )
-
 
 def conflict_warning(kind):
     """Ищет недавнее противоположное событие той же категории."""
@@ -587,34 +608,66 @@ def conflict_warning(kind):
         )
     return ""
 
-
 def moderation_keyboard(pending_id):
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Подтвердить и опубликовать",
-                                 callback_data=f"approve:{pending_id}"),
+            InlineKeyboardButton(
+                "✅ Подтвердить и опубликовать",
+                callback_data=f"approve:{pending_id}"
+            ),
         ],
         [
-            InlineKeyboardButton("❌ Отклонить",
-                                 callback_data=f"reject:{pending_id}"),
+            InlineKeyboardButton(
+                "❌ Отклонить",
+                callback_data=f"reject:{pending_id}"
+            ),
         ],
         [
-            InlineKeyboardButton("🔎 Центр событий",
-                                 callback_data="admin_center"),
+            InlineKeyboardButton(
+                "🔎 Центр событий",
+                callback_data="admin_center"
+            ),
         ],
     ])
 
+async def send_text_or_photo(
+    bot, chat_id, message, is_cancel=False, kind=None
+):
+    """
+    Отправляет текст с фотографией события.
+    Если подпись слишком длинная, фотография отправляется отдельно,
+    а полный текст — следующим сообщением.
+    """
+    if kind is not None:
+        image_path = event_image_path(kind)
+    else:
+        image_path = (
+            LEGACY_CLEAR_IMAGE if is_cancel else LEGACY_DANGER_IMAGE
+        )
 
-async def send_text_or_photo(bot, chat_id, message, is_cancel=False):
-    image_path = ALL_CLEAR_IMAGE if is_cancel else DANGER_IMAGE
-    if os.path.isfile(image_path) and len(message) <= 1024:
-        with open(image_path, "rb") as photo:
-            await bot.send_photo(
+    if image_path and os.path.isfile(image_path):
+        if len(message) <= 1024:
+            with open(image_path, "rb") as photo:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo,
+                    caption=message,
+                    parse_mode=ParseMode.HTML,
+                    disable_notification=False
+                )
+        else:
+            with open(image_path, "rb") as photo:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo,
+                    disable_notification=False
+                )
+
+            await bot.send_message(
                 chat_id=chat_id,
-                photo=photo,
-                caption=message,
+                text=message,
                 parse_mode=ParseMode.HTML,
-                disable_notification=False
+                disable_web_page_preview=True
             )
     else:
         await bot.send_message(
@@ -623,7 +676,6 @@ async def send_text_or_photo(bot, chat_id, message, is_cancel=False):
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True
         )
-
 
 def add_history(item, decision, actor_id=None):
     history = state.setdefault("event_history", [])
@@ -640,7 +692,6 @@ def add_history(item, decision, actor_id=None):
     }
     history.append(record)
     state["event_history"] = history[-500:]
-
 
 def record_approved_event(item):
     """Обновляет статусную запись только после подтверждения администратором."""
@@ -674,27 +725,33 @@ def record_approved_event(item):
             "stale": False,
         }
 
-
-async def notify_subscribers(bot, message):
-    """Рассылает подписчикам только уже одобренную администратором запись."""
+async def notify_subscribers(bot, message, kind=None):
+    """Рассылает подписчикам одобренное сообщение с нужной фотографией."""
     failed = []
+
     for user_id in list(subscribers):
         try:
-            await bot.send_message(
-                chat_id=user_id,
-                text=message,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True
+            await send_text_or_photo(
+                bot,
+                user_id,
+                message,
+                is_cancel=event_is_cancel(kind) if kind else False,
+                kind=kind
             )
         except TelegramError as exc:
-            logger.info("Не удалось уведомить подписчика %s: %s", user_id, exc)
+            logger.info(
+                "Не удалось уведомить подписчика %s: %s",
+                user_id,
+                exc
+            )
             failed.append(user_id)
 
     # Не удаляем подписчика автоматически: ошибка может быть временной.
     return failed
 
-
-async def send_event(application, kind, label, source, url, text, published_at=None):
+async def send_event(
+    application, kind, label, source, url, text, published_at=None
+):
     """
     Создаёт карточку на ручную проверку.
     Ничего не публикует в канал и не рассылает подписчикам до решения админа.
@@ -740,21 +797,27 @@ async def send_event(application, kind, label, source, url, text, published_at=N
             application.bot,
             ADMIN_ID,
             admin_message,
-            is_cancel=event_is_cancel(kind)
+            is_cancel=event_is_cancel(kind),
+            kind=kind
         )
         logger.info("Событие добавлено в очередь проверки: %s", pending_id)
     except TelegramError:
         logger.exception("Не удалось отправить карточку администратору")
 
-
 async def approve_event(query, context, pending_id):
     if query.from_user.id != ADMIN_ID:
-        await query.answer("Только администратор может подтвердить событие.", show_alert=True)
+        await query.answer(
+            "Только администратор может подтвердить событие.",
+            show_alert=True
+        )
         return
 
     item = state.setdefault("pending", {}).get(pending_id)
     if not item:
-        await query.answer("Событие уже обработано или не найдено.", show_alert=True)
+        await query.answer(
+            "Событие уже обработано или не найдено.",
+            show_alert=True
+        )
         return
 
     try:
@@ -763,11 +826,15 @@ async def approve_event(query, context, pending_id):
             context.bot,
             CHANNEL_ID,
             item["message"],
-            is_cancel=event_is_cancel(item["kind"])
+            is_cancel=event_is_cancel(item["kind"]),
+            kind=item["kind"]
         )
     except TelegramError:
         logger.exception("Не удалось опубликовать событие в канал")
-        await query.answer("Не удалось опубликовать. Проверь права бота и CHANNEL_ID.", show_alert=True)
+        await query.answer(
+            "Не удалось опубликовать. Проверь права бота и CHANNEL_ID.",
+            show_alert=True
+        )
         return
 
     state["pending"].pop(pending_id, None)
@@ -776,7 +843,12 @@ async def approve_event(query, context, pending_id):
     add_history(item, "published", query.from_user.id)
     save_state()
 
-    failed = await notify_subscribers(context.bot, item["message"])
+    failed = await notify_subscribers(
+        context.bot,
+        item["message"],
+        kind=item["kind"]
+    )
+
     try:
         await query.edit_message_text(
             "✅ <b>Событие опубликовано</b>\n\n"
@@ -787,17 +859,23 @@ async def approve_event(query, context, pending_id):
         )
     except (BadRequest, TelegramError):
         pass
-    await query.answer("Опубликовано.")
 
+    await query.answer("Опубликовано.")
 
 async def reject_event(query, pending_id):
     if query.from_user.id != ADMIN_ID:
-        await query.answer("Только администратор может отклонить событие.", show_alert=True)
+        await query.answer(
+            "Только администратор может отклонить событие.",
+            show_alert=True
+        )
         return
 
     item = state.setdefault("pending", {}).pop(pending_id, None)
     if not item:
-        await query.answer("Событие уже обработано или не найдено.", show_alert=True)
+        await query.answer(
+            "Событие уже обработано или не найдено.",
+            show_alert=True
+        )
         return
 
     state.setdefault("rejected", {})[pending_id] = now_msk().isoformat(timespec="seconds")
@@ -812,8 +890,8 @@ async def reject_event(query, pending_id):
         )
     except (BadRequest, TelegramError):
         pass
-    await query.answer("Отклонено.")
 
+    await query.answer("Отклонено.")
 
 async def send_backfill_notice(application, name, post, kind, label):
     """
@@ -841,7 +919,6 @@ async def send_backfill_notice(application, name, post, kind, label):
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True
     )
-
 
 async def monitor_source(application, name, url):
     """
@@ -893,7 +970,6 @@ async def monitor_source(application, name, url):
         kind, label = result
 
         if first_scan_after_start:
-            # Восстановление — только для трёх запрошенных категорий БПЛА.
             # Архивные события не предлагаются к публикации.
             if kind not in ("danger", "attention", "cancel"):
                 continue
@@ -901,7 +977,8 @@ async def monitor_source(application, name, url):
                 await send_backfill_notice(application, name, post, kind, label)
             except TelegramError:
                 logger.exception(
-                    "Не удалось отправить архивную карточку админу: %s", name
+                    "Не удалось отправить архивную карточку админу: %s",
+                    name
                 )
             continue
 
@@ -919,11 +996,13 @@ async def monitor_source(application, name, url):
     state.setdefault("last_errors", {}).pop(url, None)
     save_state()
 
-
 def is_safe_regional_news(text):
     """Только общие новости региона без оперативной тематики."""
-    return bool(text and mentions_kostroma(text) and not NEWS_SENSITIVE_RE.search(text))
-
+    return bool(
+        text
+        and mentions_kostroma(text)
+        and not NEWS_SENSITIVE_RE.search(text)
+    )
 
 async def monitor_news_source(application, name, url):
     """Новостная лента отдельно от сигналов: только безопасные новости админу."""
@@ -938,13 +1017,18 @@ async def monitor_news_source(application, name, url):
         state["news_initialized"][url] = True
         state.setdefault("news_last_errors", {}).pop(url, None)
         save_state()
-        logger.info("Новостной источник %s инициализирован (%s постов)", name, len(posts))
+        logger.info(
+            "Новостной источник %s инициализирован (%s постов)",
+            name,
+            len(posts)
+        )
         return
 
     for post in posts:
         if post["key"] in source_seen:
             continue
         source_seen.add(post["key"])
+
         if not is_safe_regional_news(post["text"]):
             continue
 
@@ -960,10 +1044,13 @@ async def monitor_news_source(application, name, url):
             "автоматической публикации в канал нет.\n"
             f'<a href="{html.escape(post["url"], quote=True)}">Открыть исходную публикацию</a>'
         )
+
         try:
             await application.bot.send_message(
-                chat_id=ADMIN_ID, text=message,
-                parse_mode=ParseMode.HTML, disable_web_page_preview=True
+                chat_id=ADMIN_ID,
+                text=message,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
             )
             news_history = state.setdefault("news_history", [])
             news_history.append({
@@ -976,13 +1063,15 @@ async def monitor_news_source(application, name, url):
             })
             state["news_history"] = news_history[-300:]
         except TelegramError:
-            logger.exception("Не удалось отправить новость админу: %s", name)
+            logger.exception(
+                "Не удалось отправить новость админу: %s",
+                name
+            )
 
     ordered = [p["key"] for p in posts if p["key"] in source_seen]
     seen_map[url] = ordered[-300:]
     state.setdefault("news_last_errors", {}).pop(url, None)
     save_state()
-
 
 def expire_active_alerts():
     """Помечает истёкшие состояния устаревшими; отбой не публикуется."""
@@ -1005,773 +1094,3 @@ def expire_active_alerts():
 
     if changed:
         save_state()
-
-
-async def monitor_loop(application):
-    logger.info(
-        "Мониторинг запущен; интервал=%s сек.; TTL=%s ч.; восстановление=%s ч./до %s страниц.",
-        CHECK_INTERVAL, ALERT_TTL_HOURS, HISTORY_BACKFILL_HOURS, HISTORY_MAX_PAGES
-    )
-    while True:
-        for name, url in SOURCES:
-            try:
-                await monitor_source(application, name, url)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                state.setdefault("last_errors", {})[url] = str(exc)[:250]
-                logger.warning("Источник %s недоступен: %s", name, exc)
-
-        for name, url in NEWS_SOURCES:
-            try:
-                await monitor_news_source(application, name, url)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                state.setdefault("news_last_errors", {})[url] = str(exc)[:250]
-                logger.warning("Новостной источник %s недоступен: %s", name, exc)
-
-        expire_active_alerts()
-        state["last_scan"] = now_msk().isoformat(timespec="seconds")
-        save_state()
-        await asyncio.sleep(CHECK_INTERVAL)
-
-
-def parse_iso(value):
-    try:
-        parsed = datetime.fromisoformat(value)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=MSK)
-        return parsed.astimezone(MSK)
-    except (TypeError, ValueError):
-        return None
-
-
-def recent_history(hours=24):
-    cutoff = now_msk() - timedelta(hours=hours)
-    result = []
-    for item in state.get("event_history", []):
-        stamp = parse_iso(item.get("decision_at") or item.get("created_at"))
-        if stamp and stamp >= cutoff:
-            result.append(item)
-    return result
-
-
-def stats_text():
-    records = recent_history(24)
-    published = [x for x in records if x.get("decision") == "published"]
-    rejected = [x for x in records if x.get("decision") == "rejected"]
-    counts = Counter(x.get("kind", "other") for x in published)
-
-    lines = [
-        "📊 <b>UAV ALERT — статистика за 24 часа</b>",
-        f"Проверено администратором: {len(records)}",
-        f"Опубликовано: {len(published)}",
-        f"Отклонено: {len(rejected)}",
-        "",
-        "<b>Опубликованные категории:</b>",
-    ]
-
-    labels = [
-        ("danger", "Опасность по БПЛА"),
-        ("threat", "Угроза по БПЛА"),
-        ("attention", "Внимание: БПЛА"),
-        ("cancel", "Отбой по БПЛА"),
-        ("mwsh_danger", "Опасность по МВШ"),
-        ("mwsh_cancel", "Отбой по МВШ"),
-        ("rocket_danger", "Ракетная опасность"),
-        ("rocket_cancel", "Отбой ракетной опасности"),
-    ]
-    for key, label in labels:
-        lines.append(f"• {label}: {counts.get(key, 0)}")
-
-    lines.extend([
-        "",
-        f"В очереди проверки: {len(state.get('pending', {}))}",
-        f"Подписчиков: {len(subscribers)}",
-        "",
-        "Статистика отражает только сообщения, которые бот обнаружил "
-        "и администратор обработал. Это не подсчёт реальных объектов "
-        "или атак и не оценка военной обстановки."
-    ])
-    return "\n".join(lines)
-
-
-async def regional_alert_status():
-    expire_active_alerts()
-    lines = [
-        "🛰 <b>UAV ALERT — Костромская область</b>",
-        f"Срок актуальности записи: {ALERT_TTL_HOURS} ч.",
-        ""
-    ]
-    active = state.get("active_alerts", {})
-    families = [
-        ("БПЛА", {"danger", "threat", "attention"}),
-        ("МВШ", {"mwsh_danger"}),
-        ("Ракетная опасность", {"rocket_danger"}),
-    ]
-
-    for label, keys in families:
-        entries = [(key, item) for key, item in active.items() if key in keys]
-        if not entries:
-            lines.append(f"{label}: подтверждённое активное состояние не установлено.")
-            continue
-
-        key, item = max(entries, key=lambda pair: pair[1].get("published_at", ""))
-        if item.get("stale"):
-            lines.append(
-                f"{label}: <b>запись устарела</b> — срок хранения истёк; "
-                "текущий статус не установлен."
-            )
-        else:
-            url = html.escape(item.get("url", ""), quote=True)
-            source = html.escape(item.get("source", "источник"))
-            lines.append(
-                f'{label}: <b>{html.escape(item.get("label", "событие"))}</b>. '
-                f'<a href="{url}">Источник: {source}</a>'
-            )
-
-    lines.append(
-        "\n⚠️ Это автоматическая сводка по выбранным сторонним Telegram-источникам "
-        "и событиям, подтверждённым администратором для публикации. "
-        "Истечение срока хранения не означает отбоя. Проверяйте официальные "
-        "оповещения МЧС и органов власти."
-    )
-    return "\n".join(lines)
-
-
-def admin_center_text():
-    pending = state.get("pending", {})
-    lines = [
-        "🛡 <b>Центр событий UAV ALERT</b>",
-        f"Ожидают проверки: {len(pending)}",
-        f"Опубликовано за 24 часа: {sum(1 for x in recent_history(24) if x.get('decision') == 'published')}",
-        f"Отклонено за 24 часа: {sum(1 for x in recent_history(24) if x.get('decision') == 'rejected')}",
-        f"Последний цикл мониторинга: {html.escape(state.get('last_scan') or 'ещё не завершён')}",
-        "",
-    ]
-    if pending:
-        lines.append("<b>Последние события на проверку:</b>")
-        for item in list(pending.values())[-8:]:
-            lines.append(
-                f"• {html.escape(item.get('label', 'Сообщение'))} — "
-                f"{html.escape(item.get('source', 'источник'))} — "
-                f"{html.escape(format_event_time(item.get('published_at')))}"
-            )
-    else:
-        lines.append("Новых событий, ожидающих проверки, нет.")
-    lines.extend([
-        "",
-        "Проверяйте исходный источник и официальные оповещения. "
-        "Не публикуйте координаты, маршруты, предполагаемые цели, "
-        "места падения или непроверенные сведения."
-    ])
-    return "\n".join(lines)
-
-
-def archive_text(limit=15):
-    history = state.get("event_history", [])
-    if not history:
-        return "🗂 Архив пока пуст. В нём появятся события после решения администратора."
-
-    lines = ["🗂 <b>Архив событий UAV ALERT</b>", ""]
-    for item in reversed(history[-limit:]):
-        decision = "опубликовано" if item.get("decision") == "published" else "отклонено"
-        lines.append(
-            f"• {html.escape(item.get('label') or 'Событие')} — {decision}\n"
-            f"  {html.escape(format_event_time(item.get('published_at')))}; "
-            f"{html.escape(item.get('source') or 'источник')}"
-        )
-    lines.append("\nАрхив содержит только записи, обработанные администратором.")
-    return "\n".join(lines)
-
-
-def keyboard(user_id=None):
-    rows = [
-        [
-            InlineKeyboardButton("🔔 Подписаться", callback_data="subscribe"),
-            InlineKeyboardButton("🔕 Отписаться", callback_data="unsubscribe"),
-        ],
-        [
-            InlineKeyboardButton("📡 Источники", callback_data="sources"),
-            InlineKeyboardButton("ℹ️ Статус", callback_data="status"),
-        ],
-        [
-            InlineKeyboardButton("📰 Новости", callback_data="news"),
-            InlineKeyboardButton("📊 Статистика", callback_data="stats"),
-        ],
-        [
-            InlineKeyboardButton("🗂 Архив", callback_data="archive"),
-            InlineKeyboardButton("🌦 Погода", callback_data="weather"),
-        ],
-    ]
-    if user_id == ADMIN_ID:
-        rows.append([InlineKeyboardButton("🛡 Центр событий", callback_data="admin_center")])
-        rows.append([InlineKeyboardButton("🧠 UAV ALERT AI", callback_data="ai_menu")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    user = update.effective_user
-    if not message:
-        return
-
-    await message.reply_text(
-        "🛰 UAV ALERT — информационный сервис Костромской области.\n\n"
-        "Бот проверяет публичные сообщения выбранных Telegram-источников. "
-        "Найденные события поступают администратору на ручную проверку. "
-        "Публикация в канал и уведомления подписчикам выполняются только "
-        "после подтверждения.\n\n"
-        f"Интервал проверки: {CHECK_INTERVAL} сек.\n"
-        f"Срок актуальности записи: {ALERT_TTL_HOURS} ч. "
-        "Истечение срока не означает отбоя.\n\n"
-        "Команды: /weather, /status, /sources, /stats, /archive, /health.",
-        reply_markup=keyboard(user.id if user else None)
-    )
-    try:
-        await message.reply_text(
-            await regional_alert_status(),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True
-        )
-    except Exception:
-        logger.exception("Ошибка формирования статуса при /start")
-
-
-async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    message = update.effective_message
-    if not user or not message:
-        return
-    subscribers.add(user.id)
-    save_state()
-    await message.reply_text(
-        "🔔 Подписка включена. Уведомления будут приходить после проверки "
-        "и подтверждения сообщения администратором.",
-        reply_markup=keyboard(user.id)
-    )
-
-
-async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    message = update.effective_message
-    if not user or not message:
-        return
-    subscribers.discard(user.id)
-    save_state()
-    await message.reply_text("🔕 Подписка отключена.", reply_markup=keyboard(user.id))
-
-
-def sources_text():
-    lines = [
-        "📡 Источники мониторинга",
-        "",
-        *[f"• {name}: https://t.me/{name}" for name, _ in SOURCES],
-        "",
-        "Новостная лента (без автопубликации):",
-        *[f"• {name}: https://t.me/v_kurse_kostroma" for name, _ in NEWS_SOURCES],
-        "",
-        "Telegram-каналы в списке — сторонние источники; бот не считает "
-        "их официальными государственными ресурсами.",
-        "Официальные ресурсы для самостоятельной сверки:",
-        *[f"• {name}: {url}" for name, url in OFFICIAL_SOURCES],
-    ]
-    return "\n".join(lines)
-
-
-def status_text():
-    errors = state.get("last_errors", {})
-    news_errors = state.get("news_last_errors", {})
-    lines = [
-        "🩺 UAV ALERT — диагностика",
-        f"Последний цикл: {state.get('last_scan') or 'ещё не завершён'}",
-        f"Интервал проверки: {CHECK_INTERVAL} сек.",
-        f"Срок актуальности: {ALERT_TTL_HOURS} ч.",
-        f"Подписчиков: {len(subscribers)}",
-        f"Источников сигналов: {len(SOURCES)}",
-        f"Новостных источников: {len(NEWS_SOURCES)}",
-        "Режим сигналов: ручное подтверждение администратором",
-        f"Ожидают проверки: {len(state.get('pending', {}))}",
-        f"Записей в архиве: {len(state.get('event_history', []))}",
-        f"Записей активных событий: {len(state.get('active_alerts', {}))}",
-        "",
-    ]
-    for name, url in SOURCES:
-        error = errors.get(url)
-        lines.append(f"• {name}: {'ошибка — ' + error if error else 'нет последней ошибки'}")
-    for name, url in NEWS_SOURCES:
-        error = news_errors.get(url)
-        lines.append(f"• Новости {name}: {'ошибка — ' + error if error else 'нет последней ошибки'}")
-    return "\n".join(lines)
-
-
-def weather_code_text(code):
-    mapping = {
-        0: "ясно", 1: "преимущественно ясно", 2: "переменная облачность",
-        3: "пасмурно", 45: "туман", 48: "изморозевый туман",
-        51: "слабая морось", 53: "морось", 55: "сильная морось",
-        56: "слабая ледяная морось", 57: "сильная ледяная морось",
-        61: "небольшой дождь", 63: "дождь", 65: "сильный дождь",
-        66: "слабый ледяной дождь", 67: "сильный ледяной дождь",
-        71: "небольшой снег", 73: "снег", 75: "сильный снег",
-        77: "снежные зёрна", 80: "ливневый дождь", 81: "ливень",
-        82: "сильный ливень", 85: "снегопад", 86: "сильный снегопад",
-        95: "гроза", 96: "гроза с небольшим градом", 99: "гроза с градом",
-    }
-    return mapping.get(code, "условия не определены")
-
-
-async def get_weather_text():
-    params = {
-        "latitude": KOSTROMA_LAT,
-        "longitude": KOSTROMA_LON,
-        "current": (
-            "temperature_2m,relative_humidity_2m,apparent_temperature,"
-            "weather_code,wind_speed_10m"
-        ),
-        "daily": (
-            "weather_code,temperature_2m_max,temperature_2m_min,"
-            "precipitation_probability_max"
-        ),
-        "forecast_days": 2,
-        "timezone": "Europe/Moscow",
-    }
-    response = await asyncio.to_thread(
-        lambda: requests.get(WEATHER_URL, params=params, timeout=REQUEST_TIMEOUT)
-    )
-    response.raise_for_status()
-    data = response.json()
-    current, daily = data["current"], data["daily"]
-    today, tomorrow = daily["time"][0], daily["time"][1]
-
-    return (
-        "🌦 <b>Погода — Кострома</b>\n"
-        f"Сейчас: {current['temperature_2m']:+.1f} °C, "
-        f"{weather_code_text(current['weather_code'])}\n"
-        f"Ощущается как: {current['apparent_temperature']:+.1f} °C\n"
-        f"Влажность: {current['relative_humidity_2m']}%, "
-        f"ветер: {current['wind_speed_10m']} км/ч\n\n"
-        f"Сегодня ({today}): {weather_code_text(daily['weather_code'][0])}, "
-        f"{daily['temperature_2m_min'][0]:+.0f}…{daily['temperature_2m_max'][0]:+.0f} °C, "
-        f"вероятность осадков до {daily['precipitation_probability_max'][0]}%\n"
-        f"Завтра ({tomorrow}): {weather_code_text(daily['weather_code'][1])}, "
-        f"{daily['temperature_2m_min'][1]:+.0f}…{daily['temperature_2m_max'][1]:+.0f} °C, "
-        f"вероятность осадков до {daily['precipitation_probability_max'][1]}%\n\n"
-        "Источник: Open-Meteo. Прогноз может обновляться."
-    )
-
-
-async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.effective_message.reply_text(
-            await get_weather_text(), parse_mode=ParseMode.HTML
-        )
-    except Exception:
-        logger.exception("Ошибка получения погоды")
-        await update.effective_message.reply_text(
-            "Не удалось получить прогноз погоды для Костромы. Попробуй позже."
-        )
-
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_message:
-        await update.effective_message.reply_text(status_text())
-
-
-async def sources_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_message:
-        await update.effective_message.reply_text(
-            sources_text(), disable_web_page_preview=True
-        )
-
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_message:
-        await update.effective_message.reply_text(
-            stats_text(), parse_mode=ParseMode.HTML
-        )
-
-
-async def archive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_message:
-        await update.effective_message.reply_text(
-            archive_text(), parse_mode=ParseMode.HTML
-        )
-
-
-async def news_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_message:
-        return
-    items = state.get("news_history", [])[-10:]
-    if not items:
-        await update.effective_message.reply_text(
-            "📰 Пока нет сохранённых региональных новостей. "
-            "Оперативные сообщения о БПЛА не пересылаются в эту ленту."
-        )
-        return
-    lines = ["📰 <b>Последние региональные новости</b>", ""]
-    for item in reversed(items):
-        lines.append(
-            f"• {html.escape(item.get('source', 'источник'))}: "
-            f"{html.escape((item.get('text') or '')[:250])}\n"
-            f'<a href="{html.escape(item.get("url", ""), quote=True)}">Открыть источник</a>'
-        )
-    await update.effective_message.reply_text(
-        "\n\n".join(lines), parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True
-    )
-
-
-async def admin_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or update.effective_user.id != ADMIN_ID:
-        if update.effective_message:
-            await update.effective_message.reply_text("⛔ Команда только для администратора.")
-        return
-    await update.effective_message.reply_text(status_text())
-
-
-async def admin_center_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or update.effective_user.id != ADMIN_ID:
-        await update.effective_message.reply_text("⛔ Команда только для администратора.")
-        return
-    await update.effective_message.reply_text(
-        admin_center_text(), parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("📊 Статистика", callback_data="stats"),
-            InlineKeyboardButton("🗂 Архив", callback_data="archive"),
-        ]])
-    )
-
-
-async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Включает разовый режим анализа текста для администратора."""
-    message = update.effective_message
-    user = update.effective_user
-    if not message or not user or user.id != ADMIN_ID:
-        if message:
-            await message.reply_text("⛔ Команда только для администратора.")
-        return
-
-    if context.args:
-        material = " ".join(context.args).strip()
-        await _run_ai_analysis(message, material, user.id)
-        return
-
-    context.user_data["uav_ai_waiting_text"] = True
-    await message.reply_text(
-        "🧠 Режим AI-проверки включён.\n"
-        "Отправьте следующим сообщением текст публикации.\n\n"
-        "Это отдельный режим: сообщение будет передано только на анализ ИИ "
-        "и не запустит обычную классификацию событий. Для отмены отправьте /cancel_ai."
-    )
-
-
-async def _run_ai_analysis(message, material, user_id):
-    if not material or not material.strip():
-        await message.reply_text("Пришлите непустой текст для анализа.")
-        return
-    status_message = await message.reply_text("🧠 Анализирую материал. Это может занять некоторое время...")
-    try:
-        result = await analyze_text(
-            material,
-            source="Ручная отправка администратором",
-            user_id=user_id,
-        )
-        # Оставляем запас до лимита Telegram.
-        result = result[:3800]
-        await status_message.edit_text(
-            "🧠 <b>Предварительный AI-анализ</b>\n\n" + html.escape(result),
-            parse_mode=ParseMode.HTML,
-        )
-    except AIProviderError as exc:
-        await status_message.edit_text("⚠️ " + html.escape(str(exc)), parse_mode=ParseMode.HTML)
-    except Exception:
-        logger.exception("Ошибка AI-анализа")
-        await status_message.edit_text("⚠️ Не удалось выполнить AI-анализ. Подробности сохранены в журнале сервера.")
-
-
-async def ai_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or update.effective_user.id != ADMIN_ID:
-        if update.effective_message:
-            await update.effective_message.reply_text("⛔ Команда только для администратора.")
-        return
-    await update.effective_message.reply_text(ai_status_text(), parse_mode=ParseMode.HTML)
-
-
-async def ai_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or update.effective_user.id != ADMIN_ID:
-        if update.effective_message:
-            await update.effective_message.reply_text("⛔ Команда только для администратора.")
-        return
-    await update.effective_message.reply_text(ai_history_text(), parse_mode=ParseMode.HTML)
-
-
-async def cancel_ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("uav_ai_waiting_text", None)
-    if update.effective_message:
-        await update.effective_message.reply_text("Режим AI-проверки отменён.")
-
-
-async def incoming_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручная передача текста администратором для классификации и проверки."""
-    message = update.effective_message
-    user = update.effective_user
-    if not message or not user or user.id != ADMIN_ID or not message.text:
-        return
-
-    if context.user_data.pop("uav_ai_waiting_text", False):
-        await _run_ai_analysis(message, message.text.strip(), user.id)
-        return
-
-    text = message.text.strip()
-    if not mentions_kostroma(text):
-        return
-    result = classify(text)
-    if not result:
-        return
-    kind, label = result
-    await send_event(
-        context.application, kind, label,
-        "Текст, переданный администратором",
-        "https://44.mchs.gov.ru/",
-        text, now_msk().isoformat(timespec="minutes")
-    )
-
-
-async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-    data = query.data or ""
-
-    if data.startswith("approve:"):
-        await approve_event(query, context, data.split(":", 1)[1])
-        return
-    if data.startswith("reject:"):
-        await reject_event(query, data.split(":", 1)[1])
-        return
-
-    user_id = query.from_user.id
-    if data in {"ai_menu", "ai_history", "ai_start"} and user_id != ADMIN_ID:
-        await query.answer("Только для администратора.", show_alert=True)
-        return
-    if data == "ai_menu":
-        await query.answer()
-        await query.edit_message_text(
-            ai_status_text() + "\n\nКоманды: /ai, /ai_status, /ai_history.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔍 Анализировать текст", callback_data="ai_start")],
-                [InlineKeyboardButton("🗂 История анализов", callback_data="ai_history")],
-                [InlineKeyboardButton("↩️ В главное меню", callback_data="admin_center")],
-            ]),
-        )
-        return
-    if data == "ai_history":
-        await query.answer()
-        await query.edit_message_text(
-            ai_history_text(), parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("↩️ К AI", callback_data="ai_menu")
-            ]]),
-        )
-        return
-    if data == "ai_start":
-        await query.answer()
-        # Callback user_data доступен через context; следующий текст уйдёт в AI.
-        context.user_data["uav_ai_waiting_text"] = True
-        await query.message.reply_text(
-            "🧠 Отправьте следующим сообщением текст для предварительного AI-анализа. "
-            "Для отмены используйте /cancel_ai."
-        )
-        return
-    if data == "admin_center" and user_id != ADMIN_ID:
-        await query.answer("Только для администратора.", show_alert=True)
-        return
-
-    await query.answer()
-
-    if data == "subscribe":
-        subscribers.add(user_id)
-        save_state()
-        text = "🔔 Подписка включена. Уведомления приходят после проверки администратором."
-    elif data == "unsubscribe":
-        subscribers.discard(user_id)
-        save_state()
-        text = "🔕 Подписка отключена."
-    elif data == "sources":
-        text = sources_text()
-    elif data == "status":
-        text = status_text()
-    elif data == "stats":
-        text = stats_text()
-    elif data == "archive":
-        text = archive_text()
-    elif data == "news":
-        items = state.get("news_history", [])[-8:]
-        if items:
-            text = "📰 <b>Последние региональные новости</b>\n\n" + "\n\n".join(
-                f"• {html.escape(x.get('source', 'источник'))}: "
-                f"{html.escape((x.get('text') or '')[:220])}\n"
-                f'<a href="{html.escape(x.get("url", ""), quote=True)}">Открыть</a>'
-                for x in reversed(items)
-            )
-        else:
-            text = "📰 Сохранённых новостей пока нет."
-    elif data == "weather":
-        try:
-            text = await get_weather_text()
-        except Exception:
-            logger.exception("Ошибка погоды из меню")
-            text = "Не удалось получить погоду. Попробуйте позже."
-    elif data == "admin_center":
-        text = admin_center_text()
-    else:
-        text = "Неизвестная команда."
-
-    try:
-        await query.edit_message_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard(user_id),
-            disable_web_page_preview=True
-        )
-    except BadRequest:
-        if query.message:
-            await query.message.reply_text(
-                text, parse_mode=ParseMode.HTML,
-                reply_markup=keyboard(user_id),
-                disable_web_page_preview=True
-            )
-
-
-async def post_init(application: Application):
-    global monitor_task
-
-    await application.bot.set_my_commands([
-        BotCommand("start", "Главное меню"),
-        BotCommand("subscribe", "Подписаться"),
-        BotCommand("unsubscribe", "Отписаться"),
-        BotCommand("status", "Статус мониторинга"),
-        BotCommand("weather", "Погода в Костроме"),
-        BotCommand("sources", "Список источников"),
-        BotCommand("stats", "Статистика за 24 часа"),
-        BotCommand("archive", "Архив событий"),
-        BotCommand("news", "Региональные новости"),
-        BotCommand("center", "Центр событий администратора"),
-        BotCommand("health", "Диагностика администратора"),
-        BotCommand("ai", "AI-анализ текста (администратор)"),
-        BotCommand("ai_status", "Статус AI-модуля (администратор)"),
-        BotCommand("ai_history", "История AI-анализов (администратор)"),
-        BotCommand("cancel_ai", "Отменить режим AI-анализа"),
-    ])
-
-    try:
-        await application.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                "🟢 UAV ALERT запущен.\n"
-                f"Источников сигналов: {len(SOURCES)}\n"
-                f"Интервал проверки: {CHECK_INTERVAL} сек.\n"
-                f"Срок актуальности записи: {ALERT_TTL_HOURS} ч.\n"
-                "Режим: все найденные события поступают администратору "
-                "на ручное подтверждение; автоматической публикации нет."
-            ),
-        )
-    except TelegramError:
-        logger.exception("Не удалось отправить сообщение о запуске администратору")
-
-    monitor_task = asyncio.create_task(monitor_loop(application))
-
-
-async def post_shutdown(application: Application):
-    global monitor_task
-    if monitor_task and not monitor_task.done():
-        monitor_task.cancel()
-        try:
-            await monitor_task
-        except asyncio.CancelledError:
-            pass
-
-
-web_app = Flask(__name__)
-
-
-@web_app.get("/")
-def index():
-    return jsonify({
-        "service": "UAV ALERT",
-        "status": "running",
-        "last_scan": state.get("last_scan"),
-        "pending_events": len(state.get("pending", {})),
-    })
-
-
-@web_app.get("/status")
-def health():
-    return jsonify({
-        "status": "ok",
-        "last_scan": state.get("last_scan"),
-        "sources": len(SOURCES),
-        "news_sources": len(NEWS_SOURCES),
-        "news_errors": state.get("news_last_errors", {}),
-        "errors": state.get("last_errors", {}),
-        "ttl_hours": ALERT_TTL_HOURS,
-        "pending_events": len(state.get("pending", {})),
-        "subscribers": len(subscribers),
-        "archive_records": len(state.get("event_history", [])),
-    })
-
-
-def run_flask():
-    web_app.run(host="0.0.0.0", port=PORT, use_reloader=False)
-
-
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("Укажи BOT_TOKEN в переменных окружения хостинга.")
-
-    threading.Thread(
-        target=run_flask,
-        daemon=True,
-        name="uav-alert-health"
-    ).start()
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("subscribe", subscribe))
-    application.add_handler(CommandHandler("unsubscribe", unsubscribe))
-    application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("weather", weather_command))
-    application.add_handler(CommandHandler("sources", sources_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CommandHandler("archive", archive_command))
-    application.add_handler(CommandHandler("news", news_command))
-    application.add_handler(CommandHandler("center", admin_center_command))
-    application.add_handler(CommandHandler("health", admin_health))
-    application.add_handler(CommandHandler("ai", ai_command))
-    application.add_handler(CommandHandler("ai_status", ai_status_command))
-    application.add_handler(CommandHandler("ai_history", ai_history_command))
-    application.add_handler(CommandHandler("cancel_ai", cancel_ai_command))
-
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, incoming_text)
-    )
-    application.add_handler(CallbackQueryHandler(callback))
-
-    application.run_polling(
-        drop_pending_updates=False,
-        allowed_updates=Update.ALL_TYPES
-    )
-
-
-if __name__ == "__main__":
-    main()
