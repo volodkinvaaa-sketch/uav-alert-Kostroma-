@@ -1053,9 +1053,10 @@ async def send_backfill_notice(
 ):
     title, category = event_title(kind)
     region_name = REGIONS[region_id]["name"]
+    display_region = region_name.replace("область", "Область")
 
     draft = (
-        "🛰 <b>UAV ALERT — архивная информация</b>\n"
+        f"🛰 <b>UAV ALERT | {html.escape(display_region)}</b>\n"
         f"📍 Регион: {html.escape(region_name)}\n\n"
         f"{html.escape(title)}\n"
         f"Категория: {html.escape(category)}\n"
@@ -1068,11 +1069,12 @@ async def send_backfill_notice(
         "подтверждением текущего статуса.</i>"
     )
 
-    await application.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=draft,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
+    await send_text_or_photo(
+        application.bot,
+        ADMIN_ID,
+        draft,
+        is_cancel=event_is_cancel(kind),
+        kind=kind,
     )
 
 
