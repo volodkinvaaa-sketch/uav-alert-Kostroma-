@@ -375,6 +375,7 @@ DEFAULT_STATE = {
     "event_history": [],
     "news_history": [],
     "manual_drafts": {},
+    "archive_drafts": {},
     "last_scan": None,
 }
 
@@ -1072,12 +1073,40 @@ async def send_backfill_notice(
         "подтверждением текущего статуса.</i>"
     )
 
+    # Save the historical item as a separate, manually publishable draft.
+    # Keep the historical disclaimer in the text when it is published.
+    archive_id = hashlib.sha256(
+        f"archive|{region_id}|{post.get('key', '')}|{post.get('published_at', '')}|{kind}".encode("utf-8")
+    ).hexdigest()[:16]
+    state.setdefault("archive_drafts", {})[archive_id] = {
+        "region_id": region_id,
+        "kind": kind,
+        "message": draft,
+        "created_at": now_msk().isoformat(timespec="seconds"),
+    }
+    archive_queue = state["archive_drafts"]
+    while len(archive_queue) > 200:
+        archive_queue.pop(next(iter(archive_queue)))
+    save_state()
+
+    archive_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"📢 Опубликовать в канал {region_name}",
+            callback_data=f"archive_publish:{archive_id}",
+        )],
+        [InlineKeyboardButton(
+            "🗑 Удалить из очереди архива",
+            callback_data=f"archive_discard:{archive_id}",
+        )],
+    ])
+
     await send_text_or_photo(
         application.bot,
         ADMIN_ID,
         draft,
         is_cancel=event_is_cancel(kind),
         kind=kind,
+        reply_markup=archive_keyboard,
     )
 
 
@@ -1910,6 +1939,68 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Следите за официальными оповещениями и инструкциями "
             "экстренных служб."
         )
+        return
+
+    if data.startswith("archive_publish:"):
+        if query.from_user.id != ADMIN_ID:
+            await query.answer("Доступ запрещён.", show_alert=True)
+            return
+        archive_id = data.split(":", 1)[1]
+        archive_item = state.get("archive_drafts", {}).get(archive_id)
+        if not archive_item:
+            await query.answer("Архивная запись не найдена или уже обработана.", show_alert=True)
+            return
+
+        region_id = archive_item.get("region_id", "kostroma")
+        if region_id not in REGIONS:
+            await query.answer("Неизвестный регион.", show_alert=True)
+            return
+        channel_id = REGIONS[region_id]["channel"]
+        if not channel_id:
+            await query.answer("Не задан канал для этого региона.", show_alert=True)
+            return
+
+        try:
+            await send_text_or_photo(
+                context.bot,
+                channel_id,
+                archive_item["message"],
+                is_cancel=event_is_cancel(archive_item.get("kind")),
+                kind=archive_item.get("kind"),
+            )
+        except TelegramError:
+            logger.exception("Ошибка публикации архивной записи в канал %s", channel_id)
+            await query.answer("Не удалось опубликовать архив. Проверь права бота и наличие фотографии.", show_alert=True)
+            return
+
+        state["archive_drafts"].pop(archive_id, None)
+        save_state()
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except (BadRequest, TelegramError):
+            pass
+        await query.message.reply_text(
+            "✅ Архивная запись опубликована в канал "
+            f"{html.escape(REGIONS[region_id]['name'])}.\n"
+            "В публикации сохранена пометка, что это историческая информация."
+        )
+        await query.answer("Архив опубликован!")
+        return
+
+    if data.startswith("archive_discard:"):
+        if query.from_user.id != ADMIN_ID:
+            await query.answer("Доступ запрещён.", show_alert=True)
+            return
+        archive_id = data.split(":", 1)[1]
+        if state.get("archive_drafts", {}).pop(archive_id, None) is None:
+            await query.answer("Архивная запись уже обработана.", show_alert=True)
+            return
+        save_state()
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except (BadRequest, TelegramError):
+            pass
+        await query.answer("Удалено из очереди архива.")
         return
 
     if data.startswith("approve:"):
