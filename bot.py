@@ -760,10 +760,11 @@ async def send_text_or_photo(
 # MODERATION, EVENT HISTORY AND SUBSCRIBER NOTIFICATIONS
 # ============================================================
 
-def moderation_keyboard(pending_id):
+def moderation_keyboard(pending_id, region_id):
+    region = REGIONS.get(region_id, REGIONS["kostroma"])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
-            "✅ Подтвердить и опубликовать",
+            f"📢 Опубликовать в канал {region['name']}",
             callback_data=f"approve:{pending_id}",
         )],
         [InlineKeyboardButton(
@@ -927,7 +928,7 @@ async def send_event(
             admin_message,
             is_cancel=event_is_cancel(kind),
             kind=kind,
-            reply_markup=moderation_keyboard(pending_id),
+            reply_markup=moderation_keyboard(pending_id, region_id),
         )
         logger.info(
             "Событие добавлено в очередь: region=%s id=%s",
@@ -994,18 +995,20 @@ async def approve_event(query, context, pending_id):
         item["kind"],
     )
 
+    # Remove the publish button from the original moderation message.
+    # The original message may contain a photo, so do not use edit_message_text.
     try:
-        await query.edit_message_text(
-            "✅ <b>Событие опубликовано</b>\n"
-            f"Канал: {html.escape(REGIONS[region_id]['name'])}\n\n"
-            f"{item['message']}\n\n"
-            f"Уведомлено подписчиков: "
-            f"{len(subscribers.get(region_id, set())) - len(failed)}.",
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+        await query.edit_message_reply_markup(reply_markup=None)
     except (BadRequest, TelegramError):
         pass
+
+    await query.message.reply_text(
+        "✅ <b>Событие опубликовано</b>\n"
+        f"Канал: {html.escape(REGIONS[region_id]['name'])}\n"
+        f"Уведомлено подписчиков: "
+        f"{len(subscribers.get(region_id, set())) - len(failed)}.",
+        parse_mode=ParseMode.HTML,
+    )
 
     await query.answer("Опубликовано!")
 
@@ -1610,7 +1613,7 @@ async def show_admin_center(query, context):
             text=message,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
-            reply_markup=moderation_keyboard(pending_id),
+            reply_markup=moderation_keyboard(pending_id, item.get("region_id", "kostroma")),
         )
     await query.answer()
 
