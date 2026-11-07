@@ -654,6 +654,7 @@ def source_posts(source_url, max_pages=1, cutoff=None):
 # ============================================================
 
 def event_image_path(kind):
+    """Return the exact image for an event; missing event images stay text-only."""
     paths = {
         "attention": UAV_ATTENTION_IMAGE,
         "threat": UAV_DANGER_IMAGE,
@@ -664,15 +665,12 @@ def event_image_path(kind):
         "rocket_danger": ROCKET_DANGER_IMAGE,
         "rocket_cancel": ROCKET_CANCEL_IMAGE,
     }
-    path = paths.get(kind)
-    if path and os.path.isfile(path):
-        return path
+    if kind in paths:
+        path = paths[kind]
+        return path if os.path.isfile(path) else None
 
-    fallback = (
-        LEGACY_CLEAR_IMAGE
-        if event_is_cancel(kind)
-        else LEGACY_DANGER_IMAGE
-    )
+    # Legacy fallback is retained only for older, unclassified message types.
+    fallback = LEGACY_CLEAR_IMAGE if event_is_cancel(kind) else LEGACY_DANGER_IMAGE
     return fallback if os.path.isfile(fallback) else None
 
 
@@ -713,40 +711,43 @@ async def send_text_or_photo(
     message,
     is_cancel=False,
     kind=None,
+    reply_markup=None,
 ):
+    """Send the matching event photo and text; fall back to text on photo errors."""
     image_path = (
         event_image_path(kind)
         if kind
-        else (
-            LEGACY_CLEAR_IMAGE if is_cancel else LEGACY_DANGER_IMAGE
-        )
+        else (LEGACY_CLEAR_IMAGE if is_cancel else LEGACY_DANGER_IMAGE)
     )
 
     if image_path and os.path.isfile(image_path):
         if len(message) <= 1024:
-            with open(image_path, "rb") as photo:
-                await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=photo,
-                    caption=message,
-                    parse_mode=ParseMode.HTML,
-                )
+            try:
+                with open(image_path, "rb") as photo:
+                    await bot.send_photo(
+                        chat_id=chat_id,
+                        photo=photo,
+                        caption=message,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=reply_markup,
+                    )
+                return
+            except (TelegramError, OSError):
+                logger.exception("Не удалось отправить фото события; отправляю текст")
         else:
-            with open(image_path, "rb") as photo:
-                await bot.send_photo(chat_id=chat_id, photo=photo)
-            await bot.send_message(
-                chat_id=chat_id,
-                text=message,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-    else:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=message,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+            try:
+                with open(image_path, "rb") as photo:
+                    await bot.send_photo(chat_id=chat_id, photo=photo)
+            except (TelegramError, OSError):
+                logger.exception("Не удалось отправить фото события; отправляю текст")
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=message,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=reply_markup,
+    )
 
 
 # ============================================================
@@ -914,11 +915,12 @@ async def send_event(
     )
 
     try:
-        await application.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=admin_message,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+        await send_text_or_photo(
+            application.bot,
+            ADMIN_ID,
+            admin_message,
+            is_cancel=event_is_cancel(kind),
+            kind=kind,
             reply_markup=moderation_keyboard(pending_id),
         )
         logger.info(
@@ -987,15 +989,24 @@ async def approve_event(query, context, pending_id):
     )
 
     try:
-        await query.edit_message_text(
+        result_text = (
             "✅ <b>Событие опубликовано</b>\n"
             f"Канал: {html.escape(REGIONS[region_id]['name'])}\n\n"
             f"{item['message']}\n\n"
             f"Уведомлено подписчиков: "
-            f"{len(subscribers.get(region_id, set())) - len(failed)}.",
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+            f"{len(subscribers.get(region_id, set())) - len(failed)}."
         )
+        if getattr(query.message, "photo", None):
+            await query.edit_message_caption(
+                caption=result_text[:1024],
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await query.edit_message_text(
+                result_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
     except (BadRequest, TelegramError):
         pass
 
