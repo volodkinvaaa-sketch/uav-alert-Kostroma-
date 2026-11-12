@@ -44,9 +44,6 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "1421675956"))
 KOSTROMA_CHANNEL_ID = os.getenv(
     "CHANNEL_ID", "@RADAR_Kostroma"
 ).strip()
-IVANOVO_CHANNEL_ID = os.getenv(
-    "IVANOVO_CHANNEL_ID", "@RADAR_Ivanova"
-).strip()
 
 PORT = int(os.getenv("PORT", "10000"))
 CHECK_INTERVAL = max(30, int(os.getenv("CHECK_INTERVAL", "60")))
@@ -140,33 +137,7 @@ REGIONS = {
             ("МЧС России", "https://mchs.gov.ru/"),
         ],
     },
-    "ivanovo": {
-        "name": "Ивановская область",
-        "short": "Иваново",
-        "channel": IVANOVO_CHANNEL_ID,
-        "latitude": 56.9972,
-        "longitude": 40.9714,
-        "terms": [
-            "иванов", "кинеш", "шуя", "тейков",
-            "фурманов", "родник", "комсомольск",
-            "пучеж", "заволж", "южа", "палех",
-            "юрьевец", "приволж", "волгоречен",  # kept only as a text term if explicitly mentioned
-            "гавай", "лух", "верхний ландех",
-            "ивановский район", "шуйский район",
-            "кинешma",
-        ],
-        "alert_sources": COMMON_ALERT_SOURCES + [
-            ("Правительство Ивановской области", "https://t.me/s/ivanovoobl"),
-        ],
-        "news_sources": [
-            ("Ивтелерадио", "https://t.me/s/ivteleradio"),
-        ],
-        "official_sources": [
-            ("МЧС России по Ивановской области", "https://37.mchs.gov.ru/"),
-            ("Правительство Ивановской области", "https://ivanovoobl.ru/"),
-            ("МЧС России", "https://mchs.gov.ru/"),
-        ],
-    },
+
 }
 
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
@@ -386,7 +357,7 @@ for key, default in DEFAULT_STATE.items():
 old_active = state.get("active_alerts", {})
 if isinstance(old_active, dict) and old_active:
     if not set(old_active).issubset(set(REGIONS)):
-        state["active_alerts"] = {"kostroma": old_active, "ivanovo": {}}
+        state["active_alerts"] = {"kostroma": old_active}
 for region_id in REGIONS:
     state.setdefault("active_alerts", {}).setdefault(region_id, {})
 
@@ -1362,21 +1333,11 @@ def build_region_keyboard():
                 "🔔 Костромская область",
                 callback_data="subscribe:kostroma",
             ),
-            InlineKeyboardButton(
-                "🔔 Ивановская область",
-                callback_data="subscribe:ivanovo",
-            ),
         ],
         [
             InlineKeyboardButton(
                 "📊 Статус Костромской области",
                 callback_data="status:kostroma",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "📊 Статус Ивановской области",
-                callback_data="status:ivanovo",
             ),
         ],
         [
@@ -1424,10 +1385,6 @@ async def subscribe_region(update_or_query, region_id):
 
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     region_id = "kostroma"
-    if context.args:
-        arg = context.args[0].strip().lower()
-        if arg in ("ivanovo", "иваново", "ивановская"):
-            region_id = "ivanovo"
     if not await subscribe_region(update, region_id):
         return
     await update.message.reply_text(
@@ -1443,11 +1400,7 @@ async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if context.args:
         arg = context.args[0].strip().lower()
-        region_id = (
-            "ivanovo"
-            if arg in ("ivanovo", "иваново", "ивановская")
-            else "kostroma"
-        )
+        region_id = "kostroma"
         subscribers.setdefault(region_id, set()).discard(user.id)
         save_state()
         await update.message.reply_text(
@@ -1470,10 +1423,6 @@ async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     region_id = "kostroma"
-    if context.args and context.args[0].lower() in (
-        "ivanovo", "иваново", "ивановская"
-    ):
-        region_id = "ivanovo"
     await update.message.reply_text(
         build_status_text(region_id),
         parse_mode=ParseMode.HTML,
@@ -1482,10 +1431,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     region_id = "kostroma"
-    if context.args and context.args[0].lower() in (
-        "ivanovo", "иваново", "ивановская"
-    ):
-        region_id = "ivanovo"
 
     history = [
         item for item in state.get("event_history", [])
@@ -1571,11 +1516,6 @@ async def sources_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(
             f'• <a href="{html.escape(url, quote=True)}">{html.escape(name)}</a>'
         )
-    lines.extend(["", "Ивановская область:"])
-    for name, url in REGIONS["ivanovo"]["official_sources"]:
-        lines.append(
-            f'• <a href="{html.escape(url, quote=True)}">{html.escape(name)}</a>'
-        )
     lines.extend([
         "",
         "Ссылки приведены для ручной сверки. Бот не получает "
@@ -1656,8 +1596,7 @@ async def publish_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(args) < 2:
         await update.message.reply_text(
             "Использование:\n"
-            "/publish kostroma текст сообщения\n"
-            "/publish ivanovo текст сообщения\n\n"
+            "/publish kostroma текст сообщения\n\n"
             "Бот сначала покажет предпросмотр. В канал сообщение "
             "уйдёт только после нажатия кнопки подтверждения."
         )
@@ -1666,7 +1605,7 @@ async def publish_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     region_id = args[0].lower()
     if region_id not in REGIONS:
         await update.message.reply_text(
-            "Укажи регион: kostroma или ivanovo."
+            "Доступный регион: kostroma."
         )
         return
 
@@ -1792,10 +1731,6 @@ def get_weather(region_id):
 
 async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     region_id = "kostroma"
-    if context.args and context.args[0].lower() in (
-        "ivanovo", "иваново", "ивановская"
-    ):
-        region_id = "ivanovo"
 
     try:
         data = await asyncio.to_thread(get_weather, region_id)
@@ -2082,8 +2017,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         await query.message.reply_text(
             "Для ручной публикации отправь команду:\n\n"
-            "/publish kostroma текст сообщения\n"
-            "/publish ivanovo текст сообщения\n\n"
+            "/publish kostroma текст сообщения\n\n"
             "Я покажу предпросмотр и кнопку «Опубликовать в канал»."
         )
         return
@@ -2158,11 +2092,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application):
     commands = [
         BotCommand("start", "Главное меню"),
-        BotCommand("subscribe", "Подписаться: /subscribe kostroma или ivanovo"),
+        BotCommand("subscribe", "Подписаться на Костромскую область"),
         BotCommand("unsubscribe", "Отписаться"),
-        BotCommand("status", "Статус: /status kostroma или ivanovo"),
-        BotCommand("weather", "Погода: /weather kostroma или ivanovo"),
-        BotCommand("history", "История: /history kostroma или ivanovo"),
+        BotCommand("status", "Статус Костромской области"),
+        BotCommand("weather", "Погода в Костромской области"),
+        BotCommand("history", "История Костромской области"),
         BotCommand("sources", "Официальные ресурсы"),
         BotCommand("admin", "Панель администратора"),
         BotCommand("stats", "Статистика"),
