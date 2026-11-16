@@ -141,6 +141,7 @@ REGIONS = {
             ("В курсе Кострома", "https://t.me/s/v_kurse_kostroma"),
         ],
         "official_sources": [
+            ("РСЧС Костромская область (MAX)", "https://max.ru/id4401138469_gos2"),
             ("МЧС России по Костромской области", "https://44.mchs.gov.ru/"),
             ("Администрация Костромской области", "https://adm44.ru/"),
             ("МЧС России", "https://mchs.gov.ru/"),
