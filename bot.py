@@ -45,6 +45,9 @@ KOSTROMA_CHANNEL_ID = os.getenv(
     "CHANNEL_ID", "@RADAR_Kostroma"
 ).strip()
 
+# Public link appended to alert/cancellation publications.
+PUBLIC_CHANNEL_LINK = "https://t.me/RADAR_kostroma"
+
 PORT = int(os.getenv("PORT", "10000"))
 CHECK_INTERVAL = max(30, int(os.getenv("CHECK_INTERVAL", "60")))
 REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "15")))
@@ -695,6 +698,7 @@ def event_message(
         f"Категория: {html.escape(category)}\n"
         f"Время исходного сообщения: {stamp}\n\n"
         f'📡 <b>Источник:</b> <a href="{safe_url}">{safe_source}</a>\n\n'
+        f'📢 <a href="{html.escape(PUBLIC_CHANNEL_LINK, quote=True)}">Канал UAV ALERT</a>\n\n'
         "⚠️ Сообщение получено из стороннего источника и "
         "не является самостоятельным подтверждением угрозы. "
         "Сверяйте информацию с официальными оповещениями "
@@ -1063,6 +1067,7 @@ async def send_backfill_notice(
         "Время исходного сообщения: "
         f"{html.escape(format_event_time(post.get('published_at')))}\n\n"
         f"Источник: {html.escape(name)}\n\n"
+        f'📢 <a href="{html.escape(PUBLIC_CHANNEL_LINK, quote=True)}">Канал UAV ALERT</a>\n\n'
         "⚠️ Информация получена из стороннего источника. "
         "Сверяйте её с официальными оповещениями.\n\n"
         "<i>Историческая информация. Не является "
@@ -2066,6 +2071,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "🛰 <b>UAV ALERT</b>\n"
                     f"📍 {html.escape(REGIONS[region_id]['name'])}\n\n"
                     f"{html.escape(draft['text'])}\n\n"
+                    f'📢 <a href="{html.escape(PUBLIC_CHANNEL_LINK, quote=True)}">Канал UAV ALERT</a>\n\n'
                     "<i>UAV ALERT не является официальным источником. "
                     "Сверяйте важную информацию с МЧС, РСЧС и органами власти.</i>"
                 ),
