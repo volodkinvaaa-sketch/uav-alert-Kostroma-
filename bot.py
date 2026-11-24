@@ -45,9 +45,6 @@ KOSTROMA_CHANNEL_ID = os.getenv(
     "CHANNEL_ID", "@RADAR_Kostroma"
 ).strip()
 
-# Public link appended to alert/cancellation publications.
-PUBLIC_CHANNEL_LINK = "https://t.me/RADAR_kostroma"
-
 PORT = int(os.getenv("PORT", "10000"))
 CHECK_INTERVAL = max(30, int(os.getenv("CHECK_INTERVAL", "60")))
 REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "15")))
@@ -360,11 +357,16 @@ DEFAULT_STATE = {
     "news_history": [],
     "manual_drafts": {},
     "archive_drafts": {},
+    "sleep_news_queue": [],
     "last_scan": None,
+    "work_mode": "awake",
 }
 
 for key, default in DEFAULT_STATE.items():
     state.setdefault(key, default)
+
+if state.get("work_mode") not in {"awake", "sleep"}:
+    state["work_mode"] = "awake"
 
 # Keep old one-region event records under Kostroma when possible.
 old_active = state.get("active_alerts", {})
@@ -698,7 +700,6 @@ def event_message(
         f"Категория: {html.escape(category)}\n"
         f"Время исходного сообщения: {stamp}\n\n"
         f'📡 <b>Источник:</b> <a href="{safe_url}">{safe_source}</a>\n\n'
-        f'📢 <a href="{html.escape(PUBLIC_CHANNEL_LINK, quote=True)}">Канал UAV ALERT</a>\n\n'
         "⚠️ Сообщение получено из стороннего источника и "
         "не является самостоятельным подтверждением угрозы. "
         "Сверяйте информацию с официальными оповещениями "
@@ -914,6 +915,18 @@ async def send_event(
     state["pending"][pending_id] = item
     save_state()
 
+    # В режиме сна события только копятся в очереди: бот не будит
+    # администратора отдельными уведомлениями и ничего не публикует сам.
+    item["admin_notified"] = False
+    save_state()
+
+    if state.get("work_mode", "awake") == "sleep":
+        logger.info(
+            "Событие сохранено до пробуждения: region=%s id=%s",
+            region_id, pending_id,
+        )
+        return
+
     admin_message = (
         "🛡 <b>Новое событие — требуется проверка</b>\n\n"
         f"{item['message']}"
@@ -931,6 +944,8 @@ async def send_event(
             kind=kind,
             reply_markup=moderation_keyboard(pending_id, region_id),
         )
+        item["admin_notified"] = True
+        save_state()
         logger.info(
             "Событие добавлено в очередь: region=%s id=%s",
             region_id, pending_id,
@@ -1067,7 +1082,6 @@ async def send_backfill_notice(
         "Время исходного сообщения: "
         f"{html.escape(format_event_time(post.get('published_at')))}\n\n"
         f"Источник: {html.escape(name)}\n\n"
-        f'📢 <a href="{html.escape(PUBLIC_CHANNEL_LINK, quote=True)}">Канал UAV ALERT</a>\n\n'
         "⚠️ Информация получена из стороннего источника. "
         "Сверяйте её с официальными оповещениями.\n\n"
         "<i>Историческая информация. Не является "
@@ -1084,6 +1098,7 @@ async def send_backfill_notice(
         "kind": kind,
         "message": draft,
         "created_at": now_msk().isoformat(timespec="seconds"),
+        "admin_notified": False,
     }
     archive_queue = state["archive_drafts"]
     while len(archive_queue) > 200:
@@ -1101,6 +1116,10 @@ async def send_backfill_notice(
         )],
     ])
 
+    if state.get("work_mode", "awake") == "sleep":
+        logger.info("Архивное событие сохранено до пробуждения: %s", archive_id)
+        return
+
     await send_text_or_photo(
         application.bot,
         ADMIN_ID,
@@ -1109,6 +1128,8 @@ async def send_backfill_notice(
         kind=kind,
         reply_markup=archive_keyboard,
     )
+    state["archive_drafts"][archive_id]["admin_notified"] = True
+    save_state()
 
 
 async def monitor_source(application, region_id, name, url):
@@ -1228,6 +1249,28 @@ async def monitor_news_source(application, region_id, name, url):
         )
 
         try:
+            if state.get("work_mode", "awake") == "sleep":
+                state.setdefault("sleep_news_queue", []).append({
+                    "message": message,
+                    "source": name,
+                    "url": post["url"],
+                    "queued_at": now_msk().isoformat(),
+                })
+                history = state.setdefault("news_history", [])
+                history.append({
+                    "region_id": region_id,
+                    "source": name,
+                    "url": post["url"],
+                    "text": post["text"][:1500],
+                    "published_at": post.get("published_at"),
+                    "received_at": now_msk().isoformat(),
+                    "queued_during_sleep": True,
+                })
+                state["news_history"] = history[-400:]
+                save_state()
+                logger.info("Региональная новость сохранена до пробуждения: %s", post["url"])
+                continue
+
             await application.bot.send_message(
                 chat_id=ADMIN_ID,
                 text=message,
@@ -1564,7 +1607,16 @@ async def sources_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 def admin_keyboard():
+    mode = state.get("work_mode", "awake")
+    mode_button = (
+        InlineKeyboardButton("🌙 Включить режим сна", callback_data="mode:sleep")
+        if mode == "awake"
+        else InlineKeyboardButton("☀️ Выключить режим сна", callback_data="mode:awake")
+    )
+    mode_label = "☀️ Режим: На связи" if mode == "awake" else "🌙 Режим: Сон"
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton(mode_label, callback_data="mode:status")],
+        [mode_button],
         [InlineKeyboardButton("📥 Очередь событий", callback_data="admin_center")],
         [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton("📚 История", callback_data="admin_history")],
@@ -1572,6 +1624,118 @@ def admin_keyboard():
         [InlineKeyboardButton("📢 Подготовить публикацию", callback_data="admin_publish_help")],
         [InlineKeyboardButton("📚 Официальные ресурсы", callback_data="sources")],
     ])
+
+
+async def set_work_mode(context, mode, reply_target=None):
+    """Переключает режим и при пробуждении доставляет накопленные события."""
+    if mode not in {"awake", "sleep"}:
+        return
+
+    previous = state.get("work_mode", "awake")
+    state["work_mode"] = mode
+    save_state()
+
+    if mode == "sleep":
+        message = (
+            "🌙 <b>Режим сна включён.</b>\n\n"
+            "Мониторинг продолжается. Найденные события сохраняются в очередь, "
+            "но отдельные уведомления тебе не отправляются. "
+            "Автоматической публикации в канал нет."
+        )
+        if reply_target:
+            await reply_target.reply_text(message, parse_mode=ParseMode.HTML,
+                                          reply_markup=admin_keyboard())
+        return
+
+    # Режим «На связи»: отправляем админу всё, что накопилось во время сна.
+    waiting = [
+        (pending_id, item)
+        for pending_id, item in state.get("pending", {}).items()
+        if not item.get("admin_notified", False)
+    ]
+    message = (
+        "☀️ <b>Режим «На связи» включён.</b>\n\n"
+        f"За время сна накоплено событий: <b>{len(waiting)}</b>."
+    )
+    if reply_target:
+        await reply_target.reply_text(message, parse_mode=ParseMode.HTML,
+                                      reply_markup=admin_keyboard())
+
+    for pending_id, item in waiting:
+        region_id = item.get("region_id", "kostroma")
+        if region_id not in REGIONS:
+            region_id = "kostroma"
+        admin_message = (
+            "🌙 <b>Событие, найденное во время режима сна</b>\n\n"
+            f"{item.get('message', 'Событие без текста')}"
+            f"{conflict_warning(region_id, item.get('kind', ''))}\n\n"
+            "Проверь исходную публикацию и официальные оповещения. "
+            "Публикация возможна только после твоего подтверждения."
+        )
+        try:
+            await send_text_or_photo(
+                context.bot,
+                ADMIN_ID,
+                admin_message,
+                is_cancel=event_is_cancel(item.get("kind", "")),
+                kind=item.get("kind"),
+                reply_markup=moderation_keyboard(pending_id, region_id),
+            )
+            item["admin_notified"] = True
+            save_state()
+        except TelegramError:
+            logger.exception("Не удалось доставить событие из режима сна: %s", pending_id)
+
+    # Архивные записи, обнаруженные во время сна, тоже показываем
+    # после возвращения администратора в режим «На связи».
+    for archive_id, archive_item in state.setdefault("archive_drafts", {}).items():
+        if archive_item.get("admin_notified", False):
+            continue
+        region_id = archive_item.get("region_id", "kostroma")
+        if region_id not in REGIONS:
+            region_id = "kostroma"
+        archive_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"📢 Опубликовать в канал {REGIONS[region_id]['name']}",
+                callback_data=f"archive_publish:{archive_id}",
+            )],
+            [InlineKeyboardButton(
+                "🗑 Удалить из очереди архива",
+                callback_data=f"archive_discard:{archive_id}",
+            )],
+        ])
+        try:
+            await send_text_or_photo(
+                context.bot,
+                ADMIN_ID,
+                archive_item.get("message", "Архивная запись"),
+                is_cancel=event_is_cancel(archive_item.get("kind", "")),
+                kind=archive_item.get("kind"),
+                reply_markup=archive_keyboard,
+            )
+            archive_item["admin_notified"] = True
+            save_state()
+        except TelegramError:
+            logger.exception("Не удалось доставить архивную запись из режима сна")
+            break
+
+    # Региональные новости, найденные во время сна, тоже доставляем
+    # только после возвращения администратора в режим «На связи».
+    news_queue = state.setdefault("sleep_news_queue", [])
+    while news_queue:
+        news_item = news_queue[0]
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=news_item.get("message", "📰 Новость из режима сна."),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            news_queue.pop(0)
+            save_state()
+        except TelegramError:
+            logger.exception("Не удалось доставить новость из режима сна")
+            break
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1833,6 +1997,20 @@ async def ai_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Не удалось получить историю ИИ.")
 
 
+async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return
+    await set_work_mode(context, "sleep", update.message)
+
+
+async def awake_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return
+    await set_work_mode(context, "awake", update.message)
+
+
 # ============================================================
 # CALLBACKS
 # ============================================================
@@ -1843,6 +2021,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = query.data or ""
+
+    if data.startswith("mode:"):
+        if query.from_user.id != ADMIN_ID:
+            await query.answer("Доступ запрещён.", show_alert=True)
+            return
+        mode_action = data.split(":", 1)[1]
+        if mode_action == "status":
+            current = state.get("work_mode", "awake")
+            label = "☀️ На связи" if current == "awake" else "🌙 Сон"
+            await query.answer(f"Текущий режим: {label}", show_alert=True)
+            return
+        if mode_action not in {"sleep", "awake"}:
+            await query.answer("Неизвестный режим.", show_alert=True)
+            return
+        await query.answer("Переключаю режим...")
+        await set_work_mode(context, mode_action, query.message)
+        try:
+            await query.edit_message_reply_markup(reply_markup=admin_keyboard())
+        except (BadRequest, TelegramError):
+            pass
+        return
 
     if data.startswith("subscribe:"):
         region_id = data.split(":", 1)[1]
@@ -2071,7 +2270,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "🛰 <b>UAV ALERT</b>\n"
                     f"📍 {html.escape(REGIONS[region_id]['name'])}\n\n"
                     f"{html.escape(draft['text'])}\n\n"
-                    f'📢 <a href="{html.escape(PUBLIC_CHANNEL_LINK, quote=True)}">Канал UAV ALERT</a>\n\n'
                     "<i>UAV ALERT не является официальным источником. "
                     "Сверяйте важную информацию с МЧС, РСЧС и органами власти.</i>"
                 ),
@@ -2130,6 +2328,8 @@ async def post_init(application):
         BotCommand("history", "История Костромской области"),
         BotCommand("sources", "Официальные ресурсы"),
         BotCommand("admin", "Панель администратора"),
+        BotCommand("sleep", "Включить режим сна"),
+        BotCommand("awake", "Выключить режим сна / На связи"),
         BotCommand("stats", "Статистика"),
         BotCommand("publish", "Подготовить публикацию в канал"),
         BotCommand("testphotos", "Проверить 7 фотографий"),
@@ -2184,6 +2384,8 @@ def main():
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("sources", sources_command))
     application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("sleep", sleep_command))
+    application.add_handler(CommandHandler("awake", awake_command))
     application.add_handler(CommandHandler("publish", publish_command))
     application.add_handler(CommandHandler("testphotos", test_photos_command))
     application.add_handler(CommandHandler("weather", weather_command))
