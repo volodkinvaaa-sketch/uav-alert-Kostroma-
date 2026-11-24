@@ -358,6 +358,8 @@ DEFAULT_STATE = {
     "manual_drafts": {},
     "archive_drafts": {},
     "sleep_news_queue": [],
+    "sleep_confirmations": {},
+    "sleep_auto_published": {},
     "last_scan": None,
     "work_mode": "awake",
 }
@@ -705,7 +707,9 @@ def event_message(
         "Сверяйте информацию с официальными оповещениями "
         "МЧС, РСЧС и органов власти. Следуйте инструкциям "
         "экстренных служб.\n\n"
-        "<i>UAV ALERT не является официальным источником.</i>"
+        "<i>UAV ALERT не является официальным источником.</i>\n\n"
+        '<b>UAV ALERT | Костромская область:</b> '
+        '<a href="https://t.me/RADAR_kostroma">https://t.me/RADAR_kostroma</a>'
     )
 
 
@@ -872,6 +876,104 @@ async def notify_subscribers(bot, region_id, message, kind=None):
     return failed
 
 
+async def try_sleep_auto_publish(application, item):
+    """
+    Ночной автопост допускается только после совпадения одного статуса
+    в трёх разных подключённых Telegram-источниках в пределах 30 минут.
+    Это не является официальным подтверждением: дисклеймер остаётся в посте.
+    """
+    if state.get("work_mode", "awake") != "sleep":
+        return False
+
+    region_id = item.get("region_id", "kostroma")
+    kind = item.get("kind", "")
+    group_key = f"{region_id}|{kind}"
+    now = now_msk()
+    confirmations = state.setdefault("sleep_confirmations", {})
+    group = confirmations.setdefault(group_key, [])
+
+    # Удаляем старые подтверждения и не считаем один источник дважды.
+    fresh = []
+    for entry in group:
+        created = parse_iso(entry.get("created_at"))
+        if created and now - created <= timedelta(minutes=30):
+            fresh.append(entry)
+    group = fresh
+
+    if not any(entry.get("source") == item.get("source") for entry in group):
+        group.append({
+            "source": item.get("source"),
+            "url": item.get("url"),
+            "pending_id": item.get("id"),
+            "created_at": now.isoformat(timespec="seconds"),
+        })
+
+    confirmations[group_key] = group
+    save_state()
+
+    unique_sources = {entry.get("source") for entry in group if entry.get("source")}
+    if len(unique_sources) < 3:
+        logger.info(
+            "Ночное совпадение пока не достигло порога: %s (%s/3)",
+            group_key, len(unique_sources),
+        )
+        return False
+
+    # Один автоматический пост на одну группу событий, чтобы не дублировать.
+    publication_key = hashlib.sha256(
+        f"{group_key}|{','.join(sorted(unique_sources))}|"
+        f"{group[-1].get('created_at', '')}".encode("utf-8")
+    ).hexdigest()[:20]
+    published_map = state.setdefault("sleep_auto_published", {})
+    if publication_key in published_map:
+        return False
+
+    channel_id = REGIONS[region_id]["channel"]
+    if not channel_id:
+        logger.error("Не задан канал для ночной публикации: %s", region_id)
+        return False
+
+    # В публичный пост не переносятся территории, координаты или
+    # иные оперативные детали из сторонних публикаций.
+    message = item["message"] + (
+        "\n\nℹ️ <b>Проверка совпадения:</b> похожие сообщения обнаружены "
+        "в трёх разных подключённых источниках. Это не заменяет официальное "
+        "подтверждение МЧС, РСЧС или органов власти."
+    )
+
+    try:
+        await send_text_or_photo(
+            application.bot,
+            channel_id,
+            message,
+            is_cancel=event_is_cancel(kind),
+            kind=kind,
+        )
+    except TelegramError:
+        logger.exception("Не удалось автоматически опубликовать ночное событие")
+        return False
+
+    published_map[publication_key] = now.isoformat(timespec="seconds")
+    approved_at = now.isoformat(timespec="seconds")
+    for confirmation in group:
+        confirmed_id = confirmation.get("pending_id")
+        if confirmed_id:
+            state["pending"].pop(confirmed_id, None)
+            state["approved"][confirmed_id] = approved_at
+    record_approved_event(item)
+    add_history(item, "published_sleep_3_sources", None)
+    save_state()
+
+    failed = await notify_subscribers(
+        application.bot, region_id, message, kind
+    )
+    logger.info(
+        "Ночная публикация выполнена: region=%s kind=%s sources=%s subscriber_failures=%s",
+        region_id, kind, len(unique_sources), len(failed),
+    )
+    return True
+
+
 async def send_event(
     application,
     region_id,
@@ -915,16 +1017,22 @@ async def send_event(
     state["pending"][pending_id] = item
     save_state()
 
-    # В режиме сна события только копятся в очереди: бот не будит
-    # администратора отдельными уведомлениями и ничего не публикует сам.
+    # В режиме сна событие сохраняется и участвует в проверке совпадения
+    # по трём разным источникам. До достижения порога канал не получает пост.
     item["admin_notified"] = False
     save_state()
 
     if state.get("work_mode", "awake") == "sleep":
-        logger.info(
-            "Событие сохранено до пробуждения: region=%s id=%s",
-            region_id, pending_id,
-        )
+        try:
+            published = await try_sleep_auto_publish(application, item)
+            if not published:
+                logger.info(
+                    "Событие сохранено до пробуждения/совпадения источников: "
+                    "region=%s id=%s",
+                    region_id, pending_id,
+                )
+        except Exception:
+            logger.exception("Ошибка ночной проверки совпадения источников")
         return
 
     admin_message = (
@@ -1638,9 +1746,12 @@ async def set_work_mode(context, mode, reply_target=None):
     if mode == "sleep":
         message = (
             "🌙 <b>Режим сна включён.</b>\n\n"
-            "Мониторинг продолжается. Найденные события сохраняются в очередь, "
-            "но отдельные уведомления тебе не отправляются. "
-            "Автоматической публикации в канал нет."
+            "Мониторинг продолжается. Бот сопоставляет сообщения о каждом "
+            "типе события из трёх разных подключённых источников. При совпадении "
+            "в пределах 30 минут он может опубликовать общий статус в канал. "
+            "Это не официальное подтверждение, поэтому в посте остаётся предупреждение. "
+            "Территории и оперативные подробности автоматически не публикуются. "
+            "Остальные события сохраняются до твоего возвращения."
         )
         if reply_target:
             await reply_target.reply_text(message, parse_mode=ParseMode.HTML,
