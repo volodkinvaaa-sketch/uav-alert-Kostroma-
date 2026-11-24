@@ -147,6 +147,60 @@ REGIONS = {
             ("МЧС России", "https://mchs.gov.ru/"),
         ],
     },
+    "yaroslavl": {
+        "name": "Ярославская область",
+        "short": "Ярославль",
+        "channel": None,
+        "terms": ["ярослав"],
+        "alert_sources": COMMON_ALERT_SOURCES,
+        "news_sources": [],
+        "official_sources": [],
+    },
+    "vologda": {
+        "name": "Вологодская область",
+        "short": "Вологда",
+        "channel": None,
+        "terms": ["вологод"],
+        "alert_sources": COMMON_ALERT_SOURCES,
+        "news_sources": [],
+        "official_sources": [],
+    },
+    "ivanovo": {
+        "name": "Ивановская область",
+        "short": "Иваново",
+        "channel": None,
+        "terms": ["иванов"],
+        "alert_sources": COMMON_ALERT_SOURCES,
+        "news_sources": [],
+        "official_sources": [],
+    },
+    "kirov": {
+        "name": "Кировская область",
+        "short": "Киров",
+        "channel": None,
+        "terms": ["киров"],
+        "alert_sources": COMMON_ALERT_SOURCES,
+        "news_sources": [],
+        "official_sources": [],
+    },
+    "nizhny_novgorod": {
+        "name": "Нижегородская область",
+        "short": "Нижний Новгород",
+        "channel": None,
+        "terms": ["нижегород", "нижнем новгород", "нижнего новгород"],
+        "alert_sources": COMMON_ALERT_SOURCES,
+        "news_sources": [],
+        "official_sources": [],
+    },
+    "moscow": {
+        "name": "Московская область и Москва",
+        "short": "Москва и область",
+        "channel": None,
+        "terms": ["москов", "москв", "подмосков"],
+        "alert_sources": COMMON_ALERT_SOURCES,
+        "news_sources": [],
+        "official_sources": [],
+    },
 
 }
 
@@ -190,6 +244,11 @@ UAV_ATTENTION_RE = re.compile(
     r"внимани\w*.{0,30}бпла|"
     r"бпла.{0,30}внимани",
     re.I | re.S,
+)
+
+UAV_NEWS_RE = re.compile(
+    r"\bбпла\b|беспилот\w*|\bдрон\w*",
+    re.I,
 )
 
 UAV_ALERT_RE = re.compile(
@@ -360,6 +419,7 @@ DEFAULT_STATE = {
     "sleep_news_queue": [],
     "sleep_confirmations": {},
     "sleep_auto_published": {},
+    "daily_digest_last_date": None,
     "last_scan": None,
     "work_mode": "awake",
 }
@@ -535,6 +595,7 @@ def event_title(kind):
         "threat": ("🟠 Угроза по БПЛА", "БПЛА"),
         "attention": ("🟡 Внимание: БПЛА", "БПЛА"),
         "danger": ("🔴 Опасность по БПЛА", "БПЛА"),
+        "report": ("📰 Сообщения о БПЛА", "БПЛА"),
     }.get(kind, ("ℹ️ Сообщение", "Информация"))
 
 
@@ -878,9 +939,9 @@ async def notify_subscribers(bot, region_id, message, kind=None):
 
 async def try_sleep_auto_publish(application, item):
     """
-    Ночной автопост допускается только после совпадения одного статуса
-    в трёх разных подключённых Telegram-источниках в пределах 30 минут.
-    Это не является официальным подтверждением: дисклеймер остаётся в посте.
+    Для опасности по БПЛА достаточно двух из трёх разных
+    неофициальных источников в пределах 30 минут. Для отбоя и иных
+    типов событий остаётся порог 3/3. Дисклеймер всегда остаётся в посте.
     """
     if state.get("work_mode", "awake") != "sleep":
         return False
@@ -912,33 +973,48 @@ async def try_sleep_auto_publish(application, item):
     save_state()
 
     unique_sources = {entry.get("source") for entry in group if entry.get("source")}
-    if len(unique_sources) < 3:
+    required_sources = 2 if kind == "danger" else 3
+    if len(unique_sources) < required_sources:
         logger.info(
-            "Ночное совпадение пока не достигло порога: %s (%s/3)",
-            group_key, len(unique_sources),
+            "Ночное совпадение пока не достигло порога: %s (%s/%s)",
+            group_key, len(unique_sources), required_sources,
         )
         return False
 
     # Один автоматический пост на одну группу событий, чтобы не дублировать.
-    publication_key = hashlib.sha256(
-        f"{group_key}|{','.join(sorted(unique_sources))}|"
-        f"{group[-1].get('created_at', '')}".encode("utf-8")
-    ).hexdigest()[:20]
+    # Не публикуем повторно тот же тип события в регионе в течение 30 минут,
+    # даже если после порога 2/3 пришёл третий источник.
+    publication_key = group_key
     published_map = state.setdefault("sleep_auto_published", {})
-    if publication_key in published_map:
+    last_publication = parse_iso(published_map.get(publication_key))
+    if last_publication and now - last_publication <= timedelta(minutes=30):
+        for confirmation in group:
+            confirmed_id = confirmation.get("pending_id")
+            if confirmed_id:
+                state["pending"].pop(confirmed_id, None)
+                state["approved"][confirmed_id] = last_publication.isoformat(
+                    timespec="seconds"
+                )
+        save_state()
         return False
 
-    channel_id = REGIONS[region_id]["channel"]
+    channel_id = REGIONS[region_id].get("channel")
     if not channel_id:
-        logger.error("Не задан канал для ночной публикации: %s", region_id)
+        logger.info(
+            "Для региона %s не настроен отдельный канал; событие пойдёт "
+            "только в ежедневную сводку администратору.",
+            region_id,
+        )
         return False
 
     # В публичный пост не переносятся территории, координаты или
     # иные оперативные детали из сторонних публикаций.
+    source_wording = "двух из трёх" if required_sources == 2 else "трёх из трёх"
     message = item["message"] + (
-        "\n\nℹ️ <b>Проверка совпадения:</b> похожие сообщения обнаружены "
-        "в трёх разных подключённых источниках. Это не заменяет официальное "
-        "подтверждение МЧС, РСЧС или органов власти."
+        f"\n\nℹ️ <b>Проверка совпадения:</b> похожие сообщения обнаружены "
+        f"в {source_wording} подключённых неофициальных источниках. "
+        "Это не является официальным подтверждением и не заменяет "
+        "оповещения МЧС, РСЧС или органов власти."
     )
 
     try:
@@ -961,7 +1037,7 @@ async def try_sleep_auto_publish(application, item):
             state["pending"].pop(confirmed_id, None)
             state["approved"][confirmed_id] = approved_at
     record_approved_event(item)
-    add_history(item, "published_sleep_3_sources", None)
+    add_history(item, "published", None)
     save_state()
 
     failed = await notify_subscribers(
@@ -984,6 +1060,15 @@ async def send_event(
     text_value,
     published_at=None,
 ):
+    # Соседние регионы отслеживаются для личной ежедневной сводки.
+    # Не отправляем их предупреждения в канал Костромской области.
+    if region_id != "kostroma":
+        logger.info(
+            "Событие для сводки: region=%s kind=%s source=%s",
+            region_id, kind, source,
+        )
+        return
+
     pending_id = hashlib.sha256(
         (
             f"{region_id}|{url}|{text_value}|"
@@ -1240,7 +1325,7 @@ async def send_backfill_notice(
     save_state()
 
 
-async def monitor_source(application, region_id, name, url):
+async def monitor_source(application, region_id, name, url, posts_override=None):
     scan_key = f"{region_id}|{url}"
     first_scan = scan_key not in startup_backfill_done
     startup_backfill_done.add(scan_key)
@@ -1248,9 +1333,12 @@ async def monitor_source(application, region_id, name, url):
     cutoff = now_msk() - timedelta(hours=HISTORY_BACKFILL_HOURS)
     pages = HISTORY_MAX_PAGES if first_scan else 1
 
-    posts = await asyncio.to_thread(
-        source_posts, url, pages, cutoff if first_scan else None
-    )
+    if posts_override is None:
+        posts = await asyncio.to_thread(
+            source_posts, url, pages, cutoff if first_scan else None
+        )
+    else:
+        posts = posts_override
 
     seen_map = state.setdefault("seen", {})
     source_seen = set(seen_map.get(scan_key, []))
@@ -1279,13 +1367,15 @@ async def monitor_source(application, region_id, name, url):
         kind, label = result
 
         if first_scan:
-            # Archive messages are sent only to the administrator.
-            try:
-                await send_backfill_notice(
-                    application, region_id, name, post, kind, label
-                )
-            except TelegramError:
-                logger.exception("Ошибка отправки архивной записи")
+            # Исторические черновики сохраняем только для основного региона.
+            # Соседние регионы попадут в личную сводку за день.
+            if region_id == "kostroma":
+                try:
+                    await send_backfill_notice(
+                        application, region_id, name, post, kind, label
+                    )
+                except TelegramError:
+                    logger.exception("Ошибка отправки архивной записи")
             continue
 
         await send_event(
@@ -1429,6 +1519,167 @@ def expire_active_alerts():
         save_state()
 
 
+async def maybe_send_daily_uav_digest(application):
+    """
+    В 20:00 МСК присылает администратору личную сводку по БПЛА
+    за текущие сутки на основе трёх подключённых неофициальных источников.
+    В канал сводка автоматически не публикуется.
+    """
+    now = now_msk()
+    if now.hour < 20:
+        return
+
+    day_key = now.date().isoformat()
+    if state.get("daily_digest_last_date") == day_key:
+        return
+
+    day_start = datetime.combine(now.date(), datetime.min.time()).replace(tzinfo=MSK)
+    grouped = {}
+    other_russia = {}
+    errors = []
+
+    for source_name, source_url in COMMON_ALERT_SOURCES:
+        try:
+            posts = await asyncio.to_thread(
+                source_posts,
+                source_url,
+                HISTORY_MAX_PAGES,
+                day_start,
+            )
+        except Exception as exc:
+            logger.exception("Ошибка сбора ежедневной сводки из %s", source_name)
+            errors.append(source_name)
+            continue
+
+        for post in posts:
+            published_at = parse_iso(post.get("published_at"))
+            if not published_at or published_at < day_start or published_at > now:
+                continue
+
+            post_text = post.get("text", "")
+            result = classify_uav(post_text)
+            if result:
+                kind, label = result
+            elif UAV_NEWS_RE.search(post_text):
+                kind, label = "report", "Сообщение о БПЛА"
+            else:
+                continue
+            # Не переносим в сводку координаты, маршруты, места обнаружения,
+            # сведения о работе ПВО или другие оперативные подробности.
+            post_key = post.get("key") or post.get("url")
+            regions_found = detect_regions(post.get("text", ""))
+
+            if regions_found:
+                for region_id in regions_found:
+                    bucket = grouped.setdefault(region_id, {})
+                    bucket.setdefault(kind, {})[post_key] = {
+                        "source": source_name,
+                        "url": post.get("url", ""),
+                        "published_at": post.get("published_at"),
+                        "label": label,
+                    }
+            else:
+                other_russia[post_key] = {
+                    "source": source_name,
+                    "url": post.get("url", ""),
+                    "published_at": post.get("published_at"),
+                    "label": label,
+                }
+
+    lines = [
+        f"📰 <b>UAV ALERT | Итоги дня — {now.strftime('%d.%m.%Y')}</b>",
+        "",
+        "Сводка сообщений о БПЛА за текущие сутки.",
+        "",
+    ]
+
+    if grouped:
+        for region_id in REGIONS:
+            region_data = grouped.get(region_id)
+            if not region_data:
+                continue
+            lines.append(f"📍 <b>{html.escape(REGIONS[region_id]['name'])}</b>")
+            for kind, entries in region_data.items():
+                unique_sources = sorted({
+                    item["source"] for item in entries.values()
+                })
+                label = html.escape(event_title(kind)[0])
+                lines.append(
+                    f"• {label}: публикаций — {len(entries)}, "
+                    f"источников — {len(unique_sources)}"
+                )
+                for item in list(entries.values())[:1]:
+                    if item.get("url"):
+                        safe_url = html.escape(item["url"], quote=True)
+                        safe_source = html.escape(item["source"])
+                        lines.append(
+                            f'  <a href="{safe_url}">{safe_source}</a>'
+                        )
+            lines.append("")
+
+    if other_russia:
+        unique_sources = sorted({
+            item["source"] for item in other_russia.values()
+        })
+        lines.extend([
+            "🇷🇺 <b>Другие регионы России</b>",
+            f"• Обнаружено публикаций о БПЛА: {len(other_russia)}",
+            f"• Источники: {', '.join(html.escape(x) for x in unique_sources)}",
+            "",
+        ])
+
+    if not grouped and not other_russia:
+        lines.extend([
+            "За текущие сутки в проверенных источниках не обнаружено "
+            "подходящих публикаций о беспилотной опасности.",
+            "",
+        ])
+
+    if errors:
+        lines.append(
+            "⚠️ Не удалось проверить источники: "
+            + ", ".join(html.escape(x) for x in errors)
+            + ". Сводка может быть неполной."
+        )
+        lines.append("")
+
+    lines.extend([
+        "ℹ️ Сводка составлена по трём неофициальным Telegram-источникам. "
+        "Количество публикаций не равно количеству подтверждённых событий. "
+        "Отсутствие сообщений не доказывает отсутствие угрозы.",
+        "Проверяй официальные оповещения МЧС, РСЧС и органов власти.",
+        "",
+        "<i>Это личный отчёт администратору. В канал он не публикуется.</i>",
+    ])
+
+    digest_text = "\n".join(lines)
+    while len(digest_text) > 3900:
+        link_line = next(
+            (index for index, line in enumerate(lines) if "<a href=" in line),
+            None,
+        )
+        if link_line is None:
+            break
+        lines.pop(link_line)
+        digest_text = "\n".join(lines)
+
+    try:
+        await application.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=digest_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except TelegramError:
+        logger.exception("Не удалось отправить ежедневную сводку администратору")
+        return
+
+    state["daily_digest_last_date"] = day_key
+    state["daily_digest_last_sent_at"] = now.isoformat(timespec="seconds")
+    save_state()
+    logger.info("Ежедневная сводка UAV ALERT отправлена администратору: %s", day_key)
+
+
 async def monitor_loop(application):
     logger.info(
         "Мониторинг запущен; интервал=%s сек.",
@@ -1436,11 +1687,28 @@ async def monitor_loop(application):
     )
 
     while True:
+        # Один раз загружаем каждый общий источник за цикл и используем
+        # полученные записи для всех регионов. Это не создаёт лишних запросов.
+        source_cache = {}
         for region_id, region in REGIONS.items():
             for name, url in region["alert_sources"]:
                 try:
+                    if url not in source_cache:
+                        needs_backfill = any(
+                            f"{candidate_id}|{url}" not in startup_backfill_done
+                            for candidate_id in REGIONS
+                        )
+                        cutoff = (
+                            now_msk() - timedelta(hours=HISTORY_BACKFILL_HOURS)
+                            if needs_backfill else None
+                        )
+                        pages = HISTORY_MAX_PAGES if needs_backfill else 1
+                        source_cache[url] = await asyncio.to_thread(
+                            source_posts, url, pages, cutoff
+                        )
                     await monitor_source(
-                        application, region_id, name, url
+                        application, region_id, name, url,
+                        posts_override=source_cache[url],
                     )
                 except Exception as exc:
                     key = f"{region_id}|{url}"
@@ -1466,6 +1734,10 @@ async def monitor_loop(application):
                     )
 
         expire_active_alerts()
+        try:
+            await maybe_send_daily_uav_digest(application)
+        except Exception:
+            logger.exception("Ошибка формирования ежедневной сводки UAV ALERT")
         await asyncio.sleep(CHECK_INTERVAL)
 
 
@@ -1700,7 +1972,9 @@ async def sources_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.extend([
         "",
         "Ссылки приведены для ручной сверки. Бот не получает "
-        "официальный статус РСЧС автоматически с этих страниц.",
+        "официальный статус РСЧС автоматически с этих страниц. "
+        "Сводка по соседним регионам формируется по подключённым "
+        "неофициальным источникам.",
         "Приоритет имеют официальные оповещения и инструкции экстренных служб.",
     ])
     await update.message.reply_text(
@@ -1746,12 +2020,13 @@ async def set_work_mode(context, mode, reply_target=None):
     if mode == "sleep":
         message = (
             "🌙 <b>Режим сна включён.</b>\n\n"
-            "Мониторинг продолжается. Бот сопоставляет сообщения о каждом "
-            "типе события из трёх разных подключённых источников. При совпадении "
-            "в пределах 30 минут он может опубликовать общий статус в канал. "
-            "Это не официальное подтверждение, поэтому в посте остаётся предупреждение. "
-            "Территории и оперативные подробности автоматически не публикуются. "
-            "Остальные события сохраняются до твоего возвращения."
+            "Мониторинг продолжается. Для публикации сообщения об опасности "
+            "по БПЛА в Костромской области достаточно совпадения двух из трёх "
+            "подключённых неофициальных источников в пределах 30 минут. "
+            "Для отбоя и остальных типов событий сохраняется порог три из трёх. "
+            "В каждом посте указывается, что сведения неофициальные и требуют "
+            "сверки с МЧС/РСЧС. Соседние регионы собираются в личную сводку. "
+            "Сводка за день приходит тебе в 20:00 МСК."
         )
         if reply_target:
             await reply_target.reply_text(message, parse_mode=ParseMode.HTML,
